@@ -1,0 +1,68 @@
+[package]
+name = "sping"
+version = "1.5.1"
+edition = "2024"
+rust-version = "1.88"
+authors = ["Antonio Cotos <acf981@protonmail.com>"]
+description = "Terminal-native real-time connectivity monitor with network context diagnostics"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/LambdaBytes/sping"
+homepage = "https://github.com/LambdaBytes/sping"
+documentation = "https://github.com/LambdaBytes/sping"
+keywords = ["ping", "icmp", "network", "monitoring", "tui"]
+categories = ["command-line-utilities", "network-programming"]
+exclude = [
+    "target/",
+]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+thiserror = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+socket2 = "0.5"
+libc = "0.2"
+
+[build-dependencies]
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+clap_mangen = "0.2"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+
+# ─── Debian packaging (cargo-deb) ─────────────────────────────────────
+[package.metadata.deb]
+maintainer = "Antonio Cotos <acf981@protonmail.com>"
+copyright = "2025-2026, Antonio Cotos <acf981@protonmail.com>"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+sping is a terminal-native real-time connectivity monitor written in Rust.
+It interprets network context — not just RTT and packet loss — and produces
+quality grades, trend hysteresis, spike detection and outage timing.
+
+Modes: single target, multi-target dashboard, batch (file → summary or NDJSON).
+Backends: unprivileged DGRAM ICMP on Linux/macOS, IcmpSendEcho on Windows.
+"""
+section = "net"
+priority = "optional"
+depends = "$auto"
+assets = [
+    ["target/release/sping", "usr/bin/", "755"],
+    ["target/assets/man/sping.1", "usr/share/man/man1/sping.1", "644"],
+    ["target/assets/completions/sping.bash", "usr/share/bash-completion/completions/sping", "644"],
+    ["target/assets/completions/_sping", "usr/share/zsh/vendor-completions/_sping", "644"],
+    ["target/assets/completions/sping.fish", "usr/share/fish/vendor_completions.d/sping.fish", "644"],
+    ["README.md", "usr/share/doc/sping/README.md", "644"],
+    ["CHANGELOG.md", "usr/share/doc/sping/CHANGELOG.md", "644"],
+    ["JSON_CONTRACT.md", "usr/share/doc/sping/JSON_CONTRACT.md", "644"],
+    ["LICENSE", "usr/share/doc/sping/LICENSE", "644"],
+]

@@ -1,0 +1,49 @@
+# Maintainer: Antonio Cotos <acf981@protonmail.com>
+pkgname=sping
+pkgver=1.5.1
+pkgrel=1
+pkgdesc="Terminal-native real-time connectivity monitor with network context diagnostics"
+arch=('x86_64' 'aarch64' 'armv7h')
+url="https://github.com/LambdaBytes/sping"
+license=('MIT')
+depends=('gcc-libs')
+makedepends=('cargo')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# Replace SKIP with the real digest once a v$pkgver tag exists:
+#   updpkgsums   (from pacman-contrib)
+sha256sums=('SKIP')
+
+prepare() {
+  cd "sping-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "sping-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # build.rs renders the man page and shell completions under target/assets/.
+  cargo build --frozen --release
+}
+
+check() {
+  cd "sping-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo test --frozen --release
+}
+
+package() {
+  cd "sping-$pkgver"
+  install -Dm0755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm0644 target/assets/man/sping.1 "$pkgdir/usr/share/man/man1/sping.1"
+  install -Dm0644 target/assets/completions/sping.bash \
+    "$pkgdir/usr/share/bash-completion/completions/sping"
+  install -Dm0644 target/assets/completions/_sping \
+    "$pkgdir/usr/share/zsh/site-functions/_sping"
+  install -Dm0644 target/assets/completions/sping.fish \
+    "$pkgdir/usr/share/fish/vendor_completions.d/sping.fish"
+  install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm0644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

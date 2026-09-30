@@ -1,0 +1,118 @@
+name: Release
+
+# Tag-triggered release: build cross-platform binaries (+ Debian packages),
+# checksum them, and publish a GitHub Release whose notes are that version's
+# section of CHANGELOG.md.
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64,   os: ubuntu-latest,   target: x86_64-unknown-linux-gnu,      deb: true }
+          - { name: linux-aarch64,  os: ubuntu-latest,   target: aarch64-unknown-linux-gnu,     deb: true, linker: gcc-aarch64-linux-gnu }
+          - { name: macos-arm64,    os: macos-latest,    target: aarch64-apple-darwin }
+          - { name: windows-x86_64, os: windows-latest,  target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross linker
+        if: matrix.linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.linker }}
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build Debian package
+        if: matrix.deb
+        run: |
+          cargo install cargo-deb --locked --version "^3"
+          cargo deb --no-build --target ${{ matrix.target }}
+
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tag="${GITHUB_REF_NAME}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/sping.exe" "dist/sping-${tag}-${{ matrix.name }}.exe"
+          else
+            cp "target/${{ matrix.target }}/release/sping" "dist/sping-${tag}-${{ matrix.name }}"
+          fi
+          if [ "${{ matrix.deb }}" = "true" ]; then
+            cp target/${{ matrix.target }}/debian/*.deb dist/
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # The release is published with the repository owner's token so that it
+      # is authored by the owner's account, not by the workflow's default one.
+      - name: Require RELEASE_TOKEN
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          if [ -z "$RELEASE_TOKEN" ]; then
+            echo "::error::Set the RELEASE_TOKEN repository secret (owner PAT with contents:write)."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          awk -v header="## ${GITHUB_REF_NAME}" '
+            $0 == header { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
+          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/release-notes.md"; then
+            echo "::error::CHANGELOG.md has no section for ${GITHUB_REF_NAME}."
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body_path: ${{ runner.temp }}/release-notes.md
+          token: ${{ secrets.RELEASE_TOKEN }}
