@@ -212,7 +212,11 @@ pub fn draw_inline(
         jitter: snap.jitter,
         rtt_avg: snap.rtt_avg,
     };
-    let events = correlator::diagnose(&input);
+    let mut events = correlator::diagnose(&input);
+    // A probe error goes first: it explains the loss the diagnostics describe.
+    if let Some(error) = &snap.last_error {
+        events.insert(0, error.clone());
+    }
     if !events.is_empty() {
         write!(w, "Events     {}", events.join(sep))?;
     }
@@ -235,7 +239,7 @@ pub fn draw_inline(
         lines += 1;
     }
 
-    let buf = crate::render::format::fix_raw_newlines(&buf);
+    let buf = crate::render::format::stage_frame(&buf, crate::render::format::term_width())?;
     let mut final_buf = Vec::with_capacity(buf.len() + 16);
     if lines_before > 0 {
         queue!(

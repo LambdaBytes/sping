@@ -186,6 +186,10 @@ pub async fn run(
             net_ctx: net_ctx.clone(),
             reachability: health.state(),
             recent_loss_pct: quality.window_loss_pct(),
+            last_error: match result {
+                ProbeResult::Error { message, .. } => Some(message),
+                _ => None,
+            },
         };
         let _ = probe_tx.send(Some(snapshot));
 

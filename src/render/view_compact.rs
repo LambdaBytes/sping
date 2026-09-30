@@ -195,7 +195,11 @@ pub fn draw_inline(
         jitter: snap.jitter,
         rtt_avg: snap.rtt_avg,
     };
-    let events = correlator::diagnose(&input);
+    let mut events = correlator::diagnose(&input);
+    // A probe error goes first: it explains the loss the diagnostics describe.
+    if let Some(error) = &snap.last_error {
+        events.insert(0, error.clone());
+    }
     if !events.is_empty() {
         write!(w, "Events     {}", events.join(sep))?;
     }
@@ -203,8 +207,9 @@ pub fn draw_inline(
     writeln!(w)?;
     lines += 1;
 
-    // Fix newlines for raw mode (\n → \r\n) and prepend cursor repositioning
-    let buf = crate::render::format::fix_raw_newlines(&buf);
+    // Keep every line on one row, fix newlines for raw mode (\n → \r\n) and
+    // prepend cursor repositioning
+    let buf = crate::render::format::stage_frame(&buf, crate::render::format::term_width())?;
     let mut final_buf = Vec::with_capacity(buf.len() + 16);
     if lines_before > 0 {
         queue!(
@@ -290,5 +295,28 @@ mod tests {
         assert_eq!(estimate_hops(116), 12); // 12 hops Windows
         assert_eq!(estimate_hops(255), 0); // router
         assert_eq!(estimate_hops(0), 0);
+    }
+
+    #[test]
+    fn probe_error_leads_the_events_line() {
+        let target = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
+        let mut snap = ProbeSnapshot::empty("192.0.2.1".into(), target, None, None);
+        snap.sent = 1;
+        snap.lost = 1;
+        snap.last_error = Some("send failed: No route to host (os error 65)".into());
+
+        let mut out = Vec::new();
+        draw_inline(&mut out, &snap, None, None, 0, 0).unwrap();
+        let frame = String::from_utf8(out).unwrap();
+        assert!(
+            frame.contains("Events     send failed: No route to host (os error 65)"),
+            "{frame}"
+        );
+
+        // Without an error the line carries diagnostics only.
+        snap.last_error = None;
+        let mut out = Vec::new();
+        draw_inline(&mut out, &snap, None, None, 0, 0).unwrap();
+        assert!(!String::from_utf8(out).unwrap().contains("send failed"));
     }
 }

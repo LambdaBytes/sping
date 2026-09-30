@@ -104,7 +104,22 @@ pub fn path_glyphs() -> (char, char, char, char) {
     }
 }
 
-/// Whether to emit ANSI colors: stdout is a TTY and NO_COLOR is unset.
+/// Whether to emit ANSI colors: stdout is a TTY that interprets escape
+/// sequences and NO_COLOR is unset.
 pub fn use_color() -> bool {
-    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() && ansi_enabled()
+}
+
+/// A Windows console only interprets escape sequences once virtual-terminal
+/// processing is switched on, which crossterm does lazily, when it runs its
+/// first command. Asking here switches it on before anything is printed, so
+/// an early line (the `Init:` line) does not show its sequences as text.
+#[cfg(windows)]
+fn ansi_enabled() -> bool {
+    crossterm::ansi_support::supports_ansi()
+}
+
+#[cfg(not(windows))]
+fn ansi_enabled() -> bool {
+    true
 }

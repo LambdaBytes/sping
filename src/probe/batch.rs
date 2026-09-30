@@ -42,6 +42,7 @@ pub async fn probe_target(
     let mut outage = OutageTracker::new();
     let mut health = HealthTracker::new(3, 2);
     let mut last_ttl: Option<u8> = None;
+    let mut last_error: Option<String> = None;
 
     // Fixed cadence, same policy as the scheduler.
     let mut ticker = tokio::time::interval(interval);
@@ -83,6 +84,10 @@ pub async fn probe_target(
                 last_ttl = None;
             }
         }
+        last_error = match result {
+            ProbeResult::Error { message, .. } => Some(message),
+            _ => None,
+        };
     }
 
     let recovery_duration = outage.take_recovery();
@@ -114,5 +119,6 @@ pub async fn probe_target(
         net_ctx,
         reachability: health.state(),
         recent_loss_pct: quality.window_loss_pct(),
+        last_error,
     }
 }

@@ -46,9 +46,12 @@ impl ClassicView {
                     )?;
                 }
             },
-            None => {
-                writeln!(w, "Request timeout for seq={}", snap.seq,)?;
-            }
+            None => match &snap.last_error {
+                // Not a lost reply: the probe itself failed (e.g. the OS
+                // refused to send). Say why instead of calling it a timeout.
+                Some(error) => writeln!(w, "Probe error for seq={}: {error}", snap.seq)?,
+                None => writeln!(w, "Request timeout for seq={}", snap.seq,)?,
+            },
         }
         w.flush()?;
         Ok(())
@@ -76,5 +79,40 @@ impl ClassicView {
         }
         w.flush()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lost_probe(last_error: Option<&str>) -> ProbeSnapshot {
+        let target = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
+        let mut snap = ProbeSnapshot::empty("192.0.2.1".into(), target, None, None);
+        snap.seq = 1;
+        snap.sent = 1;
+        snap.lost = 1;
+        snap.last_error = last_error.map(String::from);
+        snap
+    }
+
+    fn drawn(snap: &ProbeSnapshot) -> String {
+        let mut out = Vec::new();
+        ClassicView::new().draw(&mut out, snap).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn lost_reply_is_reported_as_timeout() {
+        assert_eq!(drawn(&lost_probe(None)), "Request timeout for seq=1\n");
+    }
+
+    #[test]
+    fn failed_probe_reports_its_error_not_a_timeout() {
+        let snap = lost_probe(Some("send failed: No route to host (os error 65)"));
+        assert_eq!(
+            drawn(&snap),
+            "Probe error for seq=1: send failed: No route to host (os error 65)\n"
+        );
     }
 }

@@ -176,7 +176,7 @@ pub fn draw_table(
         lines += 1;
     }
 
-    let buf = crate::render::format::fix_raw_newlines(&buf);
+    let buf = crate::render::format::stage_frame(&buf, crate::render::format::term_width())?;
     let mut final_buf = Vec::with_capacity(buf.len() + 16);
     if lines_before > 0 {
         queue!(

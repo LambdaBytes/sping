@@ -141,6 +141,11 @@ pub struct ProbeSnapshot {
     /// lifetime). Internal correlator input; not serialized.
     #[serde(skip)]
     pub recent_loss_pct: f64,
+    /// Why the most recent probe failed, when it failed with an error rather
+    /// than a timeout (e.g. the OS refused to send). Shown by the views so an
+    /// error is not mistaken for a lost reply; not serialized.
+    #[serde(skip)]
+    pub last_error: Option<String>,
 }
 
 impl ProbeSnapshot {
@@ -179,6 +184,7 @@ impl ProbeSnapshot {
             net_ctx,
             reachability: crate::diagnostics::health::Reachability::Unknown,
             recent_loss_pct: 0.0,
+            last_error: None,
         }
     }
 }

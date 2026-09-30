@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.5.2
+
+### Fixes
+- TUI views (compact, extended, table): a line wider than the terminal no
+  longer breaks the in-place redraw. In an 80-column terminal the `Latency`
+  line is 81 columns wide with typical RTT values; it wrapped, and every
+  frame left the previous header line behind. Lines are now cut short of the
+  terminal width and end in an ellipsis.
+- A probe that fails with an error (for example when the OS refuses to send)
+  is no longer shown as a timeout: the classic view prints
+  `Probe error for seq=N: <reason>`, and the compact and extended views put
+  the reason first on the `Events` line. JSON output is unchanged.
+- Windows: the console is switched to escape-sequence processing before the
+  first line is printed; the `Init:` line showed its bold sequences as text.
+
 ## v1.5.1
 
 ### Fixes

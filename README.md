@@ -54,7 +54,7 @@ Verify with `SHA256SUMS` from the same release.
 ### Debian / Ubuntu (.deb)
 
 ```bash
-sudo dpkg -i sping_1.5.1-1_amd64.deb     # or _arm64.deb on aarch64
+sudo dpkg -i sping_1.5.2-1_amd64.deb     # or _arm64.deb on aarch64
 ```
 
 The package installs:
@@ -259,7 +259,7 @@ x86_64/aarch64, macOS arm64 and Windows x86_64.
 | RAM | ~2 MB |
 | CPU | 0.0% |
 | Code | ~6,500 lines Rust |
-| Tests | 90 (71 unit + 19 E2E) |
+| Tests | 103 (84 unit + 19 E2E) |
 
 ## License
 
