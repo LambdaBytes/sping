@@ -105,7 +105,7 @@ jobs:
 
           test -x result/bin/sping
           test -f result/share/man/man1/sping.1.gz
-          test -f result/share/bash-completion/completions/sping
+          test -f result/share/bash-completion/completions/sping.bash
           test -f result/share/zsh/site-functions/_sping
           test -f result/share/fish/vendor_completions.d/sping.fish
 
