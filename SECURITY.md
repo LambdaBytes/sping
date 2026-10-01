@@ -42,8 +42,9 @@ without administrator rights and do not open raw sockets.
 
 ## Memory safety
 
-The only `unsafe` code is the platform FFI: `recvmsg`/`setsockopt`/cmsg parsing
-on Linux and the `iphlpapi` calls on Windows. Each `unsafe` block carries a
-`// SAFETY:` justification. The build is checked with
+The only `unsafe` code lives in the two ICMP backends: the socket and clock
+calls on Linux/macOS (`recvmsg`, `setsockopt`, `clock_gettime`, cmsg parsing
+and the view over a received buffer) and the `iphlpapi` calls on Windows. Each
+`unsafe` block carries a `// SAFETY:` justification. The build is checked with
 `cargo clippy --all-targets -- -D warnings` on Linux, macOS and Windows targets,
 and dependencies are scanned with `cargo audit` and `cargo deny`.

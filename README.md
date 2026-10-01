@@ -2,6 +2,8 @@
 
 A modern ping for humans. Terminal-native, real-time connectivity monitor that doesn't just measure packets — **it interprets network context**.
 
+![sping probing 8.8.8.8 in the compact view](docs/sping.gif)
+
 **Status:** functional and in active use, with a frozen JSON contract.
 Linux, macOS and Windows; x86_64, aarch64 and armv7 (Raspberry Pi).
 
@@ -11,11 +13,11 @@ Answers three questions at once:
 3. **What type of problem is it?** — correlated diagnostics, automatic
 
 ```
-sping google.com (142.251.140.238) via eth0  ⠹ probing...
+sping google.com (216.58.204.174) via eth0  ⠙ probing...
 
-Pulse      ▁▂▁▁▃▂▂▄▁✕▁▂▂▃▁▂▃▄▅▆▇█▅▃▁▂▃▄▅▆▇█▅▃▁▂▃▄▅▆
-Latency    now 14.2 ms · avg 13.8 · min 13.2 · max 15.1 · jitter 0.3 · dns 18.8 ms
-Status     Reachable · loss 0% · sent 42 · recv 42 · ttl 116 (Windows) · hops ~12
+Pulse      █▇▆█▁▃█▄
+Latency    now 13.8 ms · avg 13.9 ms · min 13.6 ms · max 14.1 ms · jitter 0.19 ms · dns 18.5 ms
+Status     Reachable · loss 0% · sent 8 · recv 8 · ttl 112 (Windows) · hops ~16
 Context    if eth0 · 192.168.1.100/24 · gw ● · wan ● · public
 Quality    A (100) · stable
 ```
@@ -27,11 +29,11 @@ sping 192.168.1.1 8.8.8.8 google.com
 ```
 
 ```
-Target                RTT        Avg    Loss    Qual     Trend        TTL  Hops
+Target                      RTT        Avg   Loss    Qual      Trend        TTL  Hops
 ───────────────────────────────────────────────────────────────────────────────
-192.168.1.1        0.48 ms   0.48 ms      0%    A100    stable    64(Lin)    ~0
-8.8.8.8           13.4 ms   13.5 ms      0%    A100    stable   116(Win)   ~12
-google.com        37.3 ms   37.4 ms      0%    A100    stable   105(Win)   ~23
+192.168.1.1             0.31 ms    0.30 ms     0%    A100     stable    64(Lin)    ~0
+8.8.8.8                 13.6 ms    13.6 ms     0%    A100     stable   112(Win)   ~16
+google.com (216.58.…    13.7 ms    13.6 ms     0%    A100     stable   112(Win)   ~16
 ```
 
 ## Install
@@ -155,8 +157,8 @@ sping --batch hosts.txt -c 50 -i 200
 
 Output (summary):
 ```
-8.8.8.8                  10/10  0%  avg 13.5 ms  min 13.3  max 13.8  jitter 0.17  ttl 116 (Windows) hops ~12  A(100) stable
-1.1.1.1                  10/10  0%  avg 31.4 ms  min 31.2  max 31.7  jitter 0.19  ttl 50 (Linux) hops ~14    A(100) stable
+8.8.8.8                  10/10  0%  avg 13.6 ms  min 13.6 ms  max 13.7 ms  jitter 0.05 ms  ttl 112 (Windows) hops ~16  A(100) stable
+1.1.1.1                  10/10  0%  avg 20.0 ms  min 19.9 ms  max 20.1 ms  jitter 0.08 ms  ttl 52 (Linux) hops ~12  A(100) stable
 ```
 
 All targets are probed in parallel. Full diagnostics (quality, trend, spikes) included.
@@ -215,7 +217,7 @@ sudo setcap cap_net_raw+ep /usr/bin/sping
 | TTL | recvmsg | IP header | API |
 | Gateway detection | /proc/net/route | `route` command | `route print` |
 | Interface detection | /proc/net/route | `ifconfig` | `ipconfig` |
-| `-I` interface | SO_BINDTODEVICE | unsupported | unsupported |
+| `-I` interface | SO_BINDTODEVICE | accepted, no effect | warning, unbound |
 | `-S` source | bind() | bind() | OS routes |
 | Admin required | No | No | No |
 | All views | full | full | full |
@@ -238,7 +240,8 @@ x86_64/aarch64, macOS arm64 and Windows x86_64.
 
 ## Known limitations
 
-- `-I`/`--interface` (bind to interface) is Linux-only; `-S`/`--source` is
+- `-I`/`--interface` binds only on Linux: macOS accepts the flag but it has
+  no effect, Windows prints a warning and probes unbound. `-S`/`--source` is
   ignored on Windows, where the OS picks the route.
 - The raw-socket fallback and `-I` need `CAP_NET_RAW` (see
   [SECURITY.md](SECURITY.md)); the unprivileged DGRAM path covers the common
@@ -256,9 +259,9 @@ x86_64/aarch64, macOS arm64 and Windows x86_64.
 | Metric | Value |
 |--------|-------|
 | Binary | 1.6 MB (stripped + LTO) |
-| RAM | ~2 MB |
-| CPU | 0.0% |
-| Code | ~6,500 lines Rust |
+| RAM | ~4 MB resident |
+| CPU | < 1% at two probes per second |
+| Code | ~6,900 lines Rust |
 | Tests | 103 (84 unit + 19 E2E) |
 
 ## License
