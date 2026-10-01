@@ -392,8 +392,9 @@ pub async fn run_batch(cfg: Config) -> anyhow::Result<i32> {
     let is_json = matches!(cfg.view, ViewMode::Json);
 
     eprintln!(
-        "Batch: {} targets × {} probes (interval {}ms)",
+        "Batch: {} targets {} {} probes (interval {}ms)",
         cfg.targets.len(),
+        icons::times(),
         count,
         cfg.interval.as_millis()
     );

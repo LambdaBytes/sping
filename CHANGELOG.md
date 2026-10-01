@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.5.3
+
+### Fixes
+- `--ascii` (and non-UTF-8 locales): the gateway/WAN indicators on the
+  `Context` line (`o` up, `x` down, `?` unknown) and the `x` in the batch
+  banner follow the charset; the output is now pure ASCII in that mode.
+
+### Docs
+- README: a demo recording at the top and an 80-second tour of every view and
+  mode at the end; the examples are real output of this version.
+
 ## v1.5.2
 
 ### Fixes

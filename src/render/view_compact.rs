@@ -135,11 +135,11 @@ pub fn draw_inline(
             ctx.interface, ctx.local_ip, ctx.prefix_len
         )?;
         let gw_ind = gw
-            .map(|g| format!("{}", g.reachability))
+            .map(|g| icons::reach_glyph(g.reachability).to_string())
             .unwrap_or_else(|| "?".into());
         write!(w, "{sep}gw {gw_ind}")?;
         let wan_ind = wan
-            .map(|w| format!("{}", w.reachability))
+            .map(|w| icons::reach_glyph(w.reachability).to_string())
             .unwrap_or_else(|| "?".into());
         write!(w, "{sep}wan {wan_ind}{sep}{}", ctx.target_class)?;
         queue!(w, terminal::Clear(terminal::ClearType::UntilNewLine))?;

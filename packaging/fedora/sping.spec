@@ -4,7 +4,7 @@
 %global crate sping
 
 Name:           sping
-Version:        1.5.2
+Version:        1.5.3
 Release:        %autorelease
 Summary:        Terminal-native real-time connectivity monitor with network context diagnostics
 

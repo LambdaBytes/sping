@@ -5,6 +5,8 @@
 use std::io::IsTerminal;
 use std::sync::OnceLock;
 
+use crate::diagnostics::health::Reachability;
+
 /// Spinner frames (Unicode braille).
 const SPINNER_UTF8: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 /// Spinner frames (ASCII fallback).
@@ -95,6 +97,26 @@ pub fn hline(n: usize) -> String {
     }
 }
 
+/// Reachability indicator of the gateway/WAN probes on the Context line.
+pub fn reach_glyph(r: Reachability) -> &'static str {
+    reach_glyph_for(r, is_ascii())
+}
+
+fn reach_glyph_for(r: Reachability, ascii: bool) -> &'static str {
+    match (r, ascii) {
+        (Reachability::Unknown, _) => "?",
+        (Reachability::Online, false) => "●",
+        (Reachability::Online, true) => "o",
+        (Reachability::Offline, false) => "○",
+        (Reachability::Offline, true) => "x",
+    }
+}
+
+/// Multiplication sign for "N targets × M probes".
+pub fn times() -> &'static str {
+    if is_ascii() { "x" } else { "×" }
+}
+
 /// Echo-path glyphs: (path, probe, target, probe-at-target).
 pub fn path_glyphs() -> (char, char, char, char) {
     if is_ascii() {
@@ -122,4 +144,22 @@ fn ansi_enabled() -> bool {
 #[cfg(not(windows))]
 fn ansi_enabled() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reachability_glyphs_stay_ascii_in_ascii_mode() {
+        for (r, unicode, ascii) in [
+            (Reachability::Online, "●", "o"),
+            (Reachability::Offline, "○", "x"),
+            (Reachability::Unknown, "?", "?"),
+        ] {
+            assert_eq!(reach_glyph_for(r, false), unicode);
+            assert_eq!(reach_glyph_for(r, true), ascii);
+            assert!(reach_glyph_for(r, true).is_ascii());
+        }
+    }
 }

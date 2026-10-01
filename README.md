@@ -56,7 +56,7 @@ Verify with `SHA256SUMS` from the same release.
 ### Debian / Ubuntu (.deb)
 
 ```bash
-sudo dpkg -i sping_1.5.2-1_amd64.deb     # or _arm64.deb on aarch64
+sudo dpkg -i sping_1.5.3-1_amd64.deb     # or _arm64.deb on aarch64
 ```
 
 The package installs:
@@ -262,7 +262,16 @@ x86_64/aarch64, macOS arm64 and Windows x86_64.
 | RAM | ~4 MB resident |
 | CPU | < 1% at two probes per second |
 | Code | ~6,900 lines Rust |
-| Tests | 103 (84 unit + 19 E2E) |
+| Tests | 104 (85 unit + 19 E2E) |
+
+## Tour
+
+Every view and mode in 80 seconds: the multi-target panel, batch mode from a
+file, NDJSON with `jq`, the extended view, the classic ping-compatible view
+with its exit codes, the diagnostics on a failing target, and the small things
+(interfaces, `NO_COLOR`, DNS timing).
+
+![sping tour: panel, batch, NDJSON, extended, classic, diagnostics](docs/sping-tour.gif)
 
 ## License
 

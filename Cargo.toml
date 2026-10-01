@@ -1,6 +1,6 @@
 [package]
 name = "sping"
-version = "1.5.2"
+version = "1.5.3"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Antonio Cotos <acf981@protonmail.com>"]
