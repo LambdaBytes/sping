@@ -1,0 +1,113 @@
+name: Nixpkgs package validation
+
+on:
+  push:
+    branches: [nixpkgs-sping-validation]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Build Nixpkgs package and resolve fixed-output hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > /tmp/package.nix <<'EOF'
+          {
+            lib,
+            rustPlatform,
+            fetchFromGitHub,
+            installShellFiles,
+          }:
+
+          rustPlatform.buildRustPackage (finalAttrs: {
+            pname = "sping";
+            version = "1.5.3";
+
+            src = fetchFromGitHub {
+              owner = "LambdaBytes";
+              repo = "sping";
+              tag = "v${finalAttrs.version}";
+              hash = lib.fakeHash;
+            };
+
+            cargoHash = lib.fakeHash;
+
+            nativeBuildInputs = [ installShellFiles ];
+
+            postInstall = ''
+              installManPage target/assets/man/sping.1
+              installShellCompletion target/assets/completions/{sping.bash,_sping,sping.fish}
+            '';
+
+            meta = {
+              description = "Terminal-native real-time connectivity monitor with network context diagnostics";
+              homepage = "https://github.com/LambdaBytes/sping";
+              changelog = "https://github.com/LambdaBytes/sping/releases/tag/v${finalAttrs.version}";
+              license = lib.licenses.mit;
+              maintainers = [ ];
+              mainProgram = "sping";
+            };
+          })
+          EOF
+
+          build_expr='let pkgs = import <nixpkgs> {}; in pkgs.callPackage /tmp/package.nix {}'
+
+          resolve_hash() {
+            local log="$1"
+            local out
+            set +e
+            out="$(nix-build --no-out-link -E "$build_expr" 2>&1)"
+            local rc=$?
+            set -e
+            printf '%s\n' "$out" | tee "$log"
+            if [ "$rc" -eq 0 ]; then
+              echo "Expected a fixed-output hash mismatch but the build succeeded." >&2
+              return 1
+            fi
+            printf '%s\n' "$out" | sed -nE 's/^[[:space:]]*got:[[:space:]]*(sha256-[A-Za-z0-9+\/=]+).*$/\1/p' | tail -n1
+          }
+
+          src_hash="$(resolve_hash /tmp/source-hash.log | tail -n1)"
+          if [[ "$src_hash" != sha256-* ]]; then
+            echo "Could not resolve source hash" >&2
+            exit 1
+          fi
+          sed -i "0,/hash = lib.fakeHash;/s||hash = \"$src_hash\";|" /tmp/package.nix
+
+          cargo_hash="$(resolve_hash /tmp/cargo-hash.log | tail -n1)"
+          if [[ "$cargo_hash" != sha256-* ]]; then
+            echo "Could not resolve cargoHash" >&2
+            exit 1
+          fi
+          sed -i "0,/cargoHash = lib.fakeHash;/s||cargoHash = \"$cargo_hash\";|" /tmp/package.nix
+
+          echo "Resolved src hash:   $src_hash"
+          echo "Resolved cargoHash:  $cargo_hash"
+          echo
+          echo "Final package.nix:"
+          cat /tmp/package.nix
+
+          nix-build -E "$build_expr" -o result
+
+          ./result/bin/sping --version
+          ./result/bin/sping --help >/dev/null
+
+          test -x result/bin/sping
+          test -f result/share/man/man1/sping.1
+          test -f result/share/bash-completion/completions/sping
+          test -f result/share/zsh/site-functions/_sping
+          test -f result/share/fish/vendor_completions.d/sping.fish
+
+          echo
+          echo "Nix build and installed assets validated successfully."
