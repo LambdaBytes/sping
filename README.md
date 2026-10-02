@@ -2,6 +2,8 @@
 
 A modern ping for humans. Terminal-native, real-time connectivity monitor that doesn't just measure packets — **it interprets network context**.
 
+![sping](docs/sping-logo.png)
+
 ![sping probing 8.8.8.8 in the compact view](docs/sping.gif)
 
 **Status:** functional and in active use, with a frozen JSON contract.
@@ -56,7 +58,7 @@ Verify with `SHA256SUMS` from the same release.
 ### Debian / Ubuntu (.deb)
 
 ```bash
-sudo dpkg -i sping_1.5.3-1_amd64.deb     # or _arm64.deb on aarch64
+sudo dpkg -i sping_1.5.4-1_amd64.deb     # or _arm64.deb on aarch64
 ```
 
 The package installs:
@@ -114,7 +116,8 @@ sping 8.8.8.8 -t 10               # outgoing TTL / hop limit
 sping 8.8.8.8 -c 10 -q            # quiet: summary only (classic)
 sping example.com -4              # force IPv4 (-6 for IPv6)
 
-# ASCII-only output (auto-enabled on non-UTF-8 locales); NO_COLOR honored
+# ASCII-only output: automatic on non-UTF-8 locales and on the legacy
+# Windows console (SPING_ASCII=0 forces Unicode); NO_COLOR honored
 sping 8.8.8.8 --ascii
 
 # List interfaces
@@ -216,7 +219,7 @@ sudo setcap cap_net_raw+ep /usr/bin/sping
 | IPv6 | ICMPv6 DGRAM | ICMPv6 DGRAM | Icmp6SendEcho2 |
 | TTL | recvmsg | IP header | API |
 | Gateway detection | /proc/net/route | `route` command | `route print` |
-| Interface detection | /proc/net/route | `ifconfig` | `ipconfig` |
+| Interface detection | /proc/net/route, if_inet6 | `ifconfig` | `ipconfig` |
 | `-I` interface | SO_BINDTODEVICE | accepted, no effect | warning, unbound |
 | `-S` source | bind() | bind() | OS routes |
 | Admin required | No | No | No |
@@ -248,6 +251,9 @@ x86_64/aarch64, macOS arm64 and Windows x86_64.
   case.
 - Reverse DNS / hostname display follows the system resolver; there is no
   built-in DNS cache beyond the re-resolution interval.
+- IPv6 replies carry a hop limit (`ttl`) on Linux only; on macOS and Windows
+  it is not shown (`0` in JSON). Gateway detection and `--list-interfaces` are
+  IPv4 only.
 
 ## Roadmap
 
@@ -261,8 +267,8 @@ x86_64/aarch64, macOS arm64 and Windows x86_64.
 | Binary | 1.6 MB (stripped + LTO) |
 | RAM | ~4 MB resident |
 | CPU | < 1% at two probes per second |
-| Code | ~6,900 lines Rust |
-| Tests | 104 (85 unit + 19 E2E) |
+| Code | ~7,300 lines Rust |
+| Tests | 111 (92 unit + 19 E2E) |
 
 ## Tour
 

@@ -70,7 +70,7 @@ pub struct Args {
     #[arg(long, default_value = "1.1.1.1")]
     pub wan_probe: String,
 
-    /// ASCII-only output (no Unicode glyphs); auto-enabled on non-UTF-8 locales
+    /// ASCII-only output (no Unicode glyphs); automatic on non-UTF-8 locales and on the legacy Windows console. SPING_ASCII=0 forces Unicode
     #[arg(long)]
     pub ascii: bool,
 

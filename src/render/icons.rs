@@ -14,25 +14,40 @@ const SPINNER_ASCII: &[char] = &['|', '/', '-', '\\'];
 
 /// 8-level block characters for pulse and histogram.
 const BLOCKS_UTF8: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-const BLOCKS_ASCII: [char; 8] = ['_', '.', ',', '-', '=', '+', '*', '#'];
+/// ASCII ramp: four marks rising from the baseline (`_`) through the middle
+/// of the cell (`-`, `=`) to its top (`"`), each covering two levels. ASCII
+/// has no eighth-blocks, and eight unrelated marks read as noise.
+const BLOCKS_ASCII: [char; 8] = ['_', '_', '-', '-', '=', '=', '"', '"'];
 
 static ASCII: OnceLock<bool> = OnceLock::new();
 
-/// Fix the output charset once at startup: ASCII when forced by `--ascii`,
-/// `SPING_ASCII=1`, or a non-UTF-8 locale.
+/// Fix the output charset once at startup: ASCII when forced by `--ascii` or
+/// `SPING_ASCII=1`, Unicode when forced by `SPING_ASCII=0`, otherwise
+/// whatever the terminal is expected to draw correctly.
 pub fn init(force_ascii: bool) {
-    let ascii = force_ascii || env_forces_ascii() || !locale_is_utf8();
+    let env = std::env::var_os("SPING_ASCII");
+    let ascii = choose_ascii(force_ascii, env.as_deref(), terminal_draws_unicode());
     let _ = ASCII.set(ascii);
 }
 
-fn env_forces_ascii() -> bool {
-    std::env::var_os("SPING_ASCII").is_some_and(|v| v != "0")
+fn choose_ascii(force_ascii: bool, env: Option<&std::ffi::OsStr>, terminal_unicode: bool) -> bool {
+    if force_ascii {
+        return true;
+    }
+    match env {
+        Some(v) if v.is_empty() => !terminal_unicode,
+        Some(v) => v != "0",
+        None => !terminal_unicode,
+    }
 }
 
-fn locale_is_utf8() -> bool {
-    // Windows consoles render Unicode via WriteConsoleW regardless of codepage.
+/// Whether the terminal is expected to draw the Unicode charset: a UTF-8
+/// locale on Unix; on Windows, a terminal that announces itself. The console
+/// accepts any Unicode (`WriteConsoleW`), but the legacy console host's fonts
+/// lack the eighth-block and braille glyphs, so there they come out as boxes.
+fn terminal_draws_unicode() -> bool {
     if cfg!(windows) {
-        return true;
+        return windows_terminal_announced();
     }
     for var in ["LC_ALL", "LC_CTYPE", "LANG"] {
         if let Ok(v) = std::env::var(var)
@@ -44,6 +59,15 @@ fn locale_is_utf8() -> bool {
     }
     // No locale info (containers, init systems): be conservative.
     false
+}
+
+/// Windows Terminal (`WT_SESSION`), VS Code, WezTerm, Hyper and the like
+/// (`TERM_PROGRAM`) and ConEmu/cmder (`ConEmuANSI`) export a variable; the
+/// legacy console host exports none of them.
+fn windows_terminal_announced() -> bool {
+    ["WT_SESSION", "TERM_PROGRAM", "ConEmuANSI"]
+        .iter()
+        .any(|var| std::env::var_os(var).is_some_and(|v| !v.is_empty()))
 }
 
 fn is_ascii() -> bool {
@@ -149,6 +173,29 @@ fn ansi_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn charset_choice_follows_flag_env_and_terminal() {
+        // Nothing forced: the terminal decides.
+        assert!(!choose_ascii(false, None, true));
+        assert!(choose_ascii(false, None, false));
+        // --ascii wins over everything.
+        assert!(choose_ascii(true, Some(OsStr::new("0")), true));
+        // SPING_ASCII=1 forces ASCII; SPING_ASCII=0 forces Unicode even on a
+        // terminal we would not trust; an empty value is as good as unset.
+        assert!(choose_ascii(false, Some(OsStr::new("1")), true));
+        assert!(!choose_ascii(false, Some(OsStr::new("0")), false));
+        assert!(choose_ascii(false, Some(OsStr::new("")), false));
+    }
+
+    #[test]
+    fn ascii_blocks_are_ascii_and_one_column() {
+        for c in BLOCKS_ASCII {
+            assert!(c.is_ascii() && !c.is_ascii_whitespace(), "{c:?}");
+        }
+        assert_eq!(BLOCKS_ASCII.len(), BLOCKS_UTF8.len());
+    }
 
     #[test]
     fn reachability_glyphs_stay_ascii_in_ascii_mode() {

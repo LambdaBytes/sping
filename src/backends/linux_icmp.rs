@@ -204,7 +204,8 @@ fn recv_with_ttl(fd: i32, buf: &mut [u8]) -> io::Result<(usize, u8, Option<i128>
     };
 
     // 8-byte alignment so CMSG_FIRSTHDR's cast to `*cmsghdr` is well-aligned;
-    // a plain `[u8; N]` would not guarantee it. Holds IP_TTL + SCM_TIMESTAMPNS.
+    // a plain `[u8; N]` would not guarantee it. Holds IP_TTL (or
+    // IPV6_HOPLIMIT) + SCM_TIMESTAMPNS.
     #[repr(align(8))]
     struct CmsgBuf([u8; 128]);
     let mut cmsg_buf = CmsgBuf([0u8; 128]);
@@ -243,7 +244,9 @@ fn recv_with_ttl(fd: i32, buf: &mut [u8]) -> io::Result<(usize, u8, Option<i128>
     let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
     while !cmsg.is_null() {
         let hdr = unsafe { &*cmsg };
-        if hdr.cmsg_level == libc::IPPROTO_IP && hdr.cmsg_type == libc::IP_TTL {
+        if (hdr.cmsg_level == libc::IPPROTO_IP && hdr.cmsg_type == libc::IP_TTL)
+            || (hdr.cmsg_level == libc::IPPROTO_IPV6 && hdr.cmsg_type == libc::IPV6_HOPLIMIT)
+        {
             let data = unsafe { libc::CMSG_DATA(cmsg) };
             let val = unsafe { ptr::read_unaligned(data as *const i32) };
             ttl = val as u8;
@@ -358,6 +361,21 @@ impl LinuxIcmpBackend {
     pub fn new_v6() -> io::Result<Self> {
         let (socket, is_raw) = open_icmp_socket(Domain::IPV6, Protocol::ICMPV6)?;
         socket.set_nonblocking(false)?;
+        // Request IPV6_HOPLIMIT ancillary data on received datagrams (Linux
+        // only): neither socket type delivers the IPv6 header in the payload.
+        // SAFETY: passes a pointer to a live c_int and its exact size to
+        // setsockopt on a valid fd.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let val: libc::c_int = 1;
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_IPV6,
+                libc::IPV6_RECVHOPLIMIT,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
         enable_rx_timestamps(&socket);
         let identifier = std::process::id() as u16;
         Ok(Self {
@@ -729,10 +747,11 @@ mod tests {
         assert!(v6_source_ok(false, None, target));
     }
 
-    /// The RAW ICMPv6 source filter depends on recvmsg reporting the sender.
+    /// The RAW ICMPv6 source filter depends on recvmsg reporting the sender,
+    /// and the TTL column on it reporting the hop limit.
     #[cfg(target_os = "linux")]
     #[test]
-    fn recv_reports_sender_on_loopback() {
+    fn recv_reports_sender_and_hop_limit_on_loopback() {
         let target = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
         let Ok(backend) = LinuxIcmpBackend::new_v6() else {
             return; // no ICMPv6 socket permission in this environment
@@ -753,10 +772,11 @@ mod tests {
                 backend.rearm_timeout(start, budget).is_some(),
                 "no echo reply from ::1 within {budget:?}"
             );
-            let (n, _, _, source) =
+            let (n, hop_limit, _, source) =
                 recv_with_ttl(backend.as_raw_fd(), &mut buf).expect("echo reply from ::1");
             if parse_echo_reply_v6(&buf[..n], 1, expected_id) {
                 assert_eq!(source, Some(target));
+                assert!(hop_limit > 0, "IPV6_HOPLIMIT missing from the reply");
                 return;
             }
         }

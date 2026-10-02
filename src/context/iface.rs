@@ -16,17 +16,22 @@ pub struct InterfaceInfo {
 /// Detect the local IP used to reach `target` (UDP connect trick: no packet
 /// is sent, the kernel only selects a source address). `None` if no route.
 pub fn detect_local_ip(target: IpAddr) -> Option<IpAddr> {
-    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    let bind = if target.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let sock = UdpSocket::bind(bind).ok()?;
     sock.connect(SocketAddr::new(target, 80)).ok()?;
     let local = sock.local_addr().ok()?;
     Some(local.ip())
 }
 
-/// Find the interface name and prefix for `local_ip`. `None` for IPv6 and
-/// when no data source (routing table, gateway, platform tool) matches.
+/// Find the interface name and prefix for `local_ip`. `None` when no data
+/// source (routing table, address table, gateway, platform tool) matches.
 pub fn interface_for_ip(local_ip: IpAddr) -> Option<InterfaceInfo> {
     let IpAddr::V4(_v4) = local_ip else {
-        return None;
+        return interface_for_ipv6(local_ip);
     };
 
     // Routing table is empty off Linux, so this loop is a no-op there.
@@ -105,16 +110,72 @@ pub fn list_interfaces() -> Vec<InterfaceInfo> {
         }
     }
 
+    // IPv4 only, like the Linux listing above.
     #[cfg(target_os = "macos")]
     {
         list_interfaces_ifconfig()
+            .into_iter()
+            .filter(|i| i.ip.is_ipv4())
+            .collect()
     }
     #[cfg(target_os = "windows")]
     {
         list_interfaces_ipconfig()
+            .into_iter()
+            .filter(|i| i.ip.is_ipv4())
+            .collect()
     }
     #[cfg(target_os = "linux")]
     Vec::new()
+}
+
+/// IPv6 counterpart of [`interface_for_ip`]: the kernel's address table on
+/// Linux, the platform tool elsewhere.
+fn interface_for_ipv6(local_ip: IpAddr) -> Option<InterfaceInfo> {
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/net/if_inet6").ok()?;
+        parse_if_inet6(&text).into_iter().find(|i| i.ip == local_ip)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        interface_from_ifconfig(local_ip)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        interface_from_ipconfig(local_ip)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = local_ip;
+        None
+    }
+}
+
+/// Parse `/proc/net/if_inet6`: one address per line, `<32 hex digits>
+/// <ifindex> <prefix len, hex> <scope> <flags> <name>`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_if_inet6(text: &str) -> Vec<InterfaceInfo> {
+    text.lines()
+        .filter_map(|line| {
+            let mut f = line.split_whitespace();
+            let (addr, _idx, prefix, _scope, _flags, name) = (
+                f.next()?,
+                f.next()?,
+                f.next()?,
+                f.next()?,
+                f.next()?,
+                f.next()?,
+            );
+            let bits = u128::from_str_radix(addr, 16).ok()?;
+            let prefix_len = u8::from_str_radix(prefix, 16).ok()?;
+            Some(InterfaceInfo {
+                name: name.to_string(),
+                ip: IpAddr::V6(std::net::Ipv6Addr::from(bits)),
+                prefix_len,
+            })
+        })
+        .collect()
 }
 
 // ── macOS: ifconfig parsing ──────────────────────────────────────────
@@ -136,7 +197,7 @@ fn list_interfaces_ifconfig() -> Vec<InterfaceInfo> {
     parse_ifconfig(&text)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn parse_ifconfig(text: &str) -> Vec<InterfaceInfo> {
     let mut result = Vec::new();
     let mut current_iface = String::new();
@@ -169,11 +230,31 @@ fn parse_ifconfig(text: &str) -> Vec<InterfaceInfo> {
                 });
             }
         }
+        // "inet6 fe80::1%en0 prefixlen 64 secured scopeid 0x4": the zone
+        // suffix is not part of the address.
+        if trimmed.starts_with("inet6 ") {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 4
+                && parts[2] == "prefixlen"
+                && let Ok(ip) = parts[1]
+                    .split('%')
+                    .next()
+                    .unwrap_or("")
+                    .parse::<std::net::Ipv6Addr>()
+                && let Ok(prefix) = parts[3].parse::<u8>()
+            {
+                result.push(InterfaceInfo {
+                    name: current_iface.clone(),
+                    ip: IpAddr::V6(ip),
+                    prefix_len: prefix,
+                });
+            }
+        }
     }
     result
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn parse_hex_netmask(hex: &str) -> u8 {
     let hex = hex.trim_start_matches("0x");
     let val = u32::from_str_radix(hex, 16).unwrap_or(0);
@@ -203,7 +284,7 @@ fn list_interfaces_ipconfig() -> Vec<InterfaceInfo> {
     parse_ipconfig(&text)
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn parse_ipconfig(text: &str) -> Vec<InterfaceInfo> {
     let mut result = Vec::new();
     let mut current_iface = String::new();
@@ -243,6 +324,30 @@ fn parse_ipconfig(text: &str) -> Vec<InterfaceInfo> {
             current_ip = ip_str.trim().parse::<Ipv4Addr>().ok();
         }
 
+        // IPv6 line: "   IPv6 Address. . . . . . . . . . . : 2001:db8::1"
+        // (localized labels still contain "IPv6", and may contain ": "
+        // themselves: "Vínculo: dirección IPv6 local. . . : fe80::1%12"). The
+        // value follows the last ": "; a "%zone" suffix is dropped. ipconfig
+        // gives no prefix.
+        if line.starts_with(' ')
+            && trimmed.contains("IPv6")
+            && let Some((_, value)) = trimmed.rsplit_once(": ")
+            && let Ok(ip) = value
+                .trim()
+                .split('%')
+                .next()
+                .unwrap_or("")
+                .parse::<std::net::Ipv6Addr>()
+            && !ip.is_loopback()
+            && !ip.is_unspecified()
+        {
+            result.push(InterfaceInfo {
+                name: current_iface.clone(),
+                ip: IpAddr::V6(ip),
+                prefix_len: 0,
+            });
+        }
+
         // Subnet mask: "   Subnet Mask . . . . . . . . . . . : 255.255.255.0"
         // Localized: "Máscara de subred" — match the accent-safe "scara" stem
         // ("á" survives neither OEM codepages nor from_utf8_lossy intact).
@@ -277,4 +382,122 @@ fn parse_ipconfig(text: &str) -> Vec<InterfaceInfo> {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry<'a>(list: &'a [InterfaceInfo], ip: &str) -> &'a InterfaceInfo {
+        let ip: IpAddr = ip.parse().unwrap();
+        list.iter()
+            .find(|i| i.ip == ip)
+            .unwrap_or_else(|| panic!("{ip} not parsed"))
+    }
+
+    #[test]
+    fn if_inet6_gives_name_and_prefix() {
+        let text = "\
+fe800000000000005054ff0000005ae2 02 40 20 80    ens18
+20010db8000000010000000000000010 02 40 00 80    ens18
+00000000000000000000000000000001 01 80 10 80       lo
+garbage line
+";
+        let list = parse_if_inet6(text);
+        assert_eq!(list.len(), 3);
+        let e = entry(&list, "2001:db8:0:1::10");
+        assert_eq!((e.name.as_str(), e.prefix_len), ("ens18", 64));
+        let e = entry(&list, "::1");
+        assert_eq!((e.name.as_str(), e.prefix_len), ("lo", 128));
+        assert_eq!(entry(&list, "fe80::5054:ff00:0:5ae2").name, "ens18");
+    }
+
+    #[test]
+    fn ifconfig_gives_both_families() {
+        let text = "\
+lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+\tinet 127.0.0.1 netmask 0xff000000
+\tinet6 ::1 prefixlen 128
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet6 fe80::1c2b:3d4e:5f60:7182%en0 prefixlen 64 secured scopeid 0xb
+\tinet 192.168.1.20 netmask 0xffffff00 broadcast 192.168.1.255
+\tinet6 2001:db8:1::20 prefixlen 64 autoconf secured
+";
+        let list = parse_ifconfig(text);
+        let e = entry(&list, "192.168.1.20");
+        assert_eq!((e.name.as_str(), e.prefix_len), ("en0", 24));
+        let e = entry(&list, "2001:db8:1::20");
+        assert_eq!((e.name.as_str(), e.prefix_len), ("en0", 64));
+        // The zone suffix is not part of the address.
+        let e = entry(&list, "fe80::1c2b:3d4e:5f60:7182");
+        assert_eq!((e.name.as_str(), e.prefix_len), ("en0", 64));
+        assert_eq!(entry(&list, "::1").name, "lo0");
+        assert!(
+            !list
+                .iter()
+                .any(|i| i.ip == "127.0.0.1".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn ipconfig_gives_both_families() {
+        let text = "\
+Windows IP Configuration
+
+
+Ethernet adapter Ethernet 3:
+
+   Connection-specific DNS Suffix  . : lan
+   IPv6 Address. . . . . . . . . . . : 2001:db8:1::31
+   Temporary IPv6 Address. . . . . . : 2001:db8:1:0:1234:5678:9abc:def0
+   Link-local IPv6 Address . . . . . : fe80::9d2e:4bfb:a4a2:eb3%12
+   IPv4 Address. . . . . . . . . . . : 192.168.1.31
+   Subnet Mask . . . . . . . . . . . : 255.255.255.0
+   Default Gateway . . . . . . . . . : 192.168.1.1
+";
+        let list = parse_ipconfig(text);
+        let e = entry(&list, "192.168.1.31");
+        assert_eq!((e.name.as_str(), e.prefix_len), ("Ethernet 3", 24));
+        for ip in [
+            "2001:db8:1::31",
+            "2001:db8:1:0:1234:5678:9abc:def0",
+            "fe80::9d2e:4bfb:a4a2:eb3",
+        ] {
+            let e = entry(&list, ip);
+            assert_eq!((e.name.as_str(), e.prefix_len), ("Ethernet 3", 0));
+        }
+    }
+
+    /// Spanish Windows: no " adapter " marker, and the link-local label has
+    /// a ": " of its own.
+    #[test]
+    fn ipconfig_localized_labels() {
+        let text = "\
+Configuración IP de Windows
+
+
+Adaptador de Ethernet Ethernet 3:
+
+   Sufijo DNS específico para la conexión. . : lan
+   Dirección IPv6 . . . . . . . . . . : 2001:db8:1::31
+   Dirección IPv6 temporal. . . . . . : 2001:db8:1:0:1234:5678:9abc:def0
+   Vínculo: dirección IPv6 local. . . : fe80::9d2e:4bfb:a4a2:eb3%12
+   Dirección IPv4. . . . . . . . . . . . . . : 192.168.1.31
+   Máscara de subred . . . . . . . . . . . . : 255.255.255.0
+   Puerta de enlace predeterminada . . . . . : 192.168.1.1
+";
+        let list = parse_ipconfig(text);
+        let e = entry(&list, "192.168.1.31");
+        assert_eq!(
+            (e.name.as_str(), e.prefix_len),
+            ("Adaptador de Ethernet Ethernet 3", 24)
+        );
+        for ip in [
+            "2001:db8:1::31",
+            "2001:db8:1:0:1234:5678:9abc:def0",
+            "fe80::9d2e:4bfb:a4a2:eb3",
+        ] {
+            assert_eq!(entry(&list, ip).name, "Adaptador de Ethernet Ethernet 3");
+        }
+    }
 }

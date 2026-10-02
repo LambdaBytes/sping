@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.5.4
+
+### Fixes
+- Windows: ASCII output is selected automatically on the legacy console host
+  (cmd.exe / PowerShell outside Windows Terminal, VS Code, ConEmu), whose
+  fonts draw the pulse blocks and the spinner as boxes. `SPING_ASCII=0` forces
+  the Unicode charset on any terminal.
+- The ASCII pulse uses four marks of increasing height (`_` `-` `=` `"`)
+  instead of eight unrelated ones.
+- IPv6 targets: the `Init:` and `Context` lines show the real source address,
+  interface and prefix (`if lo · ::1/128`) instead of `0.0.0.0/0`, and the
+  target is classified like IPv4 (`::1` and unique-local `fc00::/7` are
+  `routed internal`, an address inside the local prefix is `same LAN`); `::1`
+  was reported as `public`. Linux: ICMPv6 replies now carry their hop limit
+  in the `ttl` column; it was `0`.
+
+### Docs
+- README: project logo. The logo and the recordings carry no provenance
+  manifest or tool metadata, only what the image format needs.
+
 ## v1.5.3
 
 ### Fixes
