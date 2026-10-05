@@ -175,7 +175,7 @@ mod imp {
 
         /// Source binding is unavailable through `IcmpSendEcho`; warns on
         /// stderr instead of silently ignoring `-S`.
-        pub fn bind_source(&self, _addr: IpAddr) -> io::Result<()> {
+        pub fn bind_source(&self, _addr: IpAddr, _scope_id: u32) -> io::Result<()> {
             eprintln!("warning: -S/--source is ignored on Windows (OS picks the route)");
             Ok(())
         }
@@ -304,12 +304,14 @@ mod imp {
                 sin6_addr: [0u8; 16],
                 sin6_scope_id: 0,
             };
+            // The zone index of a link-local target (`fe80::1%12`) selects
+            // the interface; 0 for every other address.
             let mut dst = SockAddrIn6 {
                 sin6_family: AF_INET6,
                 sin6_port: 0,
                 sin6_flowinfo: 0,
                 sin6_addr: addr,
-                sin6_scope_id: 0,
+                sin6_scope_id: opts.scope_id,
             };
 
             // `Ttl` is the IPv6 hop limit here (see `options`).

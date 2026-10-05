@@ -183,9 +183,13 @@ impl Config {
     }
 
     /// Probe options shared by every targeted probe loop.
-    pub fn probe_options(&self, target: IpAddr) -> crate::probe::types::ProbeOptions {
+    pub fn probe_options(
+        &self,
+        target: crate::context::dns::ResolvedAddr,
+    ) -> crate::probe::types::ProbeOptions {
         crate::probe::types::ProbeOptions {
-            target,
+            target: target.ip,
+            scope_id: target.scope_id,
             timeout: self.timeout,
             payload_size: self.payload_size,
             ttl: self.ttl,

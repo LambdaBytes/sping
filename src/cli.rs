@@ -11,7 +11,7 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(name = "sping", version, about)]
 pub struct Args {
-    /// Target host(s) — IP or hostname. Multiple targets enable dashboard mode.
+    /// Target host(s) — IP or hostname; an IPv6 link-local address needs its zone (fe80::1%eth0). Multiple targets enable dashboard mode.
     pub targets: Vec<String>,
 
     /// Network interface to bind to (e.g., eth0)

@@ -42,9 +42,11 @@ without administrator rights and do not open raw sockets.
 
 ## Memory safety
 
-The only `unsafe` code lives in the two ICMP backends: the socket and clock
-calls on Linux/macOS (`recvmsg`, `setsockopt`, `clock_gettime`, cmsg parsing
-and the view over a received buffer) and the `iphlpapi` calls on Windows. Each
-`unsafe` block carries a `// SAFETY:` justification. The build is checked with
+The `unsafe` code is confined to calls into the operating system: in the ICMP
+backends, the socket and clock calls on Linux/macOS (`recvmsg`, `setsockopt`,
+`clock_gettime`, cmsg parsing and the view over a received buffer) and the
+`iphlpapi` calls on Windows; in the network context, the Windows adapter list
+(`GetAdaptersAddresses`) and the interface index of an IPv6 zone
+(`if_nametoindex`). Each `unsafe` block carries a `// SAFETY:` justification. The build is checked with
 `cargo clippy --all-targets -- -D warnings` on Linux, macOS and Windows targets,
 and dependencies are scanned with `cargo audit` and `cargo deny`.

@@ -11,6 +11,7 @@ use tokio::time::MissedTickBehavior;
 
 use crate::backends::IcmpBackend;
 use crate::context::NetworkContext;
+use crate::context::dns::ResolvedAddr;
 use crate::diagnostics::health::HealthTracker;
 use crate::diagnostics::outage::OutageTracker;
 use crate::diagnostics::spikes::SpikeDetector;
@@ -23,7 +24,9 @@ const RE_RESOLVE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Runs the probe loop, sending ICMP at `interval` and publishing snapshots.
 /// Stops after `count` probes when set, or on shutdown. `ctx_rx`, when
-/// provided, delivers hot network-context updates reflected in later snapshots.
+/// provided, delivers hot network-context updates reflected in later snapshots;
+/// `target_tx`, when provided, is told the new address after a DNS failover,
+/// so that whoever detects the context does it for the address being probed.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     target_host: String,
@@ -36,6 +39,7 @@ pub async fn run(
     probe_tx: watch::Sender<Option<ProbeSnapshot>>,
     mut shutdown: watch::Receiver<bool>,
     mut ctx_rx: Option<watch::Receiver<NetworkContext>>,
+    target_tx: Option<watch::Sender<ResolvedAddr>>,
 ) {
     let backend = match create_backend(&opts) {
         Ok(b) => Arc::new(b),
@@ -68,8 +72,11 @@ pub async fn run(
 
     // Periodic DNS re-resolution for hostname targets: a failover that changes
     // the record should redirect probes without restarting sping.
-    let (resolve_tx, mut resolve_rx) = watch::channel(target_ip);
-    if target_host.parse::<IpAddr>().is_err() {
+    let (resolve_tx, mut resolve_rx) = watch::channel(ResolvedAddr {
+        ip: target_ip,
+        scope_id: opts.scope_id,
+    });
+    if !crate::context::dns::is_literal(&target_host) {
         let host = target_host.clone();
         let mut shutdown_rx = shutdown.clone();
         tokio::spawn(async move {
@@ -80,8 +87,8 @@ pub async fn run(
                 tokio::select! {
                     _ = ticker.tick() => {
                         let current = *resolve_tx.borrow();
-                        if let Some(new_ip) = crate::context::dns::re_resolve(&host, current).await {
-                            let _ = resolve_tx.send(new_ip);
+                        if let Some(new) = crate::context::dns::re_resolve(&host, current).await {
+                            let _ = resolve_tx.send(new);
                         }
                     }
                     _ = shutdown_rx.changed() => {
@@ -106,10 +113,12 @@ pub async fn run(
 
         // Apply a DNS failover (same address family, see dns::re_resolve).
         if resolve_rx.has_changed().unwrap_or(false) {
-            let new_ip = *resolve_rx.borrow_and_update();
-            if new_ip != target_ip {
-                target_ip = new_ip;
-                opts.target = new_ip;
+            let new = *resolve_rx.borrow_and_update();
+            target_ip = new.ip;
+            opts.target = new.ip;
+            opts.scope_id = new.scope_id;
+            if let Some(tx) = &target_tx {
+                let _ = tx.send(new);
             }
         }
 
@@ -219,7 +228,7 @@ pub(crate) fn create_backend(opts: &ProbeOptions) -> std::io::Result<IcmpBackend
     }
 
     if let Some(src) = opts.source {
-        backend.bind_source(src)?;
+        backend.bind_source(src, opts.scope_id)?;
     }
 
     if let Some(ttl) = opts.ttl {

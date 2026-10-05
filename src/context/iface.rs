@@ -1,8 +1,10 @@
-//! Local interface discovery: Linux via the routing table, macOS via
-//! `ifconfig`, Windows via `ipconfig` (locale-tolerant). Best-effort.
+//! Local interface discovery: Linux via the routing table and the kernel's
+//! IPv6 address table, macOS via `ifconfig`, Windows via the adapter API
+//! (`ipconfig` text as a fallback). Best-effort.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 
+use crate::context::dns::ResolvedAddr;
 use crate::context::route::{self, mask_to_prefix, read_routes};
 
 #[derive(Debug, Clone)]
@@ -15,23 +17,25 @@ pub struct InterfaceInfo {
 
 /// Detect the local IP used to reach `target` (UDP connect trick: no packet
 /// is sent, the kernel only selects a source address). `None` if no route.
-pub fn detect_local_ip(target: IpAddr) -> Option<IpAddr> {
-    let bind = if target.is_ipv6() {
+pub fn detect_local_ip(target: ResolvedAddr) -> Option<IpAddr> {
+    let bind = if target.ip.is_ipv6() {
         "[::]:0"
     } else {
         "0.0.0.0:0"
     };
     let sock = UdpSocket::bind(bind).ok()?;
-    sock.connect(SocketAddr::new(target, 80)).ok()?;
+    sock.connect(target.socket_addr(80)).ok()?;
     let local = sock.local_addr().ok()?;
     Some(local.ip())
 }
 
 /// Find the interface name and prefix for `local_ip`. `None` when no data
 /// source (routing table, address table, gateway, platform tool) matches.
-pub fn interface_for_ip(local_ip: IpAddr) -> Option<InterfaceInfo> {
+/// `scope_id` is the target's IPv6 zone (0 = none): the same link-local
+/// address can exist on several interfaces, and the zone says which one.
+pub fn interface_for_ip(local_ip: IpAddr, scope_id: u32) -> Option<InterfaceInfo> {
     let IpAddr::V4(_v4) = local_ip else {
-        return interface_for_ipv6(local_ip);
+        return pick_in_zone(ipv6_entries(), local_ip, scope_id);
     };
 
     // Routing table is empty off Linux, so this loop is a no-op there.
@@ -97,7 +101,7 @@ pub fn list_interfaces() -> Vec<InterfaceInfo> {
                 continue;
             }
             let probe_ip = Ipv4Addr::from((dest_bits | 1).to_be_bytes());
-            if let Some(local_ip) = detect_local_ip(IpAddr::V4(probe_ip)) {
+            if let Some(local_ip) = detect_local_ip(ResolvedAddr::unscoped(IpAddr::V4(probe_ip))) {
                 result.push(InterfaceInfo {
                     name: r.iface.clone(),
                     ip: local_ip,
@@ -120,8 +124,9 @@ pub fn list_interfaces() -> Vec<InterfaceInfo> {
     }
     #[cfg(target_os = "windows")]
     {
-        list_interfaces_ipconfig()
+        windows_entries(true)
             .into_iter()
+            .map(|(_, info)| info)
             .filter(|i| i.ip.is_ipv4())
             .collect()
     }
@@ -129,37 +134,61 @@ pub fn list_interfaces() -> Vec<InterfaceInfo> {
     Vec::new()
 }
 
-/// IPv6 counterpart of [`interface_for_ip`]: the kernel's address table on
-/// Linux, the platform tool elsewhere.
-fn interface_for_ipv6(local_ip: IpAddr) -> Option<InterfaceInfo> {
+/// Every local IPv6 address with its interface index (0 when the source
+/// does not tell): the kernel's address table on Linux, the platform tool
+/// or API elsewhere.
+fn ipv6_entries() -> Vec<(u32, InterfaceInfo)> {
     #[cfg(target_os = "linux")]
     {
-        let text = std::fs::read_to_string("/proc/net/if_inet6").ok()?;
-        parse_if_inet6(&text).into_iter().find(|i| i.ip == local_ip)
+        std::fs::read_to_string("/proc/net/if_inet6")
+            .map(|text| parse_if_inet6(&text))
+            .unwrap_or_default()
     }
     #[cfg(target_os = "macos")]
     {
-        interface_from_ifconfig(local_ip)
+        list_interfaces_ifconfig()
+            .into_iter()
+            .map(|info| (interface_index(&info.name), info))
+            .collect()
     }
     #[cfg(target_os = "windows")]
     {
-        interface_from_ipconfig(local_ip)
+        windows_entries(false)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
-        let _ = local_ip;
-        None
+        Vec::new()
     }
 }
 
+/// The entry holding `local_ip`. With a zone, the entry on that interface
+/// wins and one on another interface is not it; entries whose index is
+/// unknown (0) still qualify.
+fn pick_in_zone(
+    entries: Vec<(u32, InterfaceInfo)>,
+    local_ip: IpAddr,
+    scope_id: u32,
+) -> Option<InterfaceInfo> {
+    let mut unknown_zone = None;
+    for (index, info) in entries.into_iter().filter(|(_, i)| i.ip == local_ip) {
+        if scope_id == 0 || index == scope_id {
+            return Some(info);
+        }
+        if index == 0 && unknown_zone.is_none() {
+            unknown_zone = Some(info);
+        }
+    }
+    unknown_zone
+}
+
 /// Parse `/proc/net/if_inet6`: one address per line, `<32 hex digits>
-/// <ifindex> <prefix len, hex> <scope> <flags> <name>`.
+/// <ifindex, hex> <prefix len, hex> <scope> <flags> <name>`.
 #[cfg(any(target_os = "linux", test))]
-fn parse_if_inet6(text: &str) -> Vec<InterfaceInfo> {
+fn parse_if_inet6(text: &str) -> Vec<(u32, InterfaceInfo)> {
     text.lines()
         .filter_map(|line| {
             let mut f = line.split_whitespace();
-            let (addr, _idx, prefix, _scope, _flags, name) = (
+            let (addr, index, prefix, _scope, _flags, name) = (
                 f.next()?,
                 f.next()?,
                 f.next()?,
@@ -168,12 +197,16 @@ fn parse_if_inet6(text: &str) -> Vec<InterfaceInfo> {
                 f.next()?,
             );
             let bits = u128::from_str_radix(addr, 16).ok()?;
+            let index = u32::from_str_radix(index, 16).ok()?;
             let prefix_len = u8::from_str_radix(prefix, 16).ok()?;
-            Some(InterfaceInfo {
-                name: name.to_string(),
-                ip: IpAddr::V6(std::net::Ipv6Addr::from(bits)),
-                prefix_len,
-            })
+            Some((
+                index,
+                InterfaceInfo {
+                    name: name.to_string(),
+                    ip: IpAddr::V6(std::net::Ipv6Addr::from(bits)),
+                    prefix_len,
+                },
+            ))
         })
         .collect()
 }
@@ -185,6 +218,17 @@ fn interface_from_ifconfig(local_ip: IpAddr) -> Option<InterfaceInfo> {
     list_interfaces_ifconfig()
         .into_iter()
         .find(|i| i.ip == local_ip)
+}
+
+/// Interface index of `name` (`if_nametoindex`); 0 when there is none.
+#[cfg(target_os = "macos")]
+fn interface_index(name: &str) -> u32 {
+    let Ok(name) = std::ffi::CString::new(name) else {
+        return 0;
+    };
+    // SAFETY: `name` is a live NUL-terminated C string; the call only reads
+    // it and returns 0 for an unknown interface.
+    unsafe { libc::if_nametoindex(name.as_ptr()) }
 }
 
 #[cfg(target_os = "macos")]
@@ -265,9 +309,21 @@ fn parse_hex_netmask(hex: &str) -> u8 {
 
 #[cfg(target_os = "windows")]
 fn interface_from_ipconfig(local_ip: IpAddr) -> Option<InterfaceInfo> {
-    list_interfaces_ipconfig()
-        .into_iter()
-        .find(|i| i.ip == local_ip)
+    pick_in_zone(windows_entries(false), local_ip, 0)
+}
+
+/// Addresses with their interface index: from the adapter API, whose names
+/// and prefixes do not depend on the display language; from `ipconfig` text
+/// (index unknown) only if the API gives nothing.
+#[cfg(target_os = "windows")]
+fn windows_entries(only_up: bool) -> Vec<(u32, InterfaceInfo)> {
+    match crate::context::adapters_windows::adapters(only_up) {
+        Some(list) if !list.is_empty() => list,
+        _ => list_interfaces_ipconfig()
+            .into_iter()
+            .map(|info| (0, info))
+            .collect(),
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -403,13 +459,57 @@ fe800000000000005054ff0000005ae2 02 40 20 80    ens18
 00000000000000000000000000000001 01 80 10 80       lo
 garbage line
 ";
-        let list = parse_if_inet6(text);
-        assert_eq!(list.len(), 3);
+        let parsed = parse_if_inet6(text);
+        assert_eq!(
+            parsed.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            [2, 2, 1]
+        );
+        let list: Vec<InterfaceInfo> = parsed.into_iter().map(|(_, info)| info).collect();
         let e = entry(&list, "2001:db8:0:1::10");
         assert_eq!((e.name.as_str(), e.prefix_len), ("ens18", 64));
         let e = entry(&list, "::1");
         assert_eq!((e.name.as_str(), e.prefix_len), ("lo", 128));
         assert_eq!(entry(&list, "fe80::5054:ff00:0:5ae2").name, "ens18");
+    }
+
+    /// The index column is hexadecimal: interface 26 is written `1a`.
+    #[test]
+    fn if_inet6_index_is_hex() {
+        let parsed = parse_if_inet6("fe800000000000000000000000000001 1a 40 20 80 veth0\n");
+        assert_eq!(parsed[0].0, 26);
+    }
+
+    #[test]
+    fn zone_selects_among_equal_addresses() {
+        let ip: IpAddr = "fe80::1".parse().unwrap();
+        let entries = || {
+            ["eth0", "eth1", "tun0"]
+                .into_iter()
+                .zip([2u32, 3, 0])
+                .map(|(name, index)| {
+                    (
+                        index,
+                        InterfaceInfo {
+                            name: name.into(),
+                            ip,
+                            prefix_len: 64,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let name = |scope| pick_in_zone(entries(), ip, scope).map(|i| i.name);
+        // No zone: the first entry with that address, as before.
+        assert_eq!(name(0).as_deref(), Some("eth0"));
+        assert_eq!(name(3).as_deref(), Some("eth1"));
+        // A zone no entry carries: only one of unknown index can be it.
+        assert_eq!(name(9).as_deref(), Some("tun0"));
+        assert_eq!(
+            pick_in_zone(entries(), "fe80::2".parse().unwrap(), 2).map(|i| i.name),
+            None
+        );
+        let known_only: Vec<_> = entries().into_iter().filter(|(i, _)| *i != 0).collect();
+        assert!(pick_in_zone(known_only, ip, 9).is_none());
     }
 
     #[test]

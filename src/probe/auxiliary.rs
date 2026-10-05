@@ -73,6 +73,7 @@ pub async fn run(
 
         let opts = ProbeOptions {
             target,
+            scope_id: 0,
             timeout: Duration::from_secs(2),
             payload_size: 32,
             ttl: None,

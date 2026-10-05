@@ -1,6 +1,6 @@
 [package]
 name = "sping"
-version = "1.5.4"
+version = "1.5.5"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Antonio Cotos <acf981@protonmail.com>"]
@@ -55,7 +55,11 @@ Backends: unprivileged DGRAM ICMP on Linux/macOS, IcmpSendEcho on Windows.
 """
 section = "net"
 priority = "optional"
-depends = "$auto"
+# Not "$auto": cross-built for arm64, cargo-deb takes the version of the cross
+# toolchain's libc (2.36), not what the binary needs. Release builds run on
+# Debian 12 and need GLIBC_2.34 at most (checked in the GitHub release
+# workflow); libc6 pulls in libgcc-s1.
+depends = "libc6 (>= 2.34)"
 assets = [
     ["target/release/sping", "usr/bin/", "755"],
     ["target/assets/man/sping.1", "usr/share/man/man1/sping.1", "644"],

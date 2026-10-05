@@ -1,5 +1,49 @@
 # Changelog
 
+## v1.5.5
+
+### Fixes
+- IPv6 link-local targets with a zone work: `sping fe80::1%eth0` (interface
+  name, or its index: `fe80::1%2`; Windows takes the index). The zone given
+  on the command line was dropped after resolution, so the probe failed with
+  `send failed: Invalid argument` and the `Init:` line showed `0.0.0.0/0`.
+  The same address in two zones counts as two targets, and a link-local
+  `-S` source is bound in the target's zone. Without a zone a link-local
+  target still cannot be reached on Linux; an unknown zone is reported as
+  such.
+- Windows: interface names, addresses and prefix lengths come from the
+  system's adapter list instead of the text `ipconfig` prints. On a
+  non-English Windows the `Init:` and `Context` lines showed the whole
+  localized header (`if Adaptador de Ethernet Ethernet 3`) as the interface
+  name; they now show the adapter's name (`if Ethernet 3`). IPv6 addresses get
+  their real prefix length, so an IPv6 target in the local prefix is `same
+  LAN`. `ipconfig` is still read if the system call fails.
+- macOS: ICMPv6 replies carry their hop limit in the `ttl` column, as on
+  Linux since 1.5.4.
+- macOS: with several IPv6 targets a reply could be counted for the wrong
+  one, since there every ICMPv6 socket receives every echo reply. Each probe
+  socket now has its own echo identifier and accepts only the replies that
+  carry it.
+- Multi-target and batch modes: each target gets its own network context.
+  Every target carried the context of the first one, so `net_ctx` in the JSON
+  output (interface, source address, class) was wrong for the others.
+- Single target: after a DNS failover to another address, the context is
+  detected again for the new address instead of staying on the old one.
+
+### Release
+- Every file of a GitHub release has a build provenance attestation:
+  `gh attestation verify <file> --repo <owner>/<repo>` tells which commit and
+  workflow run produced it.
+- The macOS binary is signed with a Developer ID and notarized by Apple: it
+  runs without removing the quarantine attribute first.
+- sping is on crates.io: `cargo install sping` builds and installs the binary.
+- The Linux binaries and .deb packages of a GitHub release are built on
+  Debian 12: they need glibc 2.34 instead of 2.39, so they run on Debian 12
+  and Ubuntu 22.04. The release stops if a Linux binary would need a newer
+  glibc.
+- The arm64 .deb asks for libc6 2.34, what its binary needs, instead of 2.36,
+  so it installs on Ubuntu 22.04 too.
+
 ## v1.5.4
 
 ### Fixes

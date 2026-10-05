@@ -1,0 +1,156 @@
+name: Nixpkgs package validation
+
+# Builds the nixpkgs recipe for the version just tagged, from the published
+# tag, and prints the two hashes the recipe needs for that version. It only
+# validates and reports; the version bump in nixpkgs itself is a pull request
+# there. Run by hand, it validates the version in VERSION.
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # nixos-unstable as of 2026-10-01: pinned so that a run is reproducible.
+  NIXPKGS_REV: c59305bab2065cfecc4944690d9eedbb56f3a9fa
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the version
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::VERSION does not hold a plain X.Y.Z version: '$version'."
+            exit 1
+          fi
+          manifest="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          if [ "$manifest" != "$version" ]; then
+            echo "::error::VERSION ($version) and Cargo.toml ($manifest) disagree."
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match VERSION ($version)."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ env.NIXPKGS_REV }}.tar.gz
+
+      - name: Build the package and resolve its hashes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d "$RUNNER_TEMP/nix.XXXXXX")"
+          recipe="$work/package.nix"
+
+          cat > "$recipe" <<EOF
+          {
+            lib,
+            rustPlatform,
+            fetchFromGitHub,
+            installShellFiles,
+          }:
+
+          rustPlatform.buildRustPackage (finalAttrs: {
+            pname = "sping";
+            version = "$VERSION";
+
+            __structuredAttrs = true;
+
+            src = fetchFromGitHub {
+              owner = "${GITHUB_REPOSITORY_OWNER}";
+              repo = "${GITHUB_REPOSITORY#*/}";
+              tag = "v\${finalAttrs.version}";
+              hash = lib.fakeHash;
+            };
+
+            cargoHash = lib.fakeHash;
+
+            nativeBuildInputs = [ installShellFiles ];
+
+            postInstall = ''
+              installManPage target/assets/man/sping.1
+              installShellCompletion --bash target/assets/completions/sping.bash
+              installShellCompletion --zsh target/assets/completions/_sping
+              installShellCompletion --fish target/assets/completions/sping.fish
+            '';
+
+            meta = {
+              description = "Terminal-native real-time connectivity monitor with network context diagnostics";
+              homepage = "https://github.com/${GITHUB_REPOSITORY}";
+              changelog = "https://github.com/${GITHUB_REPOSITORY}/releases/tag/v\${finalAttrs.version}";
+              license = lib.licenses.mit;
+              mainProgram = "sping";
+              platforms = lib.platforms.linux ++ lib.platforms.darwin;
+            };
+          })
+          EOF
+
+          build_expr="let pkgs = import <nixpkgs> {}; in pkgs.callPackage $recipe {}"
+
+          # A build with a placeholder hash fails and names the real one.
+          resolve_hash() {
+            local log="$1" out rc
+            set +e
+            out="$(nix-build --no-out-link -E "$build_expr" 2>&1)"
+            rc=$?
+            set -e
+            printf '%s\n' "$out" > "$log"
+            if [ "$rc" -eq 0 ]; then
+              echo "Expected a fixed-output hash mismatch, but the build succeeded." >&2
+              return 1
+            fi
+            printf '%s\n' "$out" | sed -nE 's/^[[:space:]]*got:[[:space:]]*(sha256-[A-Za-z0-9+\/=]+).*$/\1/p' | tail -n1
+          }
+
+          src_hash="$(resolve_hash "$work/source-hash.log")" || true
+          if [[ "$src_hash" != sha256-* ]]; then
+            cat "$work/source-hash.log"
+            echo "::error::Could not resolve the source hash."
+            exit 1
+          fi
+          sed -i "0,/hash = lib.fakeHash;/s||hash = \"$src_hash\";|" "$recipe"
+
+          cargo_hash="$(resolve_hash "$work/cargo-hash.log")" || true
+          if [[ "$cargo_hash" != sha256-* ]]; then
+            cat "$work/cargo-hash.log"
+            echo "::error::Could not resolve cargoHash."
+            exit 1
+          fi
+          sed -i "0,/cargoHash = lib.fakeHash;/s||cargoHash = \"$cargo_hash\";|" "$recipe"
+
+          # The hashes are reported only for a recipe that really builds and
+          # installs what it should.
+          nix-build -E "$build_expr" -o result
+          ./result/bin/sping --version | grep -Fx "sping $VERSION"
+          ./result/bin/sping --help >/dev/null
+          test -f result/share/man/man1/sping.1.gz
+          test -f result/share/bash-completion/completions/sping.bash
+          test -f result/share/zsh/site-functions/_sping
+          test -f result/share/fish/vendor_completions.d/sping.fish
+
+          {
+            echo "### nixpkgs recipe for sping $VERSION"
+            echo
+            echo "| Attribute | Value |"
+            echo "|-----------|-------|"
+            echo "| \`version\` | \`$VERSION\` |"
+            echo "| \`src.hash\` | \`$src_hash\` |"
+            echo "| \`cargoHash\` | \`$cargo_hash\` |"
+            echo
+            echo "nixpkgs revision: \`$NIXPKGS_REV\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "src.hash  = $src_hash"
+          echo "cargoHash = $cargo_hash"

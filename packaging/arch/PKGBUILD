@@ -1,6 +1,6 @@
 # Maintainer: Antonio Cotos <acf981@protonmail.com>
 pkgname=sping
-pkgver=1.5.4
+pkgver=1.5.5
 pkgrel=1
 pkgdesc="Terminal-native real-time connectivity monitor with network context diagnostics"
 arch=('x86_64' 'aarch64' 'armv7h')

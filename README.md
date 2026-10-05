@@ -53,12 +53,21 @@ Download from the [Releases page](../../releases):
 | Debian/Ubuntu amd64 | `sping_X.Y.Z-1_amd64.deb` |
 | Debian/Ubuntu arm64 | `sping_X.Y.Z-1_arm64.deb` |
 
-Verify with `SHA256SUMS` from the same release.
+The Linux binaries and packages need glibc 2.34 or newer: Debian 12, Ubuntu
+22.04, Raspberry Pi OS (Bookworm) or later.
+
+Verify with `SHA256SUMS` from the same release. From v1.5.5 on, every file of
+a GitHub release also has a build provenance attestation, which tells the
+commit and the workflow run that produced it:
+
+```bash
+gh attestation verify sping-vX.Y.Z-linux-x86_64 --repo LambdaBytes/sping
+```
 
 ### Debian / Ubuntu (.deb)
 
 ```bash
-sudo dpkg -i sping_1.5.4-1_amd64.deb     # or _arm64.deb on aarch64
+sudo dpkg -i sping_1.5.5-1_amd64.deb     # or _arm64.deb on aarch64
 ```
 
 The package installs:
@@ -69,13 +78,24 @@ The package installs:
 
 ### macOS
 
-After download, macOS may refuse to run the binary because it's not
-notarised by Apple. Remove the quarantine attribute once:
+From v1.5.5 on, the macOS binary of a release is signed with a Developer ID
+and notarized by Apple, so it runs once it is made executable:
 
 ```bash
-xattr -d com.apple.quarantine sping-vX.Y.Z-macos-arm64
 chmod +x sping-vX.Y.Z-macos-arm64
 ./sping-vX.Y.Z-macos-arm64 8.8.8.8
+```
+
+macOS refuses an earlier, unsigned binary until its quarantine attribute is
+removed: `xattr -d com.apple.quarantine sping-vX.Y.Z-macos-arm64`.
+
+### From crates.io
+
+Requires Rust 1.88+. Installs the binary only (no man page or shell
+completions):
+
+```bash
+cargo install sping
 ```
 
 ### From source
@@ -104,7 +124,7 @@ sping google.com
 # Fast probing (200ms interval)
 sping 8.8.8.8 -i 200
 
-# Bind to interface / source IP (Linux)
+# Bind to an interface (Linux) / a source IP (Linux, macOS)
 sping 8.8.8.8 -I eth0
 sping 8.8.8.8 -S 192.168.1.100
 
@@ -115,6 +135,7 @@ sping 8.8.8.8 -s 120              # 120-byte payload
 sping 8.8.8.8 -t 10               # outgoing TTL / hop limit
 sping 8.8.8.8 -c 10 -q            # quiet: summary only (classic)
 sping example.com -4              # force IPv4 (-6 for IPv6)
+sping fe80::1%eth0                # IPv6 link-local: the zone is required
 
 # ASCII-only output: automatic on non-UTF-8 locales and on the legacy
 # Windows console (SPING_ASCII=0 forces Unicode); NO_COLOR honored
@@ -217,9 +238,9 @@ sudo setcap cap_net_raw+ep /usr/bin/sping
 |---------|-------|-------|---------|
 | IPv4 ICMP | DGRAM socket | DGRAM socket | IcmpSendEcho |
 | IPv6 | ICMPv6 DGRAM | ICMPv6 DGRAM | Icmp6SendEcho2 |
-| TTL | recvmsg | IP header | API |
+| TTL / hop limit | recvmsg | IP header (IPv4), recvmsg (IPv6) | API (IPv4 only) |
 | Gateway detection | /proc/net/route | `route` command | `route print` |
-| Interface detection | /proc/net/route, if_inet6 | `ifconfig` | `ipconfig` |
+| Interface detection | /proc/net/route, if_inet6 | `ifconfig` | GetAdaptersAddresses |
 | `-I` interface | SO_BINDTODEVICE | accepted, no effect | warning, unbound |
 | `-S` source | bind() | bind() | OS routes |
 | Admin required | No | No | No |
@@ -229,9 +250,10 @@ sudo setcap cap_net_raw+ep /usr/bin/sping
 
 Own ICMP implementation per platform. No third-party ping libraries.
 
-- Linux: `socket2` DGRAM + `libc` recvmsg for TTL
-- macOS: `socket2` DGRAM + IP header parsing for TTL
-- Windows: `IcmpSendEcho` FFI from `iphlpapi.dll`
+- Linux: `socket2` DGRAM (RAW fallback) + `libc` recvmsg for TTL / hop limit
+- macOS: `socket2` DGRAM + IP header parsing for the IPv4 TTL, recvmsg for the
+  IPv6 hop limit
+- Windows: `IcmpSendEcho` / `Icmp6SendEcho2` FFI from `iphlpapi.dll`
 
 Async Tokio runtime, `watch` channels, single-writer renderer at 10 FPS.
 
@@ -249,11 +271,14 @@ x86_64/aarch64, macOS arm64 and Windows x86_64.
 - The raw-socket fallback and `-I` need `CAP_NET_RAW` (see
   [SECURITY.md](SECURITY.md)); the unprivileged DGRAM path covers the common
   case.
-- Reverse DNS / hostname display follows the system resolver; there is no
-  built-in DNS cache beyond the re-resolution interval.
-- IPv6 replies carry a hop limit (`ttl`) on Linux only; on macOS and Windows
-  it is not shown (`0` in JSON). Gateway detection and `--list-interfaces` are
+- Names go through the system resolver (5 s timeout) and are resolved again
+  every 60 s while monitoring; sping does no reverse DNS and keeps no DNS
+  cache of its own.
+- IPv6 replies carry a hop limit (`ttl`) on Linux and macOS; on Windows it
+  is not shown (`0` in JSON). Gateway detection and `--list-interfaces` are
   IPv4 only.
+- An IPv6 link-local target needs its zone: `fe80::1%eth0`, or the interface
+  index (`fe80::1%2`), which is the only form Windows takes.
 
 ## Roadmap
 
@@ -267,8 +292,8 @@ x86_64/aarch64, macOS arm64 and Windows x86_64.
 | Binary | 1.6 MB (stripped + LTO) |
 | RAM | ~4 MB resident |
 | CPU | < 1% at two probes per second |
-| Code | ~7,300 lines Rust |
-| Tests | 111 (92 unit + 19 E2E) |
+| Code | ~8,400 lines Rust |
+| Tests | 127 (108 unit + 19 E2E) |
 
 ## Tour
 

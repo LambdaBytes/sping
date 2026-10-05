@@ -1,47 +1,170 @@
 name: Release
 
 # Tag-triggered release: build cross-platform binaries (+ Debian packages),
-# checksum them, and publish a GitHub Release whose notes are that version's
-# section of CHANGELOG.md.
+# checksum them, attest their provenance, and publish a GitHub Release whose
+# notes are that version's section of CHANGELOG.md. The release is created as
+# a draft: its files are tried on real machines before it is published.
 
 on:
   push:
     tags: ['v*.*.*']
+  # Builds and publishes an existing tag again with the workflow on main, when
+  # the tag's own run failed because of the workflow. The release job checks
+  # that main holds the tagged code outside .github/, so what is built and
+  # attested is that code.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag (vX.Y.Z)'
+        required: true
+        type: string
 
+# The release itself is published with RELEASE_TOKEN (see the release job);
+# the workflow token only reads the repository.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  # The release tag: the pushed one, or the one given to a manual run.
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+# One run per tag at a time: two would mix their files in the release.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    # Linux builds run in a Debian 12 Rust image: its glibc 2.36 keeps the
+    # binaries and the .deb at GLIBC_2.34, so they run on Debian 12 and
+    # Ubuntu 22.04. The runner's own Ubuntu would raise that to its glibc.
+    # The other entries have no container and run on the runner itself.
+    container: ${{ matrix.container }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-x86_64,   os: ubuntu-latest,   target: x86_64-unknown-linux-gnu,      deb: true }
-          - { name: linux-aarch64,  os: ubuntu-latest,   target: aarch64-unknown-linux-gnu,     deb: true, linker: gcc-aarch64-linux-gnu }
+          - { name: linux-x86_64,   os: ubuntu-latest,   target: x86_64-unknown-linux-gnu,      deb: true, container: 'rust:1.92-bookworm' }
+          - { name: linux-aarch64,  os: ubuntu-latest,   target: aarch64-unknown-linux-gnu,     deb: true, container: 'rust:1.92-bookworm', linker: gcc-aarch64-linux-gnu }
           - { name: macos-arm64,    os: macos-latest,    target: aarch64-apple-darwin }
           - { name: windows-x86_64, os: windows-latest,  target: x86_64-pc-windows-msvc }
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # The same Rust as the Linux image.
+      - uses: dtolnay/rust-toolchain@1.92.0
+        if: ${{ !matrix.container }}
         with:
           targets: ${{ matrix.target }}
+      # In the container, the image's own toolchain.
+      - name: Add the Rust target
+        if: matrix.container
+        run: rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
 
       - name: Install cross linker
         if: matrix.linker
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ${{ matrix.linker }}
+          apt-get update
+          apt-get install -y ${{ matrix.linker }}
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # No release with Linux binaries that need a newer glibc than 2.34.
+      - name: Check the glibc requirement
+        if: matrix.container
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/sping"
+          need="$(readelf -V "$bin" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sed 's/^GLIBC_//' | sort -V | tail -n 1)"
+          echo "$bin needs glibc $need"
+          if [ "$(printf '%s\n' "$need" 2.34 | sort -V | tail -n 1)" != 2.34 ]; then
+            echo "::error::$bin needs glibc $need; the limit is 2.34"
+            exit 1
+          fi
+
+      # macOS: sign with the Developer ID certificate and have Apple notarize
+      # the binary, when the five signing secrets are set. With none of them
+      # the binary ships unsigned, as it always did. The secrets reach this
+      # step alone, and what they are written to lives in a private directory
+      # that is removed when the step ends, however it ends.
+      - name: Sign and notarize (macOS)
+        id: sign
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/sping"
+
+          missing=0
+          for name in MACOS_CERT_P12_BASE64 MACOS_CERT_PASSWORD APPLE_API_KEY_P8_BASE64 APPLE_API_KEY_ID APPLE_API_ISSUER_ID; do
+            [ -n "${!name}" ] || missing=$((missing + 1))
+          done
+          if [ "$missing" -eq 5 ]; then
+            echo "::warning::macOS signing secrets are not set: the binary is published unsigned."
+            exit 0
+          fi
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::Only some of the five macOS signing secrets are set; set all of them or none."
+            exit 1
+          fi
+
+          umask 077
+          work="$(mktemp -d "$RUNNER_TEMP/sign.XXXXXX")"
+          keychain="$work/signing.keychain-db"
+          cleanup() {
+            security delete-keychain "$keychain" >/dev/null 2>&1 || true
+            rm -rf "$work"
+          }
+          trap cleanup EXIT
+
+          printf '%s' "$MACOS_CERT_P12_BASE64" | base64 --decode > "$work/cert.p12"
+          printf '%s' "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$work/key.p8"
+
+          # A keychain of its own, with a throwaway password, holding nothing
+          # but this certificate.
+          keychain_password="$(openssl rand -hex 24)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$work/cert.p12" -k "$keychain" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign >/dev/null
+          # Let codesign use the key without a prompt.
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null
+          # shellcheck disable=SC2046  # one argument per listed keychain
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+
+          identity="$(security find-identity -v -p codesigning "$keychain" | awk '/Developer ID Application/ { print $2; exit }')"
+          if [ -z "$identity" ]; then
+            echo "::error::The certificate is not a 'Developer ID Application' identity."
+            exit 1
+          fi
+
+          codesign --force --options runtime --timestamp --keychain "$keychain" --sign "$identity" "$bin"
+          codesign --verify --strict --verbose=2 "$bin"
+
+          # Notarization takes an archive. A bare executable cannot carry a
+          # stapled ticket: the system looks the ticket up on first run.
+          /usr/bin/zip -q -j "$work/sping.zip" "$bin"
+          result="$(xcrun notarytool submit "$work/sping.zip" --key "$work/key.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" --wait --output-format json)"
+          # notarytool exits 0 for a rejected submission too: read the status.
+          status="$(printf '%s' "$result" | plutil -extract status raw -o - -)"
+          if [ "$status" != "Accepted" ]; then
+            submission="$(printf '%s' "$result" | plutil -extract id raw -o - -)"
+            echo "::error::Notarization ended as '$status'."
+            xcrun notarytool log "$submission" --key "$work/key.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID" || true
+            exit 1
+          fi
+          echo "signed=true" >> "$GITHUB_OUTPUT"
 
       - name: Build Debian package
         if: matrix.deb
@@ -54,7 +177,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          tag="${GITHUB_REF_NAME}"
+          tag="${TAG}"
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp "target/${{ matrix.target }}/release/sping.exe" "dist/sping-${tag}-${{ matrix.name }}.exe"
           else
@@ -63,6 +186,15 @@ jobs:
           if [ "${{ matrix.deb }}" = "true" ]; then
             cp target/${{ matrix.target }}/debian/*.deb dist/
           fi
+
+      # What is uploaded is the signed binary, not a copy made before signing.
+      - name: Verify the staged macOS signature
+        if: steps.sign.outputs.signed == 'true'
+        run: |
+          set -euo pipefail
+          staged="dist/sping-${TAG}-${{ matrix.name }}"
+          codesign --verify --strict --verbose=2 "$staged"
+          codesign --display --verbose=2 "$staged" 2>&1 | grep -E '^(Authority|TeamIdentifier|Timestamp)='
 
       - uses: actions/upload-artifact@v4
         with:
@@ -73,6 +205,12 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    # The attestation is signed with the workflow's identity token and stored
+    # with the repository; the release is published with RELEASE_TOKEN.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       # The release is published with the repository owner's token so that it
       # is authored by the owner's account, not by the workflow's default one.
@@ -86,16 +224,54 @@ jobs:
           fi
 
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check the release tag
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$TAG' is not a release tag (vX.Y.Z)."
+            exit 1
+          fi
+          if ! git rev-parse -q --verify "refs/tags/$TAG^{commit}" >/dev/null; then
+            echo "::error::There is no tag $TAG."
+            exit 1
+          fi
+          if [ "v$(cat VERSION)" != "$TAG" ]; then
+            echo "::error::VERSION is $(cat VERSION), the tag is $TAG."
+            exit 1
+          fi
+          # A manual run builds main: it must be the tagged code.
+          if ! git diff --quiet "$TAG" HEAD -- . ':(exclude).github'; then
+            echo "::error::The built commit differs from $TAG outside .github/:"
+            git diff --stat "$TAG" HEAD -- . ':(exclude).github'
+            exit 1
+          fi
+
+      # The files of a published release are never replaced: changing them
+      # takes a new version. A failed lookup stops the run too.
+      - name: Refuse a published release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          drafts="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$TAG\") | .draft")"
+          if printf '%s\n' "$drafts" | grep -qx false; then
+            echo "::error::The $TAG release is already published; its files are not replaced."
+            exit 1
+          fi
 
       - name: Extract release notes from CHANGELOG.md
         run: |
-          awk -v header="## ${GITHUB_REF_NAME}" '
+          awk -v header="## ${TAG}" '
             $0 == header { found = 1; next }
             found && /^## / { exit }
             found { print }
           ' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
           if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/release-notes.md"; then
-            echo "::error::CHANGELOG.md has no section for ${GITHUB_REF_NAME}."
+            echo "::error::CHANGELOG.md has no section for ${TAG}."
             exit 1
           fi
 
@@ -110,9 +286,45 @@ jobs:
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
 
+      # Optional detached signature of the checksums, when a release key is
+      # configured. The key lives in a keyring of its own, for this step only.
+      - name: Sign SHA256SUMS
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GPG_PRIVATE_KEY" ]; then
+            echo "No GPG_PRIVATE_KEY secret: SHA256SUMS is published without a detached signature."
+            exit 0
+          fi
+          umask 077
+          GNUPGHOME="$(mktemp -d "$RUNNER_TEMP/gnupg.XXXXXX")"
+          export GNUPGHOME
+          cleanup() {
+            gpgconf --kill all >/dev/null 2>&1 || true
+            rm -rf "$GNUPGHOME"
+          }
+          trap cleanup EXIT
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --quiet --import
+          printf '%s' "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 --armor --detach-sign --output dist/SHA256SUMS.asc dist/SHA256SUMS
+          gpg --batch --verify dist/SHA256SUMS.asc dist/SHA256SUMS
+
+      # Provenance for every published file: which repository, commit and
+      # workflow run produced it. Verify a download with
+      #   gh attestation verify <file> --repo <owner>/<repo>
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*
+
+      # A draft: published by hand once its files have been tried. A manual
+      # run reuses the tag's draft and replaces its files.
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.TAG }}
+          draft: true
           files: dist/*
           body_path: ${{ runner.temp }}/release-notes.md
           token: ${{ secrets.RELEASE_TOKEN }}

@@ -1,14 +1,15 @@
 //! ICMP echo backend for Linux and macOS. Prefers unprivileged `SOCK_DGRAM`
 //! and falls back to `SOCK_RAW` (needs `CAP_NET_RAW`/root). On Linux, TTL and
 //! the kernel receive timestamp come from `recvmsg(2)` ancillary data; on
-//! macOS the TTL is parsed from the IP header the BSD stack prepends.
+//! macOS the IPv4 TTL is parsed from the IP header the BSD stack prepends and
+//! the IPv6 hop limit comes from `recvmsg(2)` ancillary data.
 
 use std::io;
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::io::AsRawFd;
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
@@ -72,7 +73,8 @@ fn build_echo_request_v6(seq: u16, identifier: u16, payload_size: usize) -> Vec<
 /// `expected_source` filters by source IP — critical on RAW sockets, which
 /// receive every ICMP packet on the host (multi-target cross-talk).
 /// `expected_id` is `Some(id)` for RAW sockets (the kernel preserves our
-/// identifier); for DGRAM the kernel rewrites and demuxes it, so pass `None`.
+/// identifier); for DGRAM pass `None`: Linux rewrites and demuxes it, and on
+/// macOS the sender check above tells the replies apart.
 fn parse_echo_reply_v4(
     data: &[u8],
     expected_seq: u16,
@@ -119,8 +121,10 @@ fn parse_echo_reply_v4(
 /// Parse an ICMPv6 Echo Reply (type 129). The IPv6 header is never delivered
 /// to ICMPv6 sockets, so there is no source/hop-limit extraction here.
 ///
-/// `expected_id` is `Some(id)` for RAW sockets; for DGRAM the kernel demuxes
-/// by identifier, so pass `None`.
+/// `expected_id` is `Some(id)` where the socket also receives replies meant
+/// for other sockets and the kernel leaves the identifier alone (RAW; macOS
+/// DGRAM); `None` on Linux DGRAM, where the kernel rewrites the identifier
+/// and demuxes by it.
 fn parse_echo_reply_v6(data: &[u8], expected_seq: u16, expected_id: Option<u16>) -> bool {
     if data.len() < 8 {
         return false;
@@ -136,12 +140,28 @@ fn parse_echo_reply_v6(data: &[u8], expected_seq: u16, expected_id: Option<u16>)
 }
 
 /// Whether an ICMPv6 reply received from `source` may be attributed to
-/// `target`. A RAW ICMPv6 socket receives every echo reply on the host, and
-/// all backends in the process share the identifier while their sequence
-/// numbers advance in lockstep, so only the sender tells one target's replies
-/// from another's. DGRAM sockets are demuxed by the kernel: nothing to check.
-fn v6_source_ok(is_raw: bool, source: Option<IpAddr>, target: IpAddr) -> bool {
-    !is_raw || source == Some(target)
+/// `target`. A RAW ICMPv6 socket receives every echo reply on the host: the
+/// identifier tells this backend's replies from those of the others in the
+/// process, and the sender from those of another process that happens to
+/// probe with the same identifier and sequence number. DGRAM sockets are not
+/// checked here (Linux demuxes them; macOS relies on the identifier, since a
+/// reply to an anycast target comes from another address).
+///
+/// A link-local target is one host per zone: when both the target and the
+/// sender carry a zone index, they must agree. A sender reported without one
+/// is matched by address alone.
+fn v6_source_ok(is_raw: bool, source: Option<SocketAddr>, target: IpAddr, scope_id: u32) -> bool {
+    if !is_raw {
+        return true;
+    }
+    let Some(source) = source else {
+        return false;
+    };
+    let source_scope = match source {
+        SocketAddr::V6(v6) => v6.scope_id(),
+        SocketAddr::V4(_) => 0,
+    };
+    source.ip() == target && (scope_id == 0 || source_scope == 0 || source_scope == scope_id)
 }
 
 /// `CLOCK_REALTIME` now, in nanoseconds since the epoch (Linux only). Paired
@@ -192,10 +212,13 @@ fn refine_rtt(
     fallback
 }
 
-/// Receive with TTL, kernel receive-timestamp and sender extraction via
-/// recvmsg (Linux). Returns `(len, ttl, rx_nanos_since_epoch, source)`.
-#[cfg(target_os = "linux")]
-fn recv_with_ttl(fd: i32, buf: &mut [u8]) -> io::Result<(usize, u8, Option<i128>, Option<IpAddr>)> {
+/// Receive with TTL / hop limit, kernel receive-timestamp (Linux) and sender
+/// extraction via recvmsg. Returns `(len, ttl, rx_nanos_since_epoch, source)`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn recv_with_ttl(
+    fd: i32,
+    buf: &mut [u8],
+) -> io::Result<(usize, u8, Option<i128>, Option<SocketAddr>)> {
     use std::ptr;
 
     let mut iov = libc::iovec {
@@ -215,7 +238,8 @@ fn recv_with_ttl(fd: i32, buf: &mut [u8]) -> io::Result<(usize, u8, Option<i128>
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg_buf.0.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = cmsg_buf.0.len();
+    // `as _`: the field is a `size_t` on Linux and a `socklen_t` on macOS.
+    msg.msg_controllen = cmsg_buf.0.len() as _;
 
     // SAFETY: `msg` points to a live iovec, control buffer and (inside
     // `try_init`) a zeroed `sockaddr_storage` of `*len` bytes that all outlive
@@ -236,46 +260,101 @@ fn recv_with_ttl(fd: i32, buf: &mut [u8]) -> io::Result<(usize, u8, Option<i128>
     }?;
 
     let mut ttl: u8 = 0;
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut rx_ns: Option<i128> = None;
     // SAFETY: CMSG_FIRSTHDR/CMSG_NXTHDR walk the kernel-written control
     // buffer and yield either null or a pointer to a valid, aligned cmsghdr
     // within it. Payloads behind CMSG_DATA are read with `read_unaligned`
-    // because the data region carries no alignment guarantee.
+    // because the data region carries no alignment guarantee, and only when
+    // the header announces a payload of at least the size read (control data
+    // cut short by `MSG_CTRUNC` is skipped, not read).
     let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
     while !cmsg.is_null() {
         let hdr = unsafe { &*cmsg };
-        if (hdr.cmsg_level == libc::IPPROTO_IP && hdr.cmsg_type == libc::IP_TTL)
-            || (hdr.cmsg_level == libc::IPPROTO_IPV6 && hdr.cmsg_type == libc::IPV6_HOPLIMIT)
+        // `size_t` on Linux, `socklen_t` on macOS.
+        #[allow(clippy::unnecessary_cast)]
+        let cmsg_len = hdr.cmsg_len as usize;
+        let holds = |payload: usize| cmsg_len >= unsafe { libc::CMSG_LEN(payload as u32) } as usize;
+        if ((hdr.cmsg_level == libc::IPPROTO_IP && hdr.cmsg_type == libc::IP_TTL)
+            || (hdr.cmsg_level == libc::IPPROTO_IPV6 && hdr.cmsg_type == libc::IPV6_HOPLIMIT))
+            && holds(std::mem::size_of::<i32>())
         {
             let data = unsafe { libc::CMSG_DATA(cmsg) };
             let val = unsafe { ptr::read_unaligned(data as *const i32) };
             ttl = val as u8;
-        } else if hdr.cmsg_level == libc::SOL_SOCKET && hdr.cmsg_type == libc::SCM_TIMESTAMPNS {
-            let data = unsafe { libc::CMSG_DATA(cmsg) };
-            let ts = unsafe { ptr::read_unaligned(data as *const libc::timespec) };
-            rx_ns = Some(ts.tv_sec as i128 * 1_000_000_000 + ts.tv_nsec as i128);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if hdr.cmsg_level == libc::SOL_SOCKET
+                && hdr.cmsg_type == libc::SCM_TIMESTAMPNS
+                && holds(std::mem::size_of::<libc::timespec>())
+            {
+                let data = unsafe { libc::CMSG_DATA(cmsg) };
+                let ts = unsafe { ptr::read_unaligned(data as *const libc::timespec) };
+                rx_ns = Some(ts.tv_sec as i128 * 1_000_000_000 + ts.tv_nsec as i128);
+            }
         }
         cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
     }
 
-    Ok((n as usize, ttl, rx_ns, sender.as_socket().map(|sa| sa.ip())))
+    Ok((n as usize, ttl, rx_ns, sender.as_socket()))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn recv_with_ttl(
     _fd: i32,
     _buf: &mut [u8],
-) -> io::Result<(usize, u8, Option<i128>, Option<IpAddr>)> {
+) -> io::Result<(usize, u8, Option<i128>, Option<SocketAddr>)> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "recvmsg not available on this platform",
     ))
 }
 
+/// Echo identifier of the `n`-th backend created by process `pid`: the pid
+/// for the first one, like `ping`, and a different value for each of the
+/// next 65535 (an odd multiplier is a bijection on `u16`).
+fn identifier_for(pid: u16, n: u16) -> u16 {
+    pid ^ n.wrapping_mul(0x9E37)
+}
+
+/// Identifier for a new backend, unique among the backends of this process:
+/// a socket that also receives the replies of the others (RAW; macOS DGRAM)
+/// recognizes its own by it. Their sequence numbers advance in lockstep, so
+/// the sequence number alone cannot.
+fn next_identifier() -> u16 {
+    static CREATED: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    let n = CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    identifier_for(std::process::id() as u16, n)
+}
+
+/// A value drawn once per process from the operating system's random source
+/// (the keys of the standard library's hasher).
+fn process_salt() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    static SALT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SALT.get_or_init(|| {
+        std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish()
+    })
+}
+
+/// Sequence number sent on the wire for the probe `seq`. Sixteen bits of
+/// identifier cannot be unique across processes: two of them may hold the
+/// same one. Each process therefore counts from its own random offset, so
+/// that their sequence numbers are unlikely to line up as well. This makes
+/// a mix-up between processes improbable; it cannot rule it out.
+fn seq_on_wire(seq: u16, offset: u16) -> u16 {
+    seq.wrapping_add(offset)
+}
+
 /// Linux/macOS ICMP backend (DGRAM, with RAW fallback when DGRAM is denied).
 pub struct LinuxIcmpBackend {
     socket: Socket,
     identifier: u16,
+    /// See [`seq_on_wire`].
+    seq_offset: u16,
     is_v6: bool,
     is_raw: bool,
 }
@@ -343,10 +422,11 @@ impl LinuxIcmpBackend {
             );
         }
         enable_rx_timestamps(&socket);
-        let identifier = std::process::id() as u16;
+        let identifier = next_identifier();
         Ok(Self {
             socket,
             identifier,
+            seq_offset: process_salt() as u16,
             is_v6: false,
             is_raw,
         })
@@ -361,11 +441,12 @@ impl LinuxIcmpBackend {
     pub fn new_v6() -> io::Result<Self> {
         let (socket, is_raw) = open_icmp_socket(Domain::IPV6, Protocol::ICMPV6)?;
         socket.set_nonblocking(false)?;
-        // Request IPV6_HOPLIMIT ancillary data on received datagrams (Linux
-        // only): neither socket type delivers the IPv6 header in the payload.
+        // Request IPV6_HOPLIMIT ancillary data on received datagrams:
+        // neither socket type delivers the IPv6 header in the payload.
+        // Best-effort: without it the reply simply carries no hop limit.
         // SAFETY: passes a pointer to a live c_int and its exact size to
         // setsockopt on a valid fd.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         unsafe {
             let val: libc::c_int = 1;
             libc::setsockopt(
@@ -377,10 +458,11 @@ impl LinuxIcmpBackend {
             );
         }
         enable_rx_timestamps(&socket);
-        let identifier = std::process::id() as u16;
+        let identifier = next_identifier();
         Ok(Self {
             socket,
             identifier,
+            seq_offset: process_salt() as u16,
             is_v6: true,
             is_raw,
         })
@@ -432,14 +514,40 @@ impl LinuxIcmpBackend {
         Ok(())
     }
 
-    /// Bind to a specific source address.
+    /// Bind to a specific source address. `scope_id` is the target's IPv6
+    /// zone: a link-local source lives in the same zone as the target it
+    /// talks to, and the kernel refuses to bind one without it.
     ///
     /// # Errors
     ///
     /// OS error if the address is not local or its family mismatches.
-    pub fn bind_source(&self, addr: IpAddr) -> io::Result<()> {
-        let sa = SockAddr::from(SocketAddr::new(addr, 0));
-        self.socket.bind(&sa)
+    pub fn bind_source(&self, addr: IpAddr, scope_id: u32) -> io::Result<()> {
+        let sa = match addr {
+            IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80 => {
+                SocketAddr::V6(std::net::SocketAddrV6::new(v6, 0, 0, scope_id))
+            }
+            _ => SocketAddr::new(addr, 0),
+        };
+        self.socket.bind(&SockAddr::from(sa))
+    }
+
+    /// The identifier a reply must carry, where that can be checked. A RAW
+    /// socket receives every echo reply on the host with its identifier
+    /// intact. So does a macOS DGRAM ICMPv6 socket: the kernel hands every
+    /// ICMPv6 socket every echo reply and does not rewrite the identifier.
+    /// (macOS DGRAM IPv4 keeps matching by sender, from the IP header.)
+    /// Linux DGRAM sockets get their own replies only, under an identifier
+    /// the kernel chose: nothing to check.
+    fn expected_id(&self) -> Option<u16> {
+        (self.is_raw || (cfg!(target_os = "macos") && self.is_v6)).then_some(self.identifier)
+    }
+
+    /// Whether replies are read with `recvmsg` (ancillary data) instead of
+    /// socket2's plain receive: always on Linux; on macOS only for IPv6,
+    /// whose hop limit travels in ancillary data (the IPv4 TTL there comes
+    /// from the IP header in the datagram).
+    fn reads_ancillary_data(&self) -> bool {
+        cfg!(target_os = "linux") || (cfg!(target_os = "macos") && self.is_v6)
     }
 
     /// Set the outgoing TTL (IPv4) or unicast hop limit (IPv6).
@@ -468,11 +576,16 @@ impl LinuxIcmpBackend {
             IpAddr::V4(v4) => v4,
             IpAddr::V6(_) => std::net::Ipv4Addr::UNSPECIFIED,
         };
-        let dest = SockAddr::from(SocketAddr::new(opts.target, 0));
+        let dest = SockAddr::from(match opts.target {
+            IpAddr::V6(v6) => SocketAddr::V6(std::net::SocketAddrV6::new(v6, 0, 0, opts.scope_id)),
+            ip => SocketAddr::new(ip, 0),
+        });
+        // `seq` names the probe to the caller; the packets carry `wire_seq`.
+        let wire_seq = seq_on_wire(seq, self.seq_offset);
         let packet = if self.is_v6 {
-            build_echo_request_v6(seq, self.identifier, opts.payload_size)
+            build_echo_request_v6(wire_seq, self.identifier, opts.payload_size)
         } else {
-            build_echo_request_v4(seq, self.identifier, opts.payload_size)
+            build_echo_request_v4(wire_seq, self.identifier, opts.payload_size)
         };
         // `start` first: the plausibility guard in `refine_rtt` compares the
         // kernel-stamped RTT against `start.elapsed()`, so the wall stamp must
@@ -487,11 +600,7 @@ impl LinuxIcmpBackend {
             };
         }
 
-        let expected_id = if self.is_raw {
-            Some(self.identifier)
-        } else {
-            None
-        };
+        let expected_id = self.expected_id();
         // Full reply size: payload + 8-byte ICMP header + up to 60 bytes of
         // IPv4 header on RAW. Truncation would fail the RAW checksum check and
         // turn every large-payload probe into a timeout.
@@ -500,18 +609,22 @@ impl LinuxIcmpBackend {
         let mut fallback_buf: Option<Vec<MaybeUninit<u8>>> = None;
         let fd = self.as_raw_fd();
         loop {
-            let result = recv_with_ttl(fd, &mut buf);
+            let result = if self.reads_ancillary_data() {
+                recv_with_ttl(fd, &mut buf)
+            } else {
+                Err(io::ErrorKind::Unsupported.into())
+            };
             match result {
                 Ok((n, ttl, rx_ns, source)) => {
                     let rtt = refine_rtt(tx_ns, rx_ns, start.elapsed());
                     let (ok, ip_ttl) = if self.is_v6 {
                         (
-                            v6_source_ok(self.is_raw, source, opts.target)
-                                && parse_echo_reply_v6(&buf[..n], seq, expected_id),
+                            v6_source_ok(self.is_raw, source, opts.target, opts.scope_id)
+                                && parse_echo_reply_v6(&buf[..n], wire_seq, expected_id),
                             0,
                         )
                     } else {
-                        parse_echo_reply_v4(&buf[..n], seq, expected_v4, expected_id)
+                        parse_echo_reply_v4(&buf[..n], wire_seq, expected_v4, expected_id)
                     };
                     if ok {
                         // Use TTL from IP header (macOS) if recvmsg TTL is 0
@@ -537,9 +650,19 @@ impl LinuxIcmpBackend {
                 {
                     return ProbeResult::Timeout { seq: seq as u64 };
                 }
+                // macOS IPv6: recvmsg is the receive path itself, so its
+                // errors are final, as those of the plain receive below are.
+                // Receiving again would wait a second time for a datagram
+                // that may already have been consumed.
+                Err(e) if cfg!(target_os = "macos") && self.is_v6 => {
+                    return ProbeResult::Error {
+                        seq: seq as u64,
+                        message: format!("recv failed: {e}"),
+                    };
+                }
                 Err(_) => {
                     // Fall back to socket2's recv when recvmsg is unavailable
-                    // (macOS) or failed; TTL then comes from the IP header.
+                    // (macOS IPv4) or failed; TTL then comes from the IP header.
                     let mbuf = fallback_buf
                         .get_or_insert_with(|| vec![MaybeUninit::<u8>::uninit(); buf_len]);
                     match self.socket.recv_from(mbuf) {
@@ -549,15 +672,15 @@ impl LinuxIcmpBackend {
                             let data = unsafe {
                                 std::slice::from_raw_parts(mbuf.as_ptr().cast::<u8>(), n)
                             };
-                            let source = sender.as_socket().map(|sa| sa.ip());
+                            let source = sender.as_socket();
                             let (ok, ip_ttl) = if self.is_v6 {
                                 (
-                                    v6_source_ok(self.is_raw, source, opts.target)
-                                        && parse_echo_reply_v6(data, seq, expected_id),
+                                    v6_source_ok(self.is_raw, source, opts.target, opts.scope_id)
+                                        && parse_echo_reply_v6(data, wire_seq, expected_id),
                                     0,
                                 )
                             } else {
-                                parse_echo_reply_v4(data, seq, expected_v4, expected_id)
+                                parse_echo_reply_v4(data, wire_seq, expected_v4, expected_id)
                             };
                             if ok {
                                 return ProbeResult::Reply {
@@ -730,26 +853,111 @@ mod tests {
         assert!(!parse_echo_reply_v6(&pkt, 7, None));
     }
 
+    /// Every backend of a process gets an identifier of its own.
+    #[test]
+    fn identifiers_are_unique_per_backend() {
+        for pid in [0u16, 1, 4242, u16::MAX] {
+            assert_eq!(identifier_for(pid, 0), pid);
+            let mut seen = vec![false; 1 << 16];
+            for n in 0..=u16::MAX {
+                let id = identifier_for(pid, n) as usize;
+                assert!(
+                    !seen[id],
+                    "pid {pid}: identifier {id} repeats at backend {n}"
+                );
+                seen[id] = true;
+            }
+        }
+        assert_ne!(next_identifier(), next_identifier());
+    }
+
+    /// Two processes may hold the same identifier; with different offsets
+    /// their sequence numbers differ for every probe, and the caller's
+    /// numbering is untouched by the offset.
+    #[test]
+    fn wire_sequence_starts_from_the_process_offset() {
+        assert_eq!(seq_on_wire(1, 0), 1);
+        assert_eq!(seq_on_wire(1, 41_000), 41_001);
+        assert_eq!(seq_on_wire(u16::MAX, 2), 1); // wraps
+        for seq in [0u16, 1, 500, u16::MAX] {
+            assert_ne!(seq_on_wire(seq, 7), seq_on_wire(seq, 8));
+        }
+        // One offset per process: every backend created here shares it.
+        assert_eq!(process_salt(), process_salt());
+    }
+
+    /// macOS hands every ICMPv6 socket every echo reply, identifier intact:
+    /// a backend must not take the reply to another backend's probe for its
+    /// own, even with the same sequence number.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn v6_reply_to_another_backend_is_not_ours() {
+        let target = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        let (Ok(ours), Ok(other)) = (LinuxIcmpBackend::new_v6(), LinuxIcmpBackend::new_v6()) else {
+            return; // no ICMPv6 socket permission in this environment
+        };
+        assert_ne!(ours.identifier, other.identifier);
+        let seq = 9;
+        let packet = build_echo_request_v6(seq, other.identifier, 8);
+        let dest = SockAddr::from(SocketAddr::new(target, 0));
+        if other.socket.send_to(&packet, &dest).is_err() {
+            return; // no IPv6 loopback in this environment
+        }
+        // Read what reaches `ours` for a while: the other backend's reply
+        // may be among it, and must not pass as a reply to `ours`.
+        let start = Instant::now();
+        let budget = std::time::Duration::from_millis(500);
+        let mut buf = [0u8; 128];
+        while ours.rearm_timeout(start, budget).is_some() {
+            let Ok((n, ..)) = recv_with_ttl(ours.as_raw_fd(), &mut buf) else {
+                break;
+            };
+            assert!(
+                !parse_echo_reply_v6(&buf[..n], seq, ours.expected_id()),
+                "took another backend's reply for our own"
+            );
+        }
+    }
+
+    fn sender(ip: IpAddr, scope_id: u32) -> SocketAddr {
+        match ip {
+            IpAddr::V6(v6) => SocketAddr::V6(std::net::SocketAddrV6::new(v6, 0, 0, scope_id)),
+            ip => SocketAddr::new(ip, 0),
+        }
+    }
+
     #[test]
     fn v6_raw_reply_from_other_target_rejected() {
         let target: IpAddr = "fd00::1".parse().unwrap();
         let other: IpAddr = "fd00::2".parse().unwrap();
-        assert!(v6_source_ok(true, Some(target), target));
-        assert!(!v6_source_ok(true, Some(other), target));
-        assert!(!v6_source_ok(true, None, target));
+        assert!(v6_source_ok(true, Some(sender(target, 0)), target, 0));
+        assert!(!v6_source_ok(true, Some(sender(other, 0)), target, 0));
+        assert!(!v6_source_ok(true, None, target, 0));
+    }
+
+    /// The same link-local address in another zone is another host.
+    #[test]
+    fn v6_raw_reply_from_other_zone_rejected() {
+        let target: IpAddr = "fe80::1".parse().unwrap();
+        assert!(v6_source_ok(true, Some(sender(target, 2)), target, 2));
+        assert!(!v6_source_ok(true, Some(sender(target, 3)), target, 2));
+        // A sender reported without a zone, or a target probed without one,
+        // is matched by address alone.
+        assert!(v6_source_ok(true, Some(sender(target, 0)), target, 2));
+        assert!(v6_source_ok(true, Some(sender(target, 3)), target, 0));
     }
 
     #[test]
     fn v6_dgram_reply_source_not_checked() {
         let target: IpAddr = "fd00::1".parse().unwrap();
         let other: IpAddr = "fd00::2".parse().unwrap();
-        assert!(v6_source_ok(false, Some(other), target));
-        assert!(v6_source_ok(false, None, target));
+        assert!(v6_source_ok(false, Some(sender(other, 0)), target, 0));
+        assert!(v6_source_ok(false, None, target, 0));
     }
 
     /// The RAW ICMPv6 source filter depends on recvmsg reporting the sender,
     /// and the TTL column on it reporting the hop limit.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn recv_reports_sender_and_hop_limit_on_loopback() {
         let target = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
@@ -761,7 +969,7 @@ mod tests {
         if backend.socket.send_to(&packet, &dest).is_err() {
             return; // no IPv6 loopback in this environment
         }
-        let expected_id = backend.is_raw.then_some(backend.identifier);
+        let expected_id = backend.expected_id();
         let start = Instant::now();
         let budget = std::time::Duration::from_secs(2);
         let mut buf = [0u8; 128];
@@ -775,7 +983,7 @@ mod tests {
             let (n, hop_limit, _, source) =
                 recv_with_ttl(backend.as_raw_fd(), &mut buf).expect("echo reply from ::1");
             if parse_echo_reply_v6(&buf[..n], 1, expected_id) {
-                assert_eq!(source, Some(target));
+                assert_eq!(source.map(|s| s.ip()), Some(target));
                 assert!(hop_limit > 0, "IPV6_HOPLIMIT missing from the reply");
                 return;
             }

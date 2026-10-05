@@ -22,6 +22,8 @@ pub enum ProbeResult {
 #[derive(Debug, Clone)]
 pub struct ProbeOptions {
     pub target: IpAddr,
+    /// IPv6 zone index of a link-local `target` (`fe80::1%eth0`); 0 = none.
+    pub scope_id: u32,
     pub timeout: Duration,
     /// ICMP payload size in bytes (default 56, like `ping`).
     pub payload_size: usize,
@@ -38,6 +40,7 @@ impl Default for ProbeOptions {
     fn default() -> Self {
         Self {
             target: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            scope_id: 0,
             timeout: Duration::from_secs(2),
             payload_size: 56,
             ttl: None,

@@ -78,17 +78,18 @@ pub async fn run(cfg: Config) -> anyhow::Result<i32> {
 
     let target = &cfg.targets[0];
 
-    if target.parse::<IpAddr>().is_err() {
+    if !dns::is_literal(target) {
         eprint!("Resolving {target}...");
     }
-    let (target_ip, dns_time) = dns::resolve(target, cfg.family).await?;
+    let (target_addr, dns_time) = dns::resolve(target, cfg.family).await?;
+    let target_ip = target_addr.ip;
     if let Some(dt) = dns_time {
         eprintln!(" {} ({:.1} ms)", target_ip, dt.as_secs_f64() * 1000.0);
     }
 
     let sep = icons::sep();
     let dash = icons::dash();
-    let net_ctx = context::detect(target_ip);
+    let net_ctx = context::detect(target_addr);
     let bold = if icons::use_color() {
         ("\x1b[1m", "\x1b[0m")
     } else {
@@ -126,8 +127,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<i32> {
 
     // Hot context re-detection: a watch channel feeds interface/gateway
     // changes (WiFi → Ethernet, VPN up/down) to the scheduler and retargets
-    // the GW auxiliary probe.
+    // the GW auxiliary probe. The scheduler reports a DNS failover through
+    // `target_tx`: the context is always that of the address being probed.
     let (ctx_tx, ctx_rx) = watch::channel(net_ctx.clone());
+    let (target_tx, mut target_rx) = watch::channel(target_addr);
     let gw_channel = net_ctx
         .gateway
         .as_deref()
@@ -143,26 +146,34 @@ pub async fn run(cfg: Config) -> anyhow::Result<i32> {
             ticker.tick().await; // skip the immediate first tick
             loop {
                 tokio::select! {
-                    _ = ticker.tick() => {
-                        // detect() reads /proc or runs external tools — keep it
-                        // off the async runtime.
-                        let detected =
-                            tokio::task::spawn_blocking(move || context::detect(target_ip)).await;
-                        if let Ok(new_ctx) = detected
-                            && *ctx_tx.borrow() != new_ctx
-                        {
-                            if let (Some(gw_tx), Some(gw_ip)) = (
-                                &gw_target_tx,
-                                new_ctx.gateway.as_deref().and_then(|s| s.parse::<IpAddr>().ok()),
-                            ) {
-                                let _ = gw_tx.send(gw_ip);
-                            }
-                            let _ = ctx_tx.send(new_ctx);
-                        }
+                    _ = ticker.tick() => {}
+                    // A DNS failover moved the target: its context is stale.
+                    moved = target_rx.changed() => {
+                        // The scheduler is gone: nothing left to keep current.
+                        if moved.is_err() { return; }
                     }
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() { return; }
+                        continue;
                     }
+                }
+                let current = *target_rx.borrow_and_update();
+                // detect() reads /proc or runs external tools — keep it
+                // off the async runtime.
+                let detected = tokio::task::spawn_blocking(move || context::detect(current)).await;
+                if let Ok(new_ctx) = detected
+                    && *ctx_tx.borrow() != new_ctx
+                {
+                    if let (Some(gw_tx), Some(gw_ip)) = (
+                        &gw_target_tx,
+                        new_ctx
+                            .gateway
+                            .as_deref()
+                            .and_then(|s| s.parse::<IpAddr>().ok()),
+                    ) {
+                        let _ = gw_tx.send(gw_ip);
+                    }
+                    let _ = ctx_tx.send(new_ctx);
                 }
             }
         });
@@ -173,7 +184,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<i32> {
     let target_host = target.clone();
     let interval = cfg.interval;
     let ctx = Some(net_ctx.clone());
-    let opts = cfg.probe_options(target_ip);
+    let opts = cfg.probe_options(target_addr);
     let count = cfg.count;
     let scheduler_handle = tokio::spawn(async move {
         scheduler::run(
@@ -187,6 +198,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<i32> {
             probe_tx,
             shutdown_rx,
             Some(ctx_rx),
+            Some(target_tx),
         )
         .await;
     });
@@ -268,22 +280,25 @@ pub async fn run_multi(cfg: Config) -> anyhow::Result<i32> {
     eprintln!();
 
     let mut resolved = Vec::new();
-    let mut seen_ips = std::collections::HashSet::new();
+    // Address and zone together: the same link-local address in two zones
+    // is two different hosts.
+    let mut seen_addrs = std::collections::HashSet::new();
 
     for target in &cfg.targets {
-        if target.parse::<IpAddr>().is_err() {
+        if !dns::is_literal(target) {
             eprint!("Resolving {target}...");
         }
         match dns::resolve(target, cfg.family).await {
-            Ok((ip, dns_time)) => {
+            Ok((addr, dns_time)) => {
+                let ip = addr.ip;
                 if let Some(dt) = dns_time {
                     eprintln!(" {} ({:.1} ms)", ip, dt.as_secs_f64() * 1000.0);
                 }
-                if seen_ips.contains(&ip) {
+                if seen_addrs.contains(&addr) {
                     eprintln!("note: {target} resolves to {ip} (duplicate, skipping)");
                 } else {
-                    seen_ips.insert(ip);
-                    resolved.push((target.clone(), ip, dns_time));
+                    seen_addrs.insert(addr);
+                    resolved.push((target.clone(), addr, dns_time));
                 }
             }
             Err(e) => {
@@ -304,7 +319,10 @@ pub async fn run_multi(cfg: Config) -> anyhow::Result<i32> {
 
     let sep = icons::sep();
     let dash = icons::dash();
-    let net_ctx = context::detect(resolved[0].1);
+    // Each target has its own context; the Init line shows the first one's.
+    let addrs: Vec<_> = resolved.iter().map(|(_, addr, _)| *addr).collect();
+    let contexts = context::detect_all(&addrs);
+    let net_ctx = &contexts[0];
     eprintln!(
         "Init: if {}{sep}{}/{}{sep}gw {}{sep}{} targets",
         net_ctx.interface,
@@ -322,16 +340,16 @@ pub async fn run_multi(cfg: Config) -> anyhow::Result<i32> {
     let mut probe_rxs: Vec<watch::Receiver<Option<ProbeSnapshot>>> = Vec::new();
     let mut scheduler_handles = Vec::new();
 
-    for (target_host, target_ip, dns_time) in &resolved {
+    for ((target_host, target_addr, dns_time), net_ctx) in resolved.iter().zip(&contexts) {
         let (probe_tx, probe_rx) = watch::channel(None);
         probe_rxs.push(probe_rx);
 
         let target_host = target_host.clone();
-        let target_ip = *target_ip;
+        let target_ip = target_addr.ip;
         let dns_time = *dns_time;
         let ctx = Some(net_ctx.clone());
         let interval = cfg.interval;
-        let opts = cfg.probe_options(target_ip);
+        let opts = cfg.probe_options(*target_addr);
         let count = cfg.count;
         let shutdown_rx = shutdown_tx.subscribe();
 
@@ -346,6 +364,7 @@ pub async fn run_multi(cfg: Config) -> anyhow::Result<i32> {
                 count,
                 probe_tx,
                 shutdown_rx,
+                None,
                 None,
             )
             .await;
@@ -407,15 +426,15 @@ pub async fn run_batch(cfg: Config) -> anyhow::Result<i32> {
 
     let mut resolved = Vec::new();
     for target in &cfg.targets {
-        if target.parse::<IpAddr>().is_err() {
+        if !dns::is_literal(target) {
             eprint!("  Resolving {target}...");
         }
         match dns::resolve(target, cfg.family).await {
-            Ok((ip, dns_time)) => {
+            Ok((addr, dns_time)) => {
                 if let Some(dt) = dns_time {
-                    eprintln!(" {} ({:.1} ms)", ip, dt.as_secs_f64() * 1000.0);
+                    eprintln!(" {} ({:.1} ms)", addr.ip, dt.as_secs_f64() * 1000.0);
                 }
-                resolved.push((target.clone(), ip, dns_time));
+                resolved.push((target.clone(), addr, dns_time));
             }
             Err(e) => {
                 eprintln!("  warning: skipping {target}: {e}");
@@ -427,16 +446,19 @@ pub async fn run_batch(cfg: Config) -> anyhow::Result<i32> {
         anyhow::bail!("no targets could be resolved");
     }
 
-    let net_ctx = context::detect(resolved[0].1);
+    // Each target has its own context.
+    let addrs: Vec<_> = resolved.iter().map(|(_, addr, _)| *addr).collect();
+    let contexts = context::detect_all(&addrs);
 
     // Probe all targets in parallel.
     eprintln!("Probing {} targets...", resolved.len());
     let mut handles = Vec::new();
 
-    for (target_host, target_ip, dns_time) in resolved {
-        let ctx = Some(net_ctx.clone());
+    for ((target_host, target_addr, dns_time), net_ctx) in resolved.into_iter().zip(contexts) {
+        let target_ip = target_addr.ip;
+        let ctx = Some(net_ctx);
         let interval = cfg.interval;
-        let opts = cfg.probe_options(target_ip);
+        let opts = cfg.probe_options(target_addr);
 
         let handle = tokio::spawn(async move {
             batch::probe_target(target_host, target_ip, dns_time, ctx, interval, opts, count).await
