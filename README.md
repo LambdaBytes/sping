@@ -2,7 +2,7 @@
 
 A modern ping for humans. Terminal-native, real-time connectivity monitor that doesn't just measure packets — **it interprets network context**.
 
-![sping](docs/sping-logo.png)
+<p align="center"><img src="docs/sping-logo.png" alt="sping" width="300"></p>
 
 ![sping probing 8.8.8.8 in the compact view](docs/sping.gif)
 
@@ -303,6 +303,14 @@ with its exit codes, the diagnostics on a failing target, and the small things
 (interfaces, `NO_COLOR`, DNS timing).
 
 ![sping tour: panel, batch, NDJSON, extended, classic, diagnostics](docs/sping-tour.gif)
+
+## What 1.5.5 fixes
+
+Against 1.5.4: an IPv6 link-local target with its zone, IPv4, IPv6 and
+link-local targets in one table, and every target with its own network
+context, in the JSON too.
+
+![sping 1.5.5 against 1.5.4: link-local zones, mixed address families, per-target context](docs/sping-1.5.5.gif)
 
 ## License
 
