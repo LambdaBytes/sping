@@ -18,6 +18,8 @@ pub struct Config {
     pub interval: Duration,
     pub timeout: Duration,
     pub payload_size: usize,
+    /// `Some(port)` probes with a TCP connect to that port instead of ICMP.
+    pub tcp_port: Option<u16>,
     /// `None` uses the OS default TTL / hop limit.
     pub ttl: Option<u8>,
     /// `None` runs until interrupted; defaults to 10 in batch mode.
@@ -50,6 +52,8 @@ pub enum ViewMode {
     Table,
 }
 
+/// ICMP payload size when `-s` is not given (as `ping`).
+const DEFAULT_PAYLOAD: usize = 56;
 /// Max ICMP payload that fits in an unfragmented-by-spec IPv4 packet.
 const MAX_PAYLOAD: usize = 65_507 - 8;
 /// Minimum probe interval (flood protection).
@@ -106,10 +110,10 @@ impl Config {
             ));
         }
 
-        if args.payload_size > MAX_PAYLOAD {
+        let payload_size = args.payload_size.unwrap_or(DEFAULT_PAYLOAD);
+        if payload_size > MAX_PAYLOAD {
             return Err(format!(
-                "payload size must be at most {MAX_PAYLOAD} bytes (got {})",
-                args.payload_size
+                "payload size must be at most {MAX_PAYLOAD} bytes (got {payload_size})"
             ));
         }
 
@@ -165,7 +169,8 @@ impl Config {
             source,
             interval: Duration::from_millis(args.interval_ms),
             timeout: Duration::from_secs_f64(args.timeout),
-            payload_size: args.payload_size,
+            payload_size,
+            tcp_port: args.tcp,
             ttl: args.ttl,
             count,
             quiet: args.quiet,
@@ -195,6 +200,7 @@ impl Config {
             ttl: self.ttl,
             interface: self.interface.clone(),
             source: self.source,
+            tcp_port: self.tcp_port,
         }
     }
 

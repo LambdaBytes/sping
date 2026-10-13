@@ -12,7 +12,9 @@ use crate::probe::auxiliary::AuxiliaryState;
 use crate::probe::pulse::{PulseScaler, compute_rtt_dist, render_echo_path};
 use crate::probe::quality::Trend;
 use crate::probe::types::ProbeSnapshot;
-use crate::render::format::{fmt_elapsed, fmt_loss, fmt_rtt, fmt_rtt_opt};
+use crate::render::format::{
+    describe, fmt_elapsed, fmt_loss, fmt_rtt, fmt_rtt_opt, fmt_source, tcp_outcome,
+};
 use crate::render::icons;
 use crate::render::view_compact::{estimate_hops, guess_os};
 
@@ -42,7 +44,13 @@ pub fn draw_inline(
         host = snap.target_host,
         ip = snap.target_ip
     )?;
-    if let Some(ctx) = &snap.net_ctx {
+    if let Some(port) = snap.port {
+        write!(w, " tcp/{port}")?;
+    }
+    // No source address: no interface either (the Context line says so).
+    if let Some(ctx) = &snap.net_ctx
+        && !ctx.local_ip.is_unspecified()
+    {
         write!(w, " via {}", ctx.interface)?;
     }
     write!(w, "  ")?;
@@ -145,11 +153,7 @@ pub fn draw_inline(
     lines += 1;
 
     if let Some(ctx) = &snap.net_ctx {
-        write!(
-            w,
-            "Context    if {}{sep}{}/{}",
-            ctx.interface, ctx.local_ip, ctx.prefix_len
-        )?;
+        write!(w, "Context    {}", fmt_source(ctx, snap.target_ip, sep))?;
         let gw_ind = gw
             .map(|g| icons::reach_glyph(g.reachability).to_string())
             .unwrap_or_else(|| "?".into());
@@ -179,10 +183,10 @@ pub fn draw_inline(
             write!(w, ")")?;
         }
         let label = match q {
-            crate::probe::quality::QualityGrade::A => "stable",
-            crate::probe::quality::QualityGrade::B => "minor jitter",
-            crate::probe::quality::QualityGrade::C => "unstable",
-            crate::probe::quality::QualityGrade::D => "degraded",
+            crate::probe::quality::QualityGrade::A => "excellent",
+            crate::probe::quality::QualityGrade::B => "good",
+            crate::probe::quality::QualityGrade::C => "fair",
+            crate::probe::quality::QualityGrade::D => "poor",
         };
         write!(w, "{sep}{label}")?;
         if let Some(trend) = &snap.trend
@@ -198,22 +202,16 @@ pub fn draw_inline(
     writeln!(w)?;
     lines += 1;
 
-    let input = DiagInput {
-        target_reachable: snap.reachability == crate::diagnostics::health::Reachability::Online,
-        target_total_loss: snap.reachability == crate::diagnostics::health::Reachability::Offline,
-        loss_pct: snap.recent_loss_pct,
-        quality: snap.quality,
-        gateway: gw,
-        wan,
-        outage_duration: snap.outage_duration,
-        recovery_duration: snap.recovery_duration,
-        last_spike_rtt: snap.last_spike_rtt,
-        spike_guard: snap.spike_guard,
-        jitter: snap.jitter,
-        rtt_avg: snap.rtt_avg,
-    };
-    let mut events = correlator::diagnose(&input);
-    // A probe error goes first: it explains the loss the diagnostics describe.
+    let input = DiagInput::from_snapshot(snap, gw, wan);
+    let mut events: Vec<String> = correlator::diagnose(&input)
+        .iter()
+        .map(|finding| describe(finding, sep))
+        .collect();
+    // How the last TCP connect ended, or the probe error, goes first: it
+    // explains what the diagnostics describe.
+    if let Some(outcome) = tcp_outcome(snap, sep) {
+        events.insert(0, outcome);
+    }
     if let Some(error) = &snap.last_error {
         events.insert(0, error.clone());
     }

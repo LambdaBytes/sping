@@ -9,16 +9,37 @@ use serde::Serialize;
 use crate::context::NetworkContext;
 use crate::probe::quality::{QualityGrade, Trend};
 
-/// Result of a single ICMP echo probe.
+/// Result of a single probe.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum ProbeResult {
-    Reply { seq: u64, rtt: Duration, ttl: u8 },
-    Timeout { seq: u64 },
-    Error { seq: u64, message: String },
+    /// ICMP echo reply.
+    Reply {
+        seq: u64,
+        rtt: Duration,
+        ttl: u8,
+    },
+    /// TCP: the connection was established.
+    Connected {
+        seq: u64,
+        rtt: Duration,
+    },
+    /// TCP: the connection was refused (a reset, or an ICMP port-unreachable
+    /// from the target or a device on the way). Something answered.
+    Refused {
+        seq: u64,
+        rtt: Duration,
+    },
+    Timeout {
+        seq: u64,
+    },
+    Error {
+        seq: u64,
+        message: String,
+    },
 }
 
-/// Options passed to the ICMP backend for each probe.
+/// Options passed to the probe backend (ICMP or TCP) for each probe.
 #[derive(Debug, Clone)]
 pub struct ProbeOptions {
     pub target: IpAddr,
@@ -34,6 +55,8 @@ pub struct ProbeOptions {
     pub interface: Option<String>,
     #[allow(dead_code)]
     pub source: Option<IpAddr>,
+    /// `Some(port)`: probe with a TCP connect to that port instead of ICMP.
+    pub tcp_port: Option<u16>,
 }
 
 impl Default for ProbeOptions {
@@ -46,7 +69,29 @@ impl Default for ProbeOptions {
             ttl: None,
             interface: None,
             source: None,
+            tcp_port: None,
         }
+    }
+}
+
+/// Outcome of the latest TCP connect (`tcp_state` in JSON).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TcpState {
+    Open,
+    Refused,
+    Timeout,
+    Error,
+}
+
+impl std::fmt::Display for TcpState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            TcpState::Open => "open",
+            TcpState::Refused => "refused",
+            TcpState::Timeout => "timeout",
+            TcpState::Error => "error",
+        })
     }
 }
 
@@ -144,11 +189,28 @@ pub struct ProbeSnapshot {
     /// lifetime). Internal correlator input; not serialized.
     #[serde(skip)]
     pub recent_loss_pct: f64,
+    /// The recent window's replies vary by more than half their mean RTT
+    /// (`QualityScorer::high_jitter`, the window the grade uses). Internal
+    /// correlator input; not serialized.
+    #[serde(skip)]
+    pub high_jitter: bool,
     /// Why the most recent probe failed, when it failed with an error rather
     /// than a timeout (e.g. the OS refused to send). Shown by the views so an
     /// error is not mistaken for a lost reply; not serialized.
     #[serde(skip)]
     pub last_error: Option<String>,
+    /// TCP mode only (added in 1.6.0; absent from ICMP lines): `"tcp"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe: Option<&'static str>,
+    /// TCP mode only: the port probed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// TCP mode only: answers that were refusals (part of `received`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refused: Option<u64>,
+    /// TCP mode only: outcome of the latest connect; absent before the first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tcp_state: Option<TcpState>,
 }
 
 impl ProbeSnapshot {
@@ -187,16 +249,33 @@ impl ProbeSnapshot {
             net_ctx,
             reachability: crate::diagnostics::health::Reachability::Unknown,
             recent_loss_pct: 0.0,
+            high_jitter: false,
             last_error: None,
+            probe: None,
+            port: None,
+            refused: None,
+            tcp_state: None,
         }
+    }
+
+    /// Mark the snapshot as a TCP probe of `port` (no-op for ICMP).
+    pub fn with_tcp(mut self, port: Option<u16>) -> Self {
+        if let Some(port) = port {
+            self.probe = Some("tcp");
+            self.port = Some(port);
+            self.refused = Some(0);
+        }
+        self
     }
 }
 
-fn ser_duration_ms<S: serde::Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+/// Serialize a `Duration` as milliseconds (a float, sub-ms kept).
+pub(crate) fn ser_duration_ms<S: serde::Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_f64(d.as_secs_f64() * 1000.0)
 }
 
-fn ser_opt_duration_ms<S: serde::Serializer>(
+/// Serialize an optional `Duration` as milliseconds, or `null`.
+pub(crate) fn ser_opt_duration_ms<S: serde::Serializer>(
     d: &Option<Duration>,
     s: S,
 ) -> Result<S::Ok, S::Error> {

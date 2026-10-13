@@ -215,10 +215,9 @@ unsafe fn collect(first: *const IpAdapterAddresses, only_up: bool) -> Vec<(u32, 
             let Some(ip) = (unsafe { socket_address_ip(&unicast.address) }) else {
                 continue;
             };
+            // Loopback included: a 127.0.0.1 source is looked up here;
+            // `--list-interfaces` leaves it out.
             let (index, max_prefix) = match ip {
-                // Like the other platforms' sources, IPv4 loopback is not
-                // an interface address worth reporting.
-                IpAddr::V4(v4) if v4.is_loopback() => continue,
                 IpAddr::V4(_) => (adapter.if_index, 32),
                 IpAddr::V6(_) => (adapter.ipv6_if_index, 128),
             };
@@ -429,7 +428,14 @@ mod tests {
         let eth = adapter(&name, &*a_loop, IF_OPER_STATUS_UP);
         // SAFETY: the list is built from live boxes and vectors above.
         let list = unsafe { collect(&*eth, false) };
-        assert_eq!(summary(&list), vec![(7, "Ethernet", "::1".to_string(), 0)]);
+        // Loopback is kept: a 127.0.0.1 source is looked up in this list.
+        assert_eq!(
+            summary(&list),
+            vec![
+                (12, "Ethernet", "127.0.0.1".to_string(), 8),
+                (7, "Ethernet", "::1".to_string(), 0)
+            ]
+        );
 
         // SAFETY: null is an empty list.
         assert!(unsafe { collect(std::ptr::null(), false) }.is_empty());

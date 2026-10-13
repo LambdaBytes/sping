@@ -13,6 +13,26 @@ pub use linux_icmp::LinuxIcmpBackend as IcmpBackend;
 #[cfg(target_os = "windows")]
 pub use windows_icmp::WindowsIcmpBackend as IcmpBackend;
 
+pub mod tcp;
+
+use crate::probe::types::{ProbeOptions, ProbeResult};
+
+/// The probe a target runs: an ICMP echo or, with `--tcp PORT`, a TCP connect.
+pub enum ProbeBackend {
+    Icmp(IcmpBackend),
+    Tcp(tcp::TcpProber),
+}
+
+impl ProbeBackend {
+    /// One probe, blocking until its outcome or `opts.timeout`.
+    pub fn ping(&self, opts: &ProbeOptions, seq: u16) -> ProbeResult {
+        match self {
+            ProbeBackend::Icmp(backend) => backend.ping(opts, seq),
+            ProbeBackend::Tcp(prober) => prober.ping(opts, seq),
+        }
+    }
+}
+
 /// Print a hint after an ICMP socket creation failure.
 /// No-op on Windows: `IcmpSendEcho` works without admin.
 pub fn eprint_icmp_hint() {

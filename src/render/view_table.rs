@@ -8,6 +8,7 @@ use std::io::{self, Write};
 use crossterm::style::{Color, ResetColor, SetForegroundColor};
 use crossterm::{cursor, queue, terminal};
 
+use crate::context::dns::is_literal;
 use crate::probe::types::ProbeSnapshot;
 use crate::render::format::{fmt_loss, fmt_rtt_opt};
 use crate::render::icons;
@@ -42,7 +43,12 @@ pub fn draw_table(
     let w = &mut buf;
     let mut lines: u16 = 0;
 
+    // TCP mode: one port for every target.
+    let tcp_port = snapshots.iter().flatten().find_map(|s| s.port);
     write!(w, "sping multi-target  ")?;
+    if let Some(port) = tcp_port {
+        write!(w, "tcp/{port}  ")?;
+    }
     if use_color {
         queue!(w, SetForegroundColor(VAL))?;
     }
@@ -62,7 +68,14 @@ pub fn draw_table(
     write!(
         w,
         "{:<20}  {:>9}  {:>9}  {:>5}  {:>6}  {:>9}  {:>9}  {:>4}",
-        "Target", "RTT", "Avg", "Loss", "Qual", "Trend", "TTL", "Hops"
+        "Target",
+        "RTT",
+        "Avg",
+        "Loss",
+        "Qual",
+        "Trend",
+        if tcp_port.is_some() { "TCP" } else { "TTL" },
+        "Hops"
     )?;
     queue!(w, terminal::Clear(terminal::ClearType::UntilNewLine))?;
     writeln!(w)?;
@@ -82,7 +95,9 @@ pub fn draw_table(
             continue;
         };
 
-        let name = if snap.target_host == snap.target_ip.to_string() {
+        // An address given as the target (with its zone, if any) is shown
+        // once; a name with the address it resolved to.
+        let name = if is_literal(&snap.target_host) {
             snap.target_host.clone()
         } else {
             format!("{} ({})", snap.target_host, snap.target_ip)
@@ -147,18 +162,23 @@ pub fn draw_table(
 
         write!(w, "  ")?;
 
-        // TTL with OS hint.
-        let ttl_str = match snap.ttl {
-            Some(t) if t > 0 => {
-                let os = guess_os(t).unwrap_or("?");
-                let short_os = match os {
-                    "Linux" => "Lin",
-                    "Windows" => "Win",
-                    "network" => "Net",
-                    _ => os,
-                };
-                format!("{t}({short_os})")
-            }
+        // TTL with OS hint; in TCP, how the last connect ended.
+        let ttl_str = match (snap.port, snap.ttl) {
+            (Some(_), _) => snap
+                .tcp_state
+                .map_or_else(|| dash.into(), |state| state.to_string()),
+            (None, Some(t)) if t > 0 => match guess_os(t) {
+                Some(os) => {
+                    let short_os = match os {
+                        "Unix-like" => "Unix",
+                        "Windows" => "Win",
+                        "network" => "Net",
+                        _ => os,
+                    };
+                    format!("{t}({short_os})")
+                }
+                None => t.to_string(),
+            },
             _ => dash.into(),
         };
         write!(w, "{:>9}", ttl_str)?;

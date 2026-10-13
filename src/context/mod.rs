@@ -33,7 +33,12 @@ pub struct NetworkContext {
 
 /// Detect full network context for a target address.
 pub fn detect(target: dns::ResolvedAddr) -> NetworkContext {
-    context_for(target, gateway::detect(), iface::interface_for_ip)
+    context_for(
+        target,
+        iface::detect_local_ip(target),
+        gateway::detect(),
+        iface::interface_for_ip,
+    )
 }
 
 /// Detect the network context of each target, in order: every target has
@@ -47,26 +52,36 @@ pub fn detect_all(targets: &[dns::ResolvedAddr]) -> Vec<NetworkContext> {
     targets
         .iter()
         .map(|&target| {
-            context_for(target, gw, |local_ip, scope_id| {
-                interfaces
-                    .entry((local_ip, scope_id))
-                    .or_insert_with(|| iface::interface_for_ip(local_ip, scope_id))
-                    .clone()
-            })
+            context_for(
+                target,
+                iface::detect_local_ip(target),
+                gw,
+                |local_ip, scope_id| {
+                    interfaces
+                        .entry((local_ip, scope_id))
+                        .or_insert_with(|| iface::interface_for_ip(local_ip, scope_id))
+                        .clone()
+                },
+            )
         })
         .collect()
 }
 
-/// The context of one target, given the default gateway and a way to find
-/// the interface that holds a source address (in a zone).
+/// The context of one target, given its source address (`None`: the system
+/// has none for it, e.g. no route of its family), the default gateway and a
+/// way to find the interface that holds a source address (in a zone).
 fn context_for(
     target: dns::ResolvedAddr,
+    source: Option<IpAddr>,
     gw: Option<Ipv4Addr>,
     mut interface_for: impl FnMut(IpAddr, u32) -> Option<iface::InterfaceInfo>,
 ) -> NetworkContext {
-    let local_ip = iface::detect_local_ip(target).unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let local_ip = source.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
 
-    let iface_info = interface_for(local_ip, target.scope_id);
+    // Without a source address there is no interface to look up: asking for
+    // 0.0.0.0 would find whichever interface a route happens to cover it
+    // with (the default route's, or a VPN's 0.0.0.0/1), and its prefix.
+    let iface_info = source.and_then(|ip| interface_for(ip, target.scope_id));
     let interface = iface_info
         .as_ref()
         .map(|i| i.name.clone())
@@ -110,7 +125,7 @@ mod tests {
         let local_ip = iface::detect_local_ip(target).unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let gw = Some(Ipv4Addr::new(192, 168, 1, 1));
 
-        let ctx = context_for(target, gw, |ip, scope_id| {
+        let ctx = context_for(target, Some(local_ip), gw, |ip, scope_id| {
             assert_eq!((ip, scope_id), (local_ip, 0));
             Some(info("lo", "127.0.0.1", 8))
         });
@@ -123,10 +138,29 @@ mod tests {
         );
 
         // No interface found: the documented fallbacks.
-        let ctx = context_for(target, None, |_, _| None);
+        let ctx = context_for(target, Some(local_ip), None, |_, _| None);
         assert_eq!((ctx.interface.as_str(), ctx.prefix_len), ("unknown", 0));
         assert_eq!(ctx.gateway, None);
-        assert_eq!(ctx.target_class, TargetClass::RoutedInternal);
+        assert_eq!(ctx.target_class, TargetClass::Loopback);
+    }
+
+    /// No source address for the target: no interface is looked up, so no
+    /// route that happens to cover 0.0.0.0 (here a VPN's 0.0.0.0/1) lends
+    /// its interface and prefix, and the target is not put in that subnet.
+    #[test]
+    fn no_source_looks_up_no_interface() {
+        let ctx = context_for(addr("8.8.8.8"), None, None, |_, _| {
+            Some(info("tun0", "0.0.0.0", 1))
+        });
+        assert_eq!((ctx.interface.as_str(), ctx.prefix_len), ("unknown", 0));
+        assert_eq!(ctx.local_ip, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(ctx.target_class, TargetClass::PublicNetwork);
+
+        let ctx = context_for(addr("2001:db8::1"), None, None, |_, _| {
+            Some(info("eth0", "0.0.0.0", 0))
+        });
+        assert_eq!(ctx.interface, "unknown");
+        assert_eq!(ctx.local_ip, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     }
 
     /// `detect_all` is `detect` for each target, in order.

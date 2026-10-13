@@ -12,6 +12,7 @@ use crate::context;
 use crate::context::dns;
 use crate::probe::types::ProbeSnapshot;
 use crate::probe::{auxiliary, batch, scheduler};
+use crate::render::format::fmt_source;
 use crate::render::icons;
 use crate::render::terminal::{self, AuxChannels};
 use crate::runtime::bus::Bus;
@@ -62,6 +63,29 @@ fn eprint_socket_error(e: &std::io::Error) {
     eprintln!("hint: try running as Administrator");
 }
 
+/// Before probing: the ICMP socket opens or, with `--tcp`, every target's
+/// TCP socket can be prepared (source address, TTL). A failure is a local
+/// error, reported once: the caller exits with `EXIT_ERROR`. With `--tcp` and
+/// no targets yet (batch, before resolving) there is nothing to check.
+fn precheck(cfg: &Config, targets: &[dns::ResolvedAddr]) -> bool {
+    if cfg.tcp_port.is_none() {
+        return match crate::backends::IcmpBackend::new() {
+            Ok(_) => true,
+            Err(e) => {
+                eprint_socket_error(&e);
+                false
+            }
+        };
+    }
+    for &target in targets {
+        if let Err(e) = crate::backends::tcp::TcpProber::new(&cfg.probe_options(target)) {
+            eprintln!("error: cannot prepare the TCP probe of {}: {e}", target.ip);
+            return false;
+        }
+    }
+    true
+}
+
 fn exit_code_for(received: u64) -> i32 {
     if received > 0 { EXIT_OK } else { EXIT_NO_REPLY }
 }
@@ -95,24 +119,25 @@ pub async fn run(cfg: Config) -> anyhow::Result<i32> {
     } else {
         ("", "")
     };
-    let target_label = if net_ctx.target_class == context::classify::TargetClass::DefaultGateway {
+    let mut target_label = if net_ctx.target_class == context::classify::TargetClass::DefaultGateway
+    {
         format!("target {}{}{} (default gateway)", bold.0, target_ip, bold.1)
     } else {
         format!("target {}{}{}", bold.0, target_ip, bold.1)
     };
+    if let Some(port) = cfg.tcp_port {
+        target_label.push_str(&format!(" tcp/{port}"));
+    }
     eprintln!(
-        "Init: if {}{sep}{}/{}{sep}gw {}{sep}{}{sep}{}",
-        net_ctx.interface,
-        net_ctx.local_ip,
-        net_ctx.prefix_len,
+        "Init: {}{sep}gw {}{sep}{}{sep}{}",
+        fmt_source(&net_ctx, target_ip, sep),
         net_ctx.gateway.as_deref().unwrap_or(dash),
         target_label,
         net_ctx.target_class,
     );
 
-    // Pre-check the socket before entering raw mode.
-    if let Err(e) = crate::backends::IcmpBackend::new() {
-        eprint_socket_error(&e);
+    // Pre-check the probe before entering raw mode.
+    if !precheck(&cfg, &[target_addr]) {
         return Ok(EXIT_ERROR);
     }
 
@@ -311,25 +336,25 @@ pub async fn run_multi(cfg: Config) -> anyhow::Result<i32> {
         anyhow::bail!("no targets could be resolved");
     }
 
-    // Pre-check the socket before entering raw mode.
-    if let Err(e) = crate::backends::IcmpBackend::new() {
-        eprint_socket_error(&e);
+    // Pre-check the probe before entering raw mode.
+    let addrs: Vec<_> = resolved.iter().map(|(_, addr, _)| *addr).collect();
+    if !precheck(&cfg, &addrs) {
         return Ok(EXIT_ERROR);
     }
 
     let sep = icons::sep();
     let dash = icons::dash();
     // Each target has its own context; the Init line shows the first one's.
-    let addrs: Vec<_> = resolved.iter().map(|(_, addr, _)| *addr).collect();
     let contexts = context::detect_all(&addrs);
     let net_ctx = &contexts[0];
     eprintln!(
-        "Init: if {}{sep}{}/{}{sep}gw {}{sep}{} targets",
-        net_ctx.interface,
-        net_ctx.local_ip,
-        net_ctx.prefix_len,
+        "Init: {}{sep}gw {}{sep}{} targets{}",
+        fmt_source(net_ctx, addrs[0].ip, sep),
         net_ctx.gateway.as_deref().unwrap_or(dash),
         resolved.len(),
+        cfg.tcp_port
+            .map(|p| format!(" tcp/{p}"))
+            .unwrap_or_default(),
     );
 
     let (shutdown_tx, _) = watch::channel(false);
@@ -418,9 +443,8 @@ pub async fn run_batch(cfg: Config) -> anyhow::Result<i32> {
         cfg.interval.as_millis()
     );
 
-    // Pre-check the socket before probing.
-    if let Err(e) = crate::backends::IcmpBackend::new() {
-        eprint_socket_error(&e);
+    // Pre-check the socket before probing (TCP: per target, below).
+    if !precheck(&cfg, &[]) {
         return Ok(EXIT_ERROR);
     }
 
@@ -446,8 +470,13 @@ pub async fn run_batch(cfg: Config) -> anyhow::Result<i32> {
         anyhow::bail!("no targets could be resolved");
     }
 
-    // Each target has its own context.
     let addrs: Vec<_> = resolved.iter().map(|(_, addr, _)| *addr).collect();
+    // TCP: every target's socket, now that the addresses are known.
+    if cfg.tcp_port.is_some() && !precheck(&cfg, &addrs) {
+        return Ok(EXIT_ERROR);
+    }
+
+    // Each target has its own context.
     let contexts = context::detect_all(&addrs);
 
     // Probe all targets in parallel.
@@ -476,7 +505,8 @@ pub async fn run_batch(cfg: Config) -> anyhow::Result<i32> {
     let mut output = String::new();
     if is_json {
         for snap in &results {
-            match serde_json::to_string(snap) {
+            // No gateway or WAN probe in batch: the target's diagnosis only.
+            match crate::render::view_json::line(snap, None, None) {
                 Ok(json) => {
                     output.push_str(&json);
                     output.push('\n');
@@ -490,55 +520,8 @@ pub async fn run_batch(cfg: Config) -> anyhow::Result<i32> {
             }
         }
     } else {
-        // One-line summary per host.
-        use crate::render::format::{fmt_loss, fmt_rtt_opt};
-        use crate::render::view_compact::{estimate_hops, guess_os};
-
-        let dash = icons::dash();
         for snap in &results {
-            let host = if snap.target_host == snap.target_ip.to_string() {
-                snap.target_host.clone()
-            } else {
-                format!("{} ({})", snap.target_host, snap.target_ip)
-            };
-
-            let ttl_info = match snap.ttl {
-                Some(t) if t > 0 => {
-                    let os = guess_os(t).unwrap_or("?");
-                    let hops = estimate_hops(t);
-                    format!("ttl {t} ({os}) hops ~{hops}")
-                }
-                _ => format!("ttl {dash}"),
-            };
-
-            let quality = match (&snap.quality, snap.quality_score) {
-                (Some(g), Some(s)) => {
-                    let letter = format!("{g}").chars().next().unwrap_or('?');
-                    format!("{letter}({s})")
-                }
-                _ => dash.into(),
-            };
-
-            let trend = snap
-                .trend
-                .as_ref()
-                .map(|t| t.to_string())
-                .unwrap_or_else(|| dash.into());
-
-            output.push_str(&format!(
-                "{:<24} {}/{}  {}  avg {}  min {}  max {}  jitter {}  {}  {} {}\n",
-                host,
-                snap.received,
-                snap.sent,
-                fmt_loss(snap.loss_pct),
-                fmt_rtt_opt(snap.rtt_avg),
-                fmt_rtt_opt(snap.rtt_min),
-                fmt_rtt_opt(snap.rtt_max),
-                fmt_rtt_opt(snap.jitter),
-                ttl_info,
-                quality,
-                trend,
-            ));
+            output.push_str(&batch_line(snap));
         }
     }
 
@@ -559,4 +542,136 @@ pub async fn run_batch(cfg: Config) -> anyhow::Result<i32> {
 
     let all_replied = !results.is_empty() && results.iter().all(|s| s.received > 0);
     Ok(if all_replied { EXIT_OK } else { EXIT_NO_REPLY })
+}
+
+/// One-line summary of a batch target (the text batch output, one per host).
+fn batch_line(snap: &ProbeSnapshot) -> String {
+    use crate::render::format::{fmt_loss, fmt_rtt_opt};
+    use crate::render::view_compact::{estimate_hops, guess_os};
+
+    let dash = icons::dash();
+    // An address given as the target (with its zone, if any) is shown once;
+    // a name with the address it resolved to.
+    let host = if dns::is_literal(&snap.target_host) {
+        snap.target_host.clone()
+    } else {
+        format!("{} ({})", snap.target_host, snap.target_ip)
+    };
+
+    let ttl_info = match (snap.port, snap.ttl) {
+        // TCP: the port and how its last connect ended.
+        (Some(port), _) => match snap.tcp_state {
+            Some(state) => format!("tcp/{port} {state}"),
+            None => format!("tcp/{port} {dash}"),
+        },
+        (None, Some(t)) if t > 0 => {
+            let hops = estimate_hops(t);
+            match guess_os(t) {
+                Some(os) => format!("ttl {t} ({os}) hops ~{hops}"),
+                None => format!("ttl {t} hops ~{hops}"),
+            }
+        }
+        _ => format!("ttl {dash}"),
+    };
+
+    let quality = match (&snap.quality, snap.quality_score) {
+        (Some(g), Some(s)) => {
+            let letter = format!("{g}").chars().next().unwrap_or('?');
+            format!("{letter}({s})")
+        }
+        _ => dash.into(),
+    };
+
+    let trend = snap
+        .trend
+        .as_ref()
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| dash.into());
+
+    format!(
+        "{:<24} {}/{}  {}  avg {}  min {}  max {}  jitter {}  {}  {} {}\n",
+        host,
+        snap.received,
+        snap.sent,
+        fmt_loss(snap.loss_pct),
+        fmt_rtt_opt(snap.rtt_avg),
+        fmt_rtt_opt(snap.rtt_min),
+        fmt_rtt_opt(snap.rtt_max),
+        fmt_rtt_opt(snap.jitter),
+        ttl_info,
+        quality,
+        trend,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::batch_line;
+    use crate::render::golden_icmp::{lost, no_hop_limit, replying};
+    use crate::render::golden_tcp::{open, refused, timed_out};
+
+    // The exact text batch line for ICMP, as before the TCP probe existed.
+    #[test]
+    fn batch_line_icmp_golden() {
+        assert_eq!(
+            batch_line(&replying()),
+            "dns.example (192.0.2.10) 9/10  10%  avg 13.9 ms  min 13.6 ms  max 14.1 ms  jitter 0.19 ms  ttl 57 hops ~7  A(95) stable\n"
+        );
+        assert_eq!(
+            batch_line(&lost()),
+            "dns.example (192.0.2.10) 9/11  18%  avg 13.9 ms  min 13.6 ms  max 14.1 ms  jitter 0.19 ms  ttl —  A(95) stable\n"
+        );
+        assert_eq!(
+            batch_line(&no_hop_limit()),
+            "dns.example (192.0.2.10) 9/10  10%  avg 13.9 ms  min 13.6 ms  max 14.1 ms  jitter 0.19 ms  ttl —  A(95) stable\n"
+        );
+    }
+
+    // A TTL still at an initial value gives a hint; an address given with
+    // its zone is shown once.
+    #[test]
+    fn batch_line_hint_and_zoned_literal() {
+        let mut s = replying();
+        s.ttl = Some(64);
+        assert_eq!(
+            batch_line(&s),
+            "dns.example (192.0.2.10) 9/10  10%  avg 13.9 ms  min 13.6 ms  max 14.1 ms  jitter 0.19 ms  ttl 64 (Unix-like) hops ~0  A(95) stable\n"
+        );
+        s.target_host = "fe80::1%eth0".into();
+        s.target_ip = "fe80::1".parse().unwrap();
+        assert!(
+            batch_line(&s).starts_with("fe80::1%eth0             9/10"),
+            "{}",
+            batch_line(&s)
+        );
+    }
+
+    // TCP: the port and the last outcome where ICMP puts the TTL.
+    #[test]
+    fn batch_line_tcp_golden() {
+        assert_eq!(
+            batch_line(&open()),
+            "dns.example (192.0.2.10) 9/10  10%  avg 13.9 ms  min 13.6 ms  max 14.1 ms  jitter 0.19 ms  tcp/443 open  A(95) stable\n"
+        );
+        assert_eq!(
+            batch_line(&refused()),
+            "dns.example (192.0.2.10) 9/10  10%  avg 13.9 ms  min 13.6 ms  max 14.1 ms  jitter 0.19 ms  tcp/443 refused  A(95) stable\n"
+        );
+        assert_eq!(
+            batch_line(&timed_out()),
+            "dns.example (192.0.2.10) 9/11  18%  avg 13.9 ms  min 13.6 ms  max 14.1 ms  jitter 0.19 ms  tcp/443 timeout  A(95) stable\n"
+        );
+        // A target whose probe could not even start: no outcome yet.
+        let never = crate::probe::types::ProbeSnapshot::empty(
+            "192.0.2.10".into(),
+            "192.0.2.10".parse().unwrap(),
+            None,
+            None,
+        )
+        .with_tcp(Some(443));
+        assert_eq!(
+            batch_line(&never),
+            "192.0.2.10               0/0  0%  avg —  min —  max —  jitter —  tcp/443 —  — —\n"
+        );
+    }
 }

@@ -138,7 +138,9 @@ fn default_gateway_macos() -> Option<(Ipv4Addr, String)> {
     //    route to: default
     //    gateway: 192.168.1.1
     //    interface: en0
-    let output = std::process::Command::new("route")
+    // By absolute path: cron runs us with PATH=/usr/bin:/bin, without
+    // /sbin, where macOS installs route (13 to 27, at least).
+    let output = std::process::Command::new("/sbin/route")
         .args(["-n", "get", "default"])
         .output()
         .ok()?;

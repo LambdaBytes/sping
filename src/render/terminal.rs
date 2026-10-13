@@ -18,7 +18,8 @@ use crate::render::view_json::JsonView;
 use crate::render::view_table;
 use crate::runtime::frame_clock::FrameClock;
 
-/// Latest gateway and WAN auxiliary probe states shown by the TUI views.
+/// Latest gateway and WAN auxiliary probe states shown by the TUI views and
+/// the JSON lines.
 pub struct AuxChannels {
     pub gateway_rx: watch::Receiver<Option<AuxiliaryState>>,
     pub wan_rx: watch::Receiver<Option<AuxiliaryState>>,
@@ -71,7 +72,7 @@ pub async fn run(
 
     match view {
         ViewMode::Classic => run_classic(&mut out, probe_rx, shutdown, quiet).await,
-        ViewMode::Json => run_json(&mut out, probe_rx, shutdown).await,
+        ViewMode::Json => run_json(&mut out, probe_rx, aux, shutdown).await,
         _ => {
             let extended = matches!(view, ViewMode::Extended);
             run_tui(&mut out, probe_rx, aux, shutdown, extended).await;
@@ -219,8 +220,9 @@ async fn run_classic(
 }
 
 async fn run_json(
-    out: &mut Stdout,
+    out: &mut impl Write,
     probe_rx: watch::Receiver<Option<ProbeSnapshot>>,
+    aux: AuxChannels,
     shutdown: watch::Receiver<bool>,
 ) {
     // Streaming output: no raw mode.
@@ -232,8 +234,12 @@ async fn run_json(
         tokio::select! {
             result = probe_rx.changed() => {
                 if result.is_err() { break; }
+                // The gateway and WAN state of this moment: shown in the line
+                // and the source of its diagnosis.
+                let gw = aux.gateway_rx.borrow().clone();
+                let wan = aux.wan_rx.borrow().clone();
                 if let Some(snap) = probe_rx.borrow_and_update().as_ref()
-                    && let Err(e) = view.draw(out, snap)
+                    && let Err(e) = view.draw(out, snap, gw.as_ref(), wan.as_ref())
                 {
                     if e.kind() != std::io::ErrorKind::BrokenPipe {
                         eprintln!("error: cannot write to stdout: {e}");
@@ -248,10 +254,12 @@ async fn run_json(
     }
 
     // Drain the final snapshot if it raced with shutdown (count mode).
+    let gw = aux.gateway_rx.borrow().clone();
+    let wan = aux.wan_rx.borrow().clone();
     if probe_rx.has_changed().unwrap_or(false)
         && let Some(snap) = probe_rx.borrow_and_update().as_ref()
     {
-        let _ = view.draw(out, snap);
+        let _ = view.draw(out, snap, gw.as_ref(), wan.as_ref());
     }
 }
 
@@ -260,19 +268,37 @@ fn print_final_summary(snap: &ProbeSnapshot) {
 
     // EPIPE-safe: never panic if stdout is gone.
     let mut out = stdout();
-    let _ = writeln!(
-        out,
-        "--- {host} ({ip}) sping statistics ---",
-        host = snap.target_host,
-        ip = snap.target_ip,
-    );
-    let _ = writeln!(
-        out,
-        "{sent} sent, {recv} received, {loss} loss",
-        sent = snap.sent,
-        recv = snap.received,
-        loss = fmt_loss(snap.loss_pct),
-    );
+    if let Some(port) = snap.port {
+        // TCP counts connects and their answers, as the classic summary.
+        let _ = writeln!(
+            out,
+            "--- {host} ({ip}) tcp/{port} statistics ---",
+            host = snap.target_host,
+            ip = snap.target_ip,
+        );
+        let _ = writeln!(
+            out,
+            "{sent} connects, {recv} answered ({refused} refused), {loss} loss",
+            sent = snap.sent,
+            recv = snap.received,
+            refused = snap.refused.unwrap_or(0),
+            loss = fmt_loss(snap.loss_pct),
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "--- {host} ({ip}) sping statistics ---",
+            host = snap.target_host,
+            ip = snap.target_ip,
+        );
+        let _ = writeln!(
+            out,
+            "{sent} sent, {recv} received, {loss} loss",
+            sent = snap.sent,
+            recv = snap.received,
+            loss = fmt_loss(snap.loss_pct),
+        );
+    }
     let _ = writeln!(
         out,
         "rtt min/avg/max/mdev = {}/{}/{}/{}{sep}jitter {}",
@@ -288,4 +314,109 @@ fn print_final_summary(snap: &ProbeSnapshot) {
 /// Start the TUI keyboard listener; called from `app.rs` before the renderer.
 pub fn start_key_listener(shutdown_tx: watch::Sender<bool>) {
     spawn_key_listener(shutdown_tx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diagnostics::health::Reachability;
+    use crate::render::golden_icmp::replying;
+
+    fn aux(target: &str, reachability: Reachability) -> AuxiliaryState {
+        AuxiliaryState {
+            label: "probe".into(),
+            target: target.parse().unwrap(),
+            reachability,
+            last_rtt: None,
+        }
+    }
+
+    /// Output that hands each written chunk to the test, so it can wait for
+    /// a line before sending the next snapshot.
+    struct LineTap(tokio::sync::mpsc::UnboundedSender<Vec<u8>>);
+
+    impl Write for LineTap {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let _ = self.0.send(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// In the loop: each snapshot is printed as it arrives, with the gateway
+    /// and WAN state of that moment. The second snapshot is sent only once
+    /// the first line is out, after the gateway went offline: two lines (the
+    /// final drain prints at most one).
+    #[tokio::test]
+    async fn json_loop_prints_each_line_with_its_moment() {
+        let (probe_tx, probe_rx) = watch::channel(None);
+        let (gateway_tx, gateway_rx) = watch::channel(None);
+        let (_wan_tx, wan_rx) = watch::channel(None);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (tap_tx, mut tap_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut out = LineTap(tap_tx);
+        let channels = AuxChannels { gateway_rx, wan_rx };
+
+        let driver = async {
+            let mut text = Vec::new();
+            let mut next_line = async |text: &mut Vec<u8>| {
+                let lines = text.iter().filter(|&&b| b == b'\n').count();
+                while text.iter().filter(|&&b| b == b'\n').count() == lines {
+                    text.extend(tap_rx.recv().await.expect("output closed"));
+                }
+            };
+            let _ = gateway_tx.send(Some(aux("192.168.1.1", Reachability::Online)));
+            let _ = probe_tx.send(Some(replying()));
+            next_line(&mut text).await;
+            let _ = gateway_tx.send(Some(aux("192.168.1.1", Reachability::Offline)));
+            let mut second = replying();
+            second.seq = 11;
+            let _ = probe_tx.send(Some(second));
+            next_line(&mut text).await;
+            let _ = shutdown_tx.send(true);
+            text
+        };
+        let ((), text) = tokio::join!(run_json(&mut out, probe_rx, channels, shutdown_rx), driver);
+
+        let text = String::from_utf8(text).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(lines[0].contains("\"seq\":10,") && lines[0].contains("\"state\":\"online\""));
+        assert!(lines[1].contains("\"seq\":11,") && lines[1].contains("\"state\":\"offline\""));
+    }
+
+    /// Snapshot and shutdown ready together, as at the end of `-c N`: tokio
+    /// picks a ready branch at random, so the line comes from the loop or
+    /// from the final drain. Either way it is the same single line; 32 runs
+    /// reach the drain unless chance says no 32 times (2^-32).
+    #[tokio::test]
+    async fn json_loop_prints_aux_state_and_diagnosis() {
+        for _ in 0..32 {
+            let (probe_tx, probe_rx) = watch::channel(None);
+            let (gateway_tx, gateway_rx) = watch::channel(None);
+            let (wan_tx, wan_rx) = watch::channel(None);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let _ = gateway_tx.send(Some(aux("192.168.1.1", Reachability::Online)));
+            let _ = wan_tx.send(Some(aux("1.1.1.1", Reachability::Offline)));
+            let _ = probe_tx.send(Some(replying()));
+            let _ = shutdown_tx.send(true);
+
+            let mut out = Vec::new();
+            let aux = AuxChannels { gateway_rx, wan_rx };
+            run_json(&mut out, probe_rx, aux, shutdown_rx).await;
+
+            let text = String::from_utf8(out).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(lines.len(), 1, "{text}");
+            assert!(
+                lines[0].ends_with(
+                    ",\"gateway\":{\"target\":\"192.168.1.1\",\"state\":\"online\",\"rtt_last\":null},\"wan\":{\"target\":\"1.1.1.1\",\"state\":\"offline\",\"rtt_last\":null},\"diagnosis\":[{\"code\":\"intermittent_loss\",\"recent_loss_pct\":10.0},{\"code\":\"wan_degraded\"}]}"
+                ),
+                "{}",
+                lines[0]
+            );
+        }
+    }
 }

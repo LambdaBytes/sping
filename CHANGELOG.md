@@ -1,5 +1,97 @@
 # Changelog
 
+## v1.6.0
+
+### Added
+- Static Linux binaries, `sping-vX.Y.Z-linux-x86_64-musl` and
+  `sping-vX.Y.Z-linux-aarch64-musl`: built against musl, they need no glibc and
+  run on any Linux of their architecture, Alpine and older systems included.
+  They resolve names without the system's NSS modules (see the README's known
+  limitations).
+- TCP connect probe, `--tcp PORT`: times the TCP handshake with the port
+  instead of sending ICMP echoes, in every mode and view. It needs no ICMP
+  permission and gets through networks that filter ICMP. An open port and a
+  refused one both count as answers (`Connected to` / `Refused by`; the
+  summary counts the refusals); no answer before `-W` is a loss. On Windows a
+  probe is a single SYN, so that a refusal answers at once (Windows otherwise
+  retries for about 2 s); there the wait is about 3 s at most. `-t`, `-S`
+  (bound on Windows too) and `-I` (as with ICMP) apply; `-s` is rejected. A
+  source address that cannot be used exits with code 2. JSON lines gain
+  `probe`, `port`, `refused` and `tcp_state`, in TCP mode only.
+- The diagnosis in JSON: lines gain `diagnosis`, the findings shown on the
+  Events line as stable codes with their evidence (`intermittent_loss` with
+  `recent_loss_pct`, `upstream_outage`, `tcp_refused` with `port`…), and in
+  single-target mode `gateway` and `wan`, the auxiliary probes' state
+  (`online`, `offline`, `unknown`) it is drawn from. Each is absent when it
+  has nothing to say; batch lines carry the target's diagnosis. See
+  JSON_CONTRACT.md.
+
+### Changed
+- Quality grades have names that do not clash with the trend: `A (95) ·
+  excellent`, then `good`, `fair` and `poor` (the trend keeps `stable`,
+  `improving`, `degrading`). JSON keeps `"A"`…`"D"`.
+- The OS hint after the TTL appears only while the TTL is still an initial
+  value: `ttl 64 (Unix-like)`, `ttl 128 (Windows)`, `ttl 255 (network)`.
+  Past a router the TTL no longer says what answered (8.8.8.8 was shown as
+  Windows), and 64 is macOS and the BSDs as much as Linux.
+- A loopback target (`127.0.0.0/8`, `::1`) is `loopback`, not `routed
+  internal`. JSON keeps `"RoutedInternal"` for it.
+- With no source address for the target's family (an IPv6 target on a host
+  without IPv6) the `Init:` and `Context` lines say `no IPv6 source` instead
+  of `0.0.0.0/0` on the default route's interface.
+- A WAN outage while nothing is known about the gateway reads `WAN
+  unreachable · gateway state unknown` instead of `upstream outage likely`.
+- TCP: the compact and extended views say how the last connect ended at the
+  head of Events: `TCP 443 connected · 21 ms`, `TCP 443 refused · host or
+  firewall answered`, `TCP 443 timeout · no answer`. The Status line no
+  longer repeats it.
+- Batch and table: an address given with its zone (`fe80::1%eth0`) is shown
+  once, not followed by the same address in parentheses.
+- Scoring: the `high jitter with no loss` warning reads the same 20 probes
+  and the same jitter measure as the quality grade (it read the whole
+  session's jitter), and appears exactly when the grade takes its largest
+  jitter penalty.
+- Scoring: changes and deviations under 0.1 ms are noise. Loopback and fast
+  LAN targets no longer turn `degrading`/`improving` or lose 10-20 quality
+  points over tens of microseconds; a LAN going from 0.3 to 0.9 ms is still
+  `degrading`.
+- The trend counts losses: two or more lost probes more in the recent half
+  of the window than in the older one is `degrading` (an outage was
+  `unknown`), as many fewer `improving`. When loss and latency disagree,
+  `degrading` wins. JSON `quality_score` and `trend` change accordingly;
+  their types and values are the same.
+- README: one recording of 1.6.0 replaces the three earlier ones (the
+  compact view, the tour and the 1.5.5 comparison); the install methods
+  and the features of every version are listed.
+
+### Packaging
+- `build.rs` writes the man page and the shell completions to Cargo's
+  `OUT_DIR` (`assets/man`, `assets/completions`), no longer into the source
+  tree: `cargo install` from a read-only source works. A packager that wants
+  them at a fixed path sets `SPING_ASSETS_DIR` to an absolute directory (the
+  release builds and the Arch recipes use `$PWD/target/assets`).
+- The macOS release binary is always signed and notarized: a release build
+  without the signing setup fails instead of shipping it unsigned.
+- nixpkgs package validation: a workflow builds the nixpkgs recipe from each
+  release tag. sping is not in nixpkgs until that recipe is merged there.
+- Homebrew: `brew install LambdaBytes/tap/sping` builds the release from
+  source and installs the man page and the shell completions too. A
+  published release goes to the tap and to crates.io on its own.
+
+### Fixes
+- The interface of a loopback target: `if lo · 127.0.0.1/8` (`lo0` on macOS,
+  the loopback adapter on Windows) instead of the default route's interface
+  with `/0` — on Windows its address (`if 192.168.6.233 · 127.0.0.1/0`).
+  JSON `net_ctx` gets the same `interface` and `prefix_len`.
+- Without a source address no interface is looked up: JSON `net_ctx` has
+  `"interface": "unknown"` and `"prefix_len": 0`, as documented, instead of
+  the interface of whatever route covered `0.0.0.0` — with a VPN's
+  `0.0.0.0/1` that also put the target in its subnet (`"SameLan"`). For the
+  same reason a VPN's `0.0.0.0/1` no longer puts `127.0.0.1` in `"SameLan"`.
+- macOS: the gateway and the interfaces were missing when sping ran with a
+  `PATH` without `/sbin` (cron runs its jobs with `/usr/bin:/bin`): `route`
+  and `ifconfig` now run from `/sbin`.
+
 ## v1.5.5
 
 ### Fixes

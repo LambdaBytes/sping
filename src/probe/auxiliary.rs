@@ -79,6 +79,8 @@ pub async fn run(
             ttl: None,
             interface: None,
             source: None,
+            // The auxiliary probes stay ICMP, whatever the main probe.
+            tcp_port: None,
         };
 
         let backend = Arc::clone(&backend);

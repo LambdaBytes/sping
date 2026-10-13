@@ -38,6 +38,17 @@ pub fn interface_for_ip(local_ip: IpAddr, scope_id: u32) -> Option<InterfaceInfo
         return pick_in_zone(ipv6_entries(), local_ip, scope_id);
     };
 
+    // Linux keeps 127.0.0.0/8 in its local routing table, which
+    // /proc/net/route does not show; it is on the kernel's loopback device.
+    #[cfg(target_os = "linux")]
+    if _v4.is_loopback() {
+        return Some(InterfaceInfo {
+            name: "lo".into(),
+            ip: local_ip,
+            prefix_len: 8,
+        });
+    }
+
     // Routing table is empty off Linux, so this loop is a no-op there.
     let routes = read_routes();
     for r in &routes {
@@ -54,8 +65,11 @@ pub fn interface_for_ip(local_ip: IpAddr, scope_id: u32) -> Option<InterfaceInfo
         }
     }
 
-    // Fallback: use default gateway for interface name, platform tool for prefix
-    if let Some((_, iface_name)) = route::default_gateway() {
+    // Fallback: use default gateway for interface name, platform tool for
+    // prefix. A loopback address is never on the default route's interface.
+    if !_v4.is_loopback()
+        && let Some((_, iface_name)) = route::default_gateway()
+    {
         #[cfg(target_os = "macos")]
         if let Some(info) = interface_from_ifconfig(local_ip) {
             return Some(info);
@@ -114,12 +128,12 @@ pub fn list_interfaces() -> Vec<InterfaceInfo> {
         }
     }
 
-    // IPv4 only, like the Linux listing above.
+    // IPv4 only and no loopback, like the Linux listing above.
     #[cfg(target_os = "macos")]
     {
         list_interfaces_ifconfig()
             .into_iter()
-            .filter(|i| i.ip.is_ipv4())
+            .filter(|i| i.ip.is_ipv4() && !i.ip.is_loopback())
             .collect()
     }
     #[cfg(target_os = "windows")]
@@ -127,7 +141,7 @@ pub fn list_interfaces() -> Vec<InterfaceInfo> {
         windows_entries(true)
             .into_iter()
             .map(|(_, info)| info)
-            .filter(|i| i.ip.is_ipv4())
+            .filter(|i| i.ip.is_ipv4() && !i.ip.is_loopback())
             .collect()
     }
     #[cfg(target_os = "linux")]
@@ -233,7 +247,9 @@ fn interface_index(name: &str) -> u32 {
 
 #[cfg(target_os = "macos")]
 fn list_interfaces_ifconfig() -> Vec<InterfaceInfo> {
-    let output = std::process::Command::new("ifconfig").output().ok();
+    // By absolute path, like route (`route::default_gateway_macos`): cron's
+    // PATH, /usr/bin:/bin, does not reach /sbin.
+    let output = std::process::Command::new("/sbin/ifconfig").output().ok();
     let Some(output) = output else {
         return Vec::new();
     };
@@ -259,9 +275,6 @@ fn parse_ifconfig(text: &str) -> Vec<InterfaceInfo> {
             if parts.len() >= 4
                 && let Ok(ip) = parts[1].parse::<Ipv4Addr>()
             {
-                if ip.is_loopback() {
-                    continue;
-                }
                 let prefix = if parts[2] == "netmask" {
                     parse_hex_netmask(parts[3])
                 } else {
@@ -512,6 +525,21 @@ garbage line
         assert!(pick_in_zone(known_only, ip, 9).is_none());
     }
 
+    /// A 127.0.0.1 source is on the loopback interface with its /8, never
+    /// on the default route's interface (which Windows named by its
+    /// address). Exact on Linux; on macOS and Windows it comes from the
+    /// system's list, which holds the loopback interface on every host.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn loopback_source_is_on_the_loopback_interface() {
+        let info =
+            interface_for_ip("127.0.0.1".parse().unwrap(), 0).expect("no interface for 127.0.0.1");
+        #[cfg(target_os = "linux")]
+        assert_eq!(info.name, "lo");
+        assert!(info.name.parse::<IpAddr>().is_err(), "{info:?}");
+        assert_eq!(info.prefix_len, 8, "{info:?}");
+    }
+
     #[test]
     fn ifconfig_gives_both_families() {
         let text = "\
@@ -532,11 +560,9 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
         let e = entry(&list, "fe80::1c2b:3d4e:5f60:7182");
         assert_eq!((e.name.as_str(), e.prefix_len), ("en0", 64));
         assert_eq!(entry(&list, "::1").name, "lo0");
-        assert!(
-            !list
-                .iter()
-                .any(|i| i.ip == "127.0.0.1".parse::<IpAddr>().unwrap())
-        );
+        // Loopback too: a 127.0.0.1 source is looked up here.
+        let e = entry(&list, "127.0.0.1");
+        assert_eq!((e.name.as_str(), e.prefix_len), ("lo0", 8));
     }
 
     #[test]

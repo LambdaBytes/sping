@@ -2,7 +2,7 @@
 # VCS package: builds the latest master. Install as `sping-git`.
 pkgname=sping-git
 _pkgname=sping
-pkgver=1.5.5
+pkgver=1.6.0
 pkgrel=1
 pkgdesc="Terminal-native real-time connectivity monitor with network context diagnostics (git)"
 arch=('x86_64' 'aarch64' 'armv7h')
@@ -37,6 +37,9 @@ build() {
   cd "$_pkgname"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
+  # build.rs renders the man page and shell completions here (OUT_DIR
+  # otherwise).
+  export SPING_ASSETS_DIR="$PWD/target/assets"
   cargo build --frozen --release
 }
 

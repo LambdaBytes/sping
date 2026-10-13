@@ -21,7 +21,7 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Read the version
         id: version
@@ -79,6 +79,12 @@ jobs:
             cargoHash = lib.fakeHash;
 
             nativeBuildInputs = [ installShellFiles ];
+
+            # build.rs writes the man page and completions here (OUT_DIR
+            # otherwise).
+            preBuild = ''
+              export SPING_ASSETS_DIR="\$PWD/target/assets"
+            '';
 
             postInstall = ''
               installManPage target/assets/man/sping.1

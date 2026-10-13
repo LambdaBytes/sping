@@ -30,9 +30,13 @@ pub struct Args {
     #[arg(short = 'W', long, default_value = "2")]
     pub timeout: f64,
 
-    /// ICMP payload size in bytes
-    #[arg(short = 's', long = "size", default_value = "56")]
-    pub payload_size: usize,
+    /// ICMP payload size in bytes (default 56)
+    #[arg(short = 's', long = "size")]
+    pub payload_size: Option<usize>,
+
+    /// Probe with a TCP connect to PORT instead of ICMP: works without ICMP permission and through ICMP filters
+    #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..), conflicts_with = "payload_size")]
+    pub tcp: Option<u16>,
 
     /// IP TTL / IPv6 hop limit for outgoing probes
     #[arg(short = 't', long)]

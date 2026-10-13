@@ -3,7 +3,7 @@
 
 use std::io::{self, Write};
 
-use crate::probe::types::ProbeSnapshot;
+use crate::probe::types::{ProbeSnapshot, TcpState};
 use crate::render::format::fmt_rtt;
 
 /// Classic view state; deduplicates on `seq` so each probe prints once.
@@ -25,6 +25,21 @@ impl ClassicView {
         self.last_seq = snap.seq;
 
         match snap.rtt_last {
+            // TCP: which endpoint answered, and how.
+            Some(rtt) if snap.port.is_some() => {
+                let endpoint = std::net::SocketAddr::new(snap.target_ip, snap.port.unwrap_or(0));
+                let verb = if snap.tcp_state == Some(TcpState::Refused) {
+                    "Refused by"
+                } else {
+                    "Connected to"
+                };
+                writeln!(
+                    w,
+                    "{verb} {endpoint}: seq={} time={}",
+                    snap.seq,
+                    fmt_rtt(rtt)
+                )?;
+            }
             Some(rtt) => match snap.ttl {
                 Some(ttl) if ttl > 0 => {
                     writeln!(
@@ -61,12 +76,25 @@ impl ClassicView {
     /// replies were received.
     pub fn summary(&self, w: &mut impl Write, snap: &ProbeSnapshot) -> io::Result<()> {
         writeln!(w)?;
-        writeln!(w, "--- {} ping statistics ---", snap.target_host,)?;
-        writeln!(
-            w,
-            "{} packets transmitted, {} received, {:.1}% packet loss",
-            snap.sent, snap.received, snap.loss_pct,
-        )?;
+        if let Some(port) = snap.port {
+            // TCP counts connects and their answers, not packets.
+            writeln!(w, "--- {} tcp/{port} statistics ---", snap.target_host)?;
+            writeln!(
+                w,
+                "{} connects, {} answered ({} refused), {:.1}% loss",
+                snap.sent,
+                snap.received,
+                snap.refused.unwrap_or(0),
+                snap.loss_pct,
+            )?;
+        } else {
+            writeln!(w, "--- {} ping statistics ---", snap.target_host,)?;
+            writeln!(
+                w,
+                "{} packets transmitted, {} received, {:.1}% packet loss",
+                snap.sent, snap.received, snap.loss_pct,
+            )?;
+        }
         if let (Some(min), Some(avg), Some(max)) = (snap.rtt_min, snap.rtt_avg, snap.rtt_max) {
             writeln!(
                 w,

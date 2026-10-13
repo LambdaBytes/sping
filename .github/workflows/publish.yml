@@ -1,0 +1,213 @@
+name: Publish
+
+# After the owner publishes a release — the draft that release.yml made,
+# tried on real machines first — the crate goes to crates.io and the formula
+# to the Homebrew tap, both from that release's tag. Each destination is
+# switched on by its owner setting and is safe to run again: a version that
+# is already there is left alone, and the tap never goes back to an older
+# version.
+#
+#   crates.io  repository variable CRATES_IO_TRUSTED_PUBLISHING=true, once
+#              crates.io trusts this repository's publish.yml
+#   Homebrew   secret HOMEBREW_TAP_TOKEN: write access to <owner>/homebrew-tap
+
+on:
+  release:
+    types: [published]
+  # Runs the publication of a published release again, with the workflow on
+  # main: after what made it fail is fixed (a setting, a secret, an outage).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Published release tag (vX.Y.Z)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ inputs.tag || github.event.release.tag_name }}
+
+# One publication at a time: a release run again cannot overtake a newer one.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      crates: ${{ steps.destinations.outputs.crates }}
+      tap: ${{ steps.tap.outputs.action }}
+      tap-sha: ${{ steps.tap.outputs.sha }}
+    steps:
+      # A final version, published (not a draft, not a pre-release).
+      - name: The release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::$TAG is not a final version tag (vX.Y.Z)."
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          state="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease --jq '"\(.isDraft) \(.isPrerelease)"')"
+          if [ "$state" != "false false" ]; then
+            echo "::error::$TAG is a draft or a pre-release (isDraft isPrerelease: $state)."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Destinations
+        id: destinations
+        env:
+          CRATES: ${{ vars.CRATES_IO_TRUSTED_PUBLISHING }}
+          # Whether the token is set, not the token.
+          HAS_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          crates=false tap=false
+          [ "$CRATES" = true ] && crates=true
+          [ "$HAS_TAP_TOKEN" = true ] && tap=true
+          echo "crates=$crates" >> "$GITHUB_OUTPUT"
+          echo "tap=$tap" >> "$GITHUB_OUTPUT"
+          {
+            echo "### $TAG"
+            echo "- crates.io: $([ "$crates" = true ] && echo enabled || echo 'not enabled (CRATES_IO_TRUSTED_PUBLISHING)')"
+            echo "- Homebrew tap: $([ "$tap" = true ] && echo enabled || echo 'not enabled (HOMEBREW_TAP_TOKEN)')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The tap moves forward only: the same version is done, a newer one
+      # stays (a publication of an older release run again). `write` when the
+      # formula is to be written, with the blob read here: the write is
+      # refused if the tap changed in between.
+      - name: The tap's version
+        id: tap
+        if: steps.destinations.outputs.tap == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAP: ${{ github.repository_owner }}/homebrew-tap
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          current="" sha=""
+          if gh api "repos/$TAP/contents/Formula/sping.rb" > formula.json 2> api.err; then
+            sha="$(jq -r .sha formula.json)"
+            current="$(jq -r .content formula.json | base64 --decode | sed -nE 's|^  url ".*/v([0-9]+\.[0-9]+\.[0-9]+)\.tar\.gz"$|\1|p')"
+          elif ! grep -q 'HTTP 404' api.err; then
+            cat api.err
+            exit 1
+          fi
+          action="write"
+          if [ "$current" = "$VERSION" ]; then
+            action="done"
+            echo "- Homebrew tap: sping $VERSION was already there" >> "$GITHUB_STEP_SUMMARY"
+          elif [ -n "$current" ] && [ "$(printf '%s\n' "$current" "$VERSION" | sort -V | tail -n 1)" != "$VERSION" ]; then
+            action="done"
+            echo "- Homebrew tap: holds sping $current, newer than $VERSION: left alone" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "action=$action" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  crates-io:
+    needs: check
+    if: needs.check.outputs.crates == 'true'
+    runs-on: ubuntu-latest
+    # The OIDC token is exchanged for a crates.io token that lasts this job.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: The crate is the tag's version
+        run: |
+          set -euo pipefail
+          crate="$(sed -nE 's/^version = "(.*)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ "$crate" != "${{ needs.check.outputs.version }}" ]; then
+            echo "::error::Cargo.toml says $crate, the tag $TAG."
+            exit 1
+          fi
+
+      - name: Already on crates.io?
+        id: crates
+        run: |
+          set -euo pipefail
+          code="$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "User-Agent: sping-publish (https://github.com/$GITHUB_REPOSITORY)" \
+            "https://crates.io/api/v1/crates/sping/${{ needs.check.outputs.version }}")"
+          case "$code" in
+            200) echo "published=true" >> "$GITHUB_OUTPUT"
+                 echo "- crates.io: sping ${{ needs.check.outputs.version }} was already there" >> "$GITHUB_STEP_SUMMARY" ;;
+            404) echo "published=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::crates.io answered $code"; exit 1 ;;
+          esac
+
+      - name: Authenticate (trusted publishing)
+        id: auth
+        if: steps.crates.outputs.published == 'false'
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish
+        if: steps.crates.outputs.published == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          cargo publish --locked
+          echo "- crates.io: sping ${{ needs.check.outputs.version }} published" >> "$GITHUB_STEP_SUMMARY"
+
+  homebrew:
+    needs: check
+    if: needs.check.outputs.tap == 'write'
+    runs-on: macos-latest
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      TAP: ${{ github.repository_owner }}/homebrew-tap
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+
+      - name: Render the formula
+        run: |
+          set -euo pipefail
+          sha="$(curl -fsSL "https://github.com/$GITHUB_REPOSITORY/archive/refs/tags/$TAG.tar.gz" | shasum -a 256 | cut -d ' ' -f 1)"
+          sed -e "s|@REPOSITORY@|$GITHUB_REPOSITORY|g" -e "s|@VERSION@|$VERSION|g" -e "s|@SHA256@|$sha|g" \
+            packaging/homebrew/sping.rb > sping.rb
+          if grep -q '@[A-Z0-9]*@' sping.rb; then
+            echo "::error::A placeholder is left in the formula."
+            exit 1
+          fi
+
+      # Built from source and tested from a local tap before the real tap
+      # gets it.
+      - name: Build and test the formula
+        run: |
+          set -euo pipefail
+          brew tap-new --no-git local/sping-check
+          cp sping.rb "$(brew --repository local/sping-check)/Formula/sping.rb"
+          brew install --build-from-source local/sping-check/sping
+          brew test local/sping-check/sping
+
+      # The token reaches this step alone. The commit is its owner's. The
+      # blob is the one the version check read (none: the file did not
+      # exist); if the tap changed since, GitHub refuses the write.
+      - name: Write it to the tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          BLOB: ${{ needs.check.outputs.tap-sha }}
+        run: |
+          set -euo pipefail
+          args=(-X PUT "repos/$TAP/contents/Formula/sping.rb" -f "message=sping $VERSION" -f "content=$(base64 < sping.rb | tr -d '\n')")
+          [ -z "$BLOB" ] || args+=(-f "sha=$BLOB")
+          gh api "${args[@]}" --jq .commit.sha
+          echo "- Homebrew tap: sping $VERSION written" >> "$GITHUB_STEP_SUMMARY"

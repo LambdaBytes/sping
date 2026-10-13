@@ -1,6 +1,6 @@
 [package]
 name = "sping"
-version = "1.5.5"
+version = "1.6.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Antonio Cotos <acf981@protonmail.com>"]
@@ -25,9 +25,10 @@ thiserror = "2"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# "all" for SO_BINDTODEVICE (`-I`) on the TCP probe's sockets.
+socket2 = { version = "0.5", features = ["all"] }
 
 [target.'cfg(unix)'.dependencies]
-socket2 = "0.5"
 libc = "0.2"
 
 [build-dependencies]

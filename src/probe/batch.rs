@@ -12,7 +12,7 @@ use crate::diagnostics::health::HealthTracker;
 use crate::diagnostics::outage::OutageTracker;
 use crate::diagnostics::spikes::SpikeDetector;
 use crate::probe::quality::QualityScorer;
-use crate::probe::scheduler::create_backend;
+use crate::probe::scheduler::{create_backend, record_result};
 use crate::probe::stats::ProbeStats;
 use crate::probe::types::{ProbeOptions, ProbeResult, ProbeSnapshot};
 
@@ -31,8 +31,14 @@ pub async fn probe_target(
     let backend = match create_backend(&opts) {
         Ok(b) => Arc::new(b),
         Err(e) => {
-            eprintln!("  {target_host}: failed to create ICMP socket: {e}");
-            return ProbeSnapshot::empty(target_host, target_ip, dns_time, net_ctx);
+            let what = if opts.tcp_port.is_some() {
+                "cannot prepare the TCP probe"
+            } else {
+                "failed to create ICMP socket"
+            };
+            eprintln!("  {target_host}: {what}: {e}");
+            return ProbeSnapshot::empty(target_host, target_ip, dns_time, net_ctx)
+                .with_tcp(opts.tcp_port);
         }
     };
 
@@ -43,6 +49,8 @@ pub async fn probe_target(
     let mut health = HealthTracker::new(3, 2);
     let mut last_ttl: Option<u8> = None;
     let mut last_error: Option<String> = None;
+    let mut last_tcp_state = None;
+    let mut refused: u64 = 0;
 
     // Fixed cadence, same policy as the scheduler.
     let mut ticker = tokio::time::interval(interval);
@@ -60,29 +68,18 @@ pub async fn probe_target(
                 message: "probe task panicked".into(),
             });
 
-        match &result {
-            ProbeResult::Reply { rtt, ttl, .. } => {
-                stats.record_reply(*rtt);
-                quality.record_reply(*rtt);
-                spikes.record(*rtt);
-                outage.record_reply();
-                health.record_success();
-                last_ttl = Some(*ttl);
-            }
-            ProbeResult::Timeout { .. } => {
-                stats.record_timeout();
-                quality.record_loss();
-                outage.record_failure();
-                health.record_failure();
-                last_ttl = None;
-            }
-            ProbeResult::Error { .. } => {
-                stats.record_error();
-                quality.record_loss();
-                outage.record_failure();
-                health.record_failure();
-                last_ttl = None;
-            }
+        let recorded = record_result(
+            &result,
+            &mut stats,
+            &mut quality,
+            &mut spikes,
+            &mut outage,
+            &mut health,
+        );
+        last_ttl = recorded.ttl;
+        last_tcp_state = recorded.tcp_state;
+        if matches!(result, ProbeResult::Refused { .. }) {
+            refused += 1;
         }
         last_error = match result {
             ProbeResult::Error { message, .. } => Some(message),
@@ -92,7 +89,7 @@ pub async fn probe_target(
 
     let recovery_duration = outage.take_recovery();
 
-    ProbeSnapshot {
+    let snapshot = ProbeSnapshot {
         target_host,
         target_ip,
         dns_time,
@@ -119,6 +116,17 @@ pub async fn probe_target(
         net_ctx,
         reachability: health.state(),
         recent_loss_pct: quality.window_loss_pct(),
+        high_jitter: quality.high_jitter(),
         last_error,
+        probe: None,
+        port: None,
+        refused: None,
+        tcp_state: None,
+    }
+    .with_tcp(opts.tcp_port);
+    ProbeSnapshot {
+        refused: snapshot.refused.map(|_| refused),
+        tcp_state: snapshot.port.and(last_tcp_state),
+        ..snapshot
     }
 }

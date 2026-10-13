@@ -49,10 +49,13 @@ jobs:
         include:
           - { name: linux-x86_64,   os: ubuntu-latest,   target: x86_64-unknown-linux-gnu,      deb: true, container: 'rust:1.92-bookworm' }
           - { name: linux-aarch64,  os: ubuntu-latest,   target: aarch64-unknown-linux-gnu,     deb: true, container: 'rust:1.92-bookworm', linker: gcc-aarch64-linux-gnu }
+          # Static (musl): any Linux, whatever its glibc.
+          - { name: linux-x86_64-musl,  os: ubuntu-latest, target: x86_64-unknown-linux-musl,  musl: true, container: 'rust:1.92-bookworm' }
+          - { name: linux-aarch64-musl, os: ubuntu-latest, target: aarch64-unknown-linux-musl, musl: true, container: 'rust:1.92-bookworm' }
           - { name: macos-arm64,    os: macos-latest,    target: aarch64-apple-darwin }
           - { name: windows-x86_64, os: windows-latest,  target: x86_64-pc-windows-msvc }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # The same Rust as the Linux image.
       - uses: dtolnay/rust-toolchain@1.92.0
         if: ${{ !matrix.container }}
@@ -71,12 +74,22 @@ jobs:
           apt-get install -y ${{ matrix.linker }}
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
 
+      # The man page and completions where Cargo.toml's .deb assets are
+      # (build.rs writes them to OUT_DIR otherwise).
+      - name: Set the assets directory
+        if: matrix.deb
+        run: echo "SPING_ASSETS_DIR=$PWD/target/assets" >> "$GITHUB_ENV"
+
       - name: Build
+        # aarch64 musl links with rust-lld and the target's own musl: no C
+        # cross toolchain (no dependency compiles C). Other targets ignore it.
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       # No release with Linux binaries that need a newer glibc than 2.34.
       - name: Check the glibc requirement
-        if: matrix.container
+        if: matrix.container && !matrix.musl
         shell: bash
         run: |
           set -euo pipefail
@@ -88,9 +101,24 @@ jobs:
             exit 1
           fi
 
+      # A musl binary must be static: no interpreter, no shared library.
+      - name: Check the static binary
+        if: matrix.musl
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/sping"
+          headers="$(readelf -lW "$bin")"
+          dynamic="$(readelf -dW "$bin")"
+          if grep -q 'INTERP' <<< "$headers" || grep -q '(NEEDED)' <<< "$dynamic"; then
+            echo "::error::$bin is not static"
+            exit 1
+          fi
+          echo "$bin is static"
+
       # macOS: sign with the Developer ID certificate and have Apple notarize
-      # the binary, when the five signing secrets are set. With none of them
-      # the binary ships unsigned, as it always did. The secrets reach this
+      # the binary. A release is never built without them: the README says
+      # the macOS binary is signed and notarized. The secrets reach this
       # step alone, and what they are written to lives in a private directory
       # that is removed when the step ends, however it ends.
       - name: Sign and notarize (macOS)
@@ -111,8 +139,8 @@ jobs:
             [ -n "${!name}" ] || missing=$((missing + 1))
           done
           if [ "$missing" -eq 5 ]; then
-            echo "::warning::macOS signing secrets are not set: the binary is published unsigned."
-            exit 0
+            echo "::error::The macOS signing secrets are not set: a release is not built unsigned."
+            exit 1
           fi
           if [ "$missing" -ne 0 ]; then
             echo "::error::Only some of the five macOS signing secrets are set; set all of them or none."
@@ -196,7 +224,7 @@ jobs:
           codesign --verify --strict --verbose=2 "$staged"
           codesign --display --verbose=2 "$staged" 2>&1 | grep -E '^(Authority|TeamIdentifier|Timestamp)='
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.name }}
           path: dist/*
@@ -223,7 +251,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -275,7 +303,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
@@ -314,14 +342,14 @@ jobs:
       # workflow run produced it. Verify a download with
       #   gh attestation verify <file> --repo <owner>/<repo>
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v3
         with:
           subject-path: dist/*
 
       # A draft: published by hand once its files have been tried. A manual
       # run reuses the tag's draft and replaces its files.
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.TAG }}
           draft: true

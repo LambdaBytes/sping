@@ -2,7 +2,12 @@
 //! required for raw-mode output.
 
 use std::io::IsTerminal;
+use std::net::IpAddr;
 use std::time::Duration;
+
+use crate::context::NetworkContext;
+use crate::diagnostics::correlator::Finding;
+use crate::probe::types::{ProbeSnapshot, TcpState};
 
 /// Format a `Duration` as ms ("23.4 ms"), switching to seconds at or above
 /// 1000 ms. Precision decreases with magnitude (2, 1, then 0 decimals).
@@ -48,6 +53,62 @@ pub fn fmt_elapsed(d: Duration) -> String {
         format!("{h:02}:{m:02}:{s:02}")
     } else {
         format!("{m:02}:{s:02}")
+    }
+}
+
+/// Where probes leave from: `if eth0 · 192.168.1.100/24`, or `no IPv6
+/// source` (`no IPv4 source`) when the system has no source address for the
+/// target's family — the context then holds `0.0.0.0` and no interface.
+pub fn fmt_source(ctx: &NetworkContext, target: IpAddr, sep: &str) -> String {
+    if ctx.local_ip.is_unspecified() {
+        let family = if target.is_ipv6() { "IPv6" } else { "IPv4" };
+        return format!("no {family} source");
+    }
+    format!(
+        "if {}{sep}{}/{}",
+        ctx.interface, ctx.local_ip, ctx.prefix_len
+    )
+}
+
+/// How the last TCP connect ended, for a person: `TCP 443 connected · 21 ms`,
+/// `TCP 443 timeout · no answer`. `None` for ICMP, before the first connect,
+/// for a refusal, which the diagnosis reports (`Finding::TcpRefused`), and
+/// for a local error, which the probe error itself explains.
+pub fn tcp_outcome(snap: &ProbeSnapshot, sep: &str) -> Option<String> {
+    let port = snap.port?;
+    match snap.tcp_state? {
+        TcpState::Open => Some(format!(
+            "TCP {port} connected{sep}{}",
+            fmt_rtt_opt(snap.rtt_last)
+        )),
+        TcpState::Timeout => Some(format!("TCP {port} timeout{sep}no answer")),
+        TcpState::Refused | TcpState::Error => None,
+    }
+}
+
+/// A finding as the Events line says it.
+pub fn describe(finding: &Finding, sep: &str) -> String {
+    match finding {
+        // A reset or an ICMP unreachable can come from a device on the way,
+        // so the host is not named.
+        Finding::TcpRefused { port } => {
+            format!("TCP {port} refused{sep}host or firewall answered")
+        }
+        Finding::Recovered { duration } => format!("recovered after {}", fmt_elapsed(*duration)),
+        Finding::Outage { duration } => format!("outage {}", fmt_elapsed(*duration)),
+        Finding::GatewayUnreachable => {
+            format!("gateway unreachable{sep}local network issue likely")
+        }
+        Finding::UpstreamOutage => format!("upstream outage likely{sep}local gateway OK"),
+        Finding::WanUnreachable => format!("WAN unreachable{sep}gateway state unknown"),
+        Finding::TargetUnreachable { wan_online: true } => {
+            format!("target unreachable{sep}internet still OK")
+        }
+        Finding::TargetUnreachable { wan_online: false } => "target unreachable".into(),
+        Finding::LatencySpike { rtt } => format!("last spike {}{sep}spike guard on", fmt_rtt(*rtt)),
+        Finding::HighJitter => format!("high jitter with no loss{sep}unstable path"),
+        Finding::IntermittentLoss { .. } => "intermittent loss".into(),
+        Finding::WanDegraded => format!("WAN degraded{sep}gateway OK"),
     }
 }
 
@@ -221,6 +282,96 @@ fn escape_len(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_is_the_interface_or_its_absence() {
+        use crate::context::classify::TargetClass;
+        let mut ctx = NetworkContext {
+            interface: "eth0".into(),
+            local_ip: "192.168.1.100".parse().unwrap(),
+            prefix_len: 24,
+            gateway: None,
+            target_class: TargetClass::PublicNetwork,
+        };
+        let v4: IpAddr = "192.0.2.10".parse().unwrap();
+        let v6: IpAddr = "2001:db8::10".parse().unwrap();
+        assert_eq!(fmt_source(&ctx, v4, " · "), "if eth0 · 192.168.1.100/24");
+        assert_eq!(fmt_source(&ctx, v4, " | "), "if eth0 | 192.168.1.100/24");
+
+        ctx.local_ip = "0.0.0.0".parse().unwrap();
+        ctx.interface = "unknown".into();
+        assert_eq!(fmt_source(&ctx, v6, " · "), "no IPv6 source");
+        assert_eq!(fmt_source(&ctx, v4, " · "), "no IPv4 source");
+    }
+
+    /// Each finding as the Events line has always said it; the separator is
+    /// the charset's.
+    #[test]
+    fn findings_are_described_as_before() {
+        use std::time::Duration;
+        let cases = [
+            (
+                Finding::TcpRefused { port: 443 },
+                "TCP 443 refused · host or firewall answered",
+            ),
+            (
+                Finding::Recovered {
+                    duration: Duration::from_secs(92),
+                },
+                "recovered after 01:32",
+            ),
+            (
+                Finding::Outage {
+                    duration: Duration::from_secs(12),
+                },
+                "outage 00:12",
+            ),
+            (
+                Finding::GatewayUnreachable,
+                "gateway unreachable · local network issue likely",
+            ),
+            (
+                Finding::UpstreamOutage,
+                "upstream outage likely · local gateway OK",
+            ),
+            (
+                Finding::WanUnreachable,
+                "WAN unreachable · gateway state unknown",
+            ),
+            (
+                Finding::TargetUnreachable { wan_online: true },
+                "target unreachable · internet still OK",
+            ),
+            (
+                Finding::TargetUnreachable { wan_online: false },
+                "target unreachable",
+            ),
+            (
+                Finding::LatencySpike {
+                    rtt: Duration::from_millis(120),
+                },
+                "last spike 120 ms · spike guard on",
+            ),
+            (
+                Finding::HighJitter,
+                "high jitter with no loss · unstable path",
+            ),
+            (
+                Finding::IntermittentLoss {
+                    recent_loss_pct: 10.0,
+                },
+                "intermittent loss",
+            ),
+            (Finding::WanDegraded, "WAN degraded · gateway OK"),
+        ];
+        for (finding, text) in cases {
+            assert_eq!(describe(&finding, " · "), text);
+        }
+        assert_eq!(
+            describe(&Finding::WanDegraded, " | "),
+            "WAN degraded | gateway OK"
+        );
+    }
 
     #[test]
     fn test_fmt_rtt() {

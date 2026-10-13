@@ -306,6 +306,68 @@ fn test_classic_view_localhost() {
     );
 }
 
+/// The `Init:` line (printed before the socket is opened, so whether ICMP is
+/// allowed does not matter) calls 127.0.0.1 loopback and, on Linux, puts its
+/// source on `lo` with the /8, not on the default route's interface.
+/// `--ascii`: the separator is ` | ` whatever the locale (CI runs without a
+/// UTF-8 one).
+#[test]
+fn test_init_line_loopback() {
+    let output = sping_timed(5)
+        .args([
+            "127.0.0.1",
+            "--view",
+            "classic",
+            "-c",
+            "1",
+            "-W",
+            "1",
+            "--ascii",
+        ])
+        .output()
+        .expect("failed to run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let init = stderr
+        .lines()
+        .find(|l| l.starts_with("Init:"))
+        .unwrap_or_else(|| panic!("no Init line: {stderr}"));
+    assert!(init.ends_with("target 127.0.0.1 | loopback"), "{init}");
+    #[cfg(target_os = "linux")]
+    assert!(init.starts_with("Init: if lo | 127.0.0.1/8 | "), "{init}");
+}
+
+/// macOS runs `route` and `ifconfig` from /sbin by absolute path: under
+/// cron's PATH (/usr/bin:/bin, no /sbin) the loopback `Init:` line, with its
+/// interface, prefix and gateway, is the one a PATH with /sbin gives.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_init_line_without_sbin_in_path() {
+    let init_line = |path: &str| {
+        let mut run = sping_timed(5).args([
+            "127.0.0.1",
+            "--view",
+            "classic",
+            "-c",
+            "1",
+            "-W",
+            "1",
+            "--ascii",
+        ]);
+        run.cmd.env("PATH", path);
+        let output = run.output().expect("failed to run");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        stderr
+            .lines()
+            .find(|l| l.starts_with("Init:"))
+            .unwrap_or_else(|| panic!("no Init line: {stderr}"))
+            .to_string()
+    };
+    assert_eq!(
+        init_line("/usr/bin:/bin"),
+        init_line("/usr/bin:/bin:/usr/sbin:/sbin")
+    );
+}
+
 // === Ping parity ===
 
 #[test]
@@ -421,4 +483,337 @@ fn test_multi_target_dedup() {
         !stderr.contains("panic"),
         "Multi-target with dupes should not panic"
     );
+}
+
+// === TCP connect (`--tcp`): needs no ICMP permission, so nothing is skipped ===
+
+/// A local listener and its port, as text for the command line.
+fn tcp_listener() -> (std::net::TcpListener, String) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port().to_string();
+    (listener, port)
+}
+
+/// A port nobody listens on: bound, then released.
+fn tcp_closed_port() -> String {
+    tcp_listener().1
+}
+
+/// A batch file under Cargo's scratch directory for integration tests.
+fn batch_file(name: &str, hosts: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    std::fs::write(&path, hosts).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// A target that never answers on `port`: 127.0.0.2 (local on Linux) with a
+/// listener whose queue is full, so the kernel drops every new SYN. Keep
+/// both values alive while probing.
+#[cfg(target_os = "linux")]
+fn tcp_silent_target(port: &str) -> (socket2::Socket, std::net::TcpStream) {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let addr: std::net::SocketAddr = format!("127.0.0.2:{port}").parse().unwrap();
+    let listener = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    listener.bind(&SockAddr::from(addr)).unwrap();
+    listener.listen(0).unwrap();
+    // A backlog of 0 holds one pending connection: this one.
+    let queued = std::net::TcpStream::connect(addr).unwrap();
+    (listener, queued)
+}
+
+#[test]
+fn test_tcp_open_port_classic() {
+    let (_listener, port) = tcp_listener();
+    let output = sping_timed(15)
+        .args([
+            "127.0.0.1",
+            "--tcp",
+            &port,
+            "-c",
+            "3",
+            "-i",
+            "200",
+            "--view",
+            "classic",
+        ])
+        .output()
+        .expect("failed to run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.timed_out, "did not stop after -c 3");
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&format!("target 127.0.0.1 tcp/{port}")),
+        "{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("Connected to 127.0.0.1:{port}: seq=1 ")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("--- 127.0.0.1 tcp/{port} statistics ---")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("3 connects, 3 answered (0 refused), 0.0% loss"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn test_tcp_refused_port_is_an_answer() {
+    let port = tcp_closed_port();
+    // -W 1: a refusal comes at once, also on Windows (no SYN retries).
+    let output = sping_timed(30)
+        .args([
+            "127.0.0.1",
+            "--tcp",
+            &port,
+            "-c",
+            "2",
+            "-i",
+            "200",
+            "-W",
+            "1",
+            "--view",
+            "classic",
+        ])
+        .output()
+        .expect("failed to run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.timed_out, "did not stop after -c 2");
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(
+        stdout.contains(&format!("Refused by 127.0.0.1:{port}: seq=1 ")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("2 connects, 2 answered (2 refused), 0.0% loss"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn test_tcp_json_fields() {
+    let (_listener, port) = tcp_listener();
+    let output = sping_timed(15)
+        .args([
+            "127.0.0.1",
+            "--tcp",
+            &port,
+            "-c",
+            "2",
+            "-i",
+            "200",
+            "--view",
+            "json",
+        ])
+        .output()
+        .expect("failed to run");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("invalid JSON '{l}': {e}")))
+        .collect();
+    assert_eq!(lines.len(), 2, "{stdout}");
+    for (i, val) in lines.iter().enumerate() {
+        assert_eq!(val["probe"], "tcp");
+        assert_eq!(val["port"], port.parse::<u64>().unwrap());
+        assert_eq!(val["tcp_state"], "open");
+        assert_eq!(val["refused"], 0);
+        assert_eq!(val["received"], i as u64 + 1);
+        assert!(val["ttl"].is_null(), "TCP has no TTL: {val}");
+    }
+}
+
+/// A refused port is in each JSON line's diagnosis, with its port; in the
+/// batch JSON too, which has no gateway or WAN probe to report.
+#[test]
+fn test_tcp_refusal_in_the_json_diagnosis() {
+    let port = tcp_closed_port();
+    let hosts = batch_file("diagnosis_batch.txt", "127.0.0.1\n");
+    for batch in [false, true] {
+        let common = [
+            "--tcp", &port, "-c", "2", "-i", "200", "-W", "1", "--view", "json",
+        ];
+        let timed = sping_timed(30).args(common);
+        let timed = if batch {
+            timed.args(["--batch", &hosts])
+        } else {
+            timed.args(["127.0.0.1"])
+        };
+        let output = timed.output().expect("failed to run");
+        assert!(!output.timed_out, "did not stop after -c 2");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let lines: Vec<serde_json::Value> = stdout
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("invalid JSON '{l}': {e}")))
+            .collect();
+        assert_eq!(lines.len(), if batch { 1 } else { 2 }, "{stdout}");
+        for val in &lines {
+            assert_eq!(val["tcp_state"], "refused", "{val}");
+            let diagnosis = val["diagnosis"].as_array().expect("no diagnosis");
+            assert_eq!(
+                diagnosis[0],
+                serde_json::json!({"code": "tcp_refused", "port": port.parse::<u64>().unwrap()}),
+                "{val}"
+            );
+            if batch {
+                assert!(
+                    val.get("gateway").is_none() && val.get("wan").is_none(),
+                    "{val}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_tcp_port_and_size_rejected() {
+    for args in [
+        ["127.0.0.1", "--tcp", "0", "-c", "1"],
+        ["127.0.0.1", "--tcp", "65536", "-c", "1"],
+        ["127.0.0.1", "--tcp", "80", "-s", "56"],
+    ] {
+        let output = sping_cmd().args(args).output().expect("failed to run");
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+    }
+}
+
+#[test]
+fn test_tcp_unusable_source_is_an_error() {
+    let (_listener, port) = tcp_listener();
+    let output = sping_timed(15)
+        .args(["127.0.0.1", "-S", "192.0.2.7", "--tcp", &port, "-c", "1"])
+        .output()
+        .expect("failed to run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("cannot prepare the TCP probe"), "{stderr}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_tcp_multi_target_needs_every_answer() {
+    let (_listener, port) = tcp_listener();
+    let _silent = tcp_silent_target(&port);
+    let output = sping_timed(30)
+        .args([
+            "127.0.0.1",
+            "127.0.0.2",
+            "--tcp",
+            &port,
+            "-c",
+            "2",
+            "-i",
+            "200",
+            "-W",
+            "1",
+        ])
+        .output()
+        .expect("failed to run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.timed_out, "did not stop after -c 2");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "--- 127.0.0.1 (127.0.0.1) tcp/{port} statistics ---"
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("2 connects, 2 answered (0 refused), 0% loss"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("2 connects, 0 answered (0 refused), 100% loss"),
+        "{stdout}"
+    );
+}
+
+/// Two loopback targets: one listening, one refusing; both answer. 127.0.0.2
+/// is local on Linux only.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_tcp_multi_target_refused_counts() {
+    let (_listener, port) = tcp_listener();
+    let output = sping_timed(30)
+        .args([
+            "127.0.0.1",
+            "127.0.0.2",
+            "--tcp",
+            &port,
+            "-c",
+            "2",
+            "-i",
+            "200",
+        ])
+        .output()
+        .expect("failed to run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(
+        stdout.contains("2 connects, 2 answered (2 refused), 0% loss"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn test_tcp_batch_exit_codes() {
+    let (_listener, port) = tcp_listener();
+
+    let answered = batch_file("tcp-batch-answered.txt", "127.0.0.1\n");
+    let output = sping_timed(30)
+        .args(["--batch", &answered, "--tcp", &port, "-c", "2", "-i", "200"])
+        .output()
+        .expect("failed to run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(stdout.contains("2/2  0%"), "{stdout}");
+    assert!(stdout.contains(&format!("tcp/{port} open")), "{stdout}");
+
+    // A source address that cannot be used is a local error for the batch.
+    let output = sping_timed(30)
+        .args([
+            "--batch",
+            &answered,
+            "-S",
+            "192.0.2.7",
+            "--tcp",
+            &port,
+            "-c",
+            "1",
+        ])
+        .output()
+        .expect("failed to run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("cannot prepare the TCP probe"), "{stderr}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_tcp_batch_needs_every_answer() {
+    let (_listener, port) = tcp_listener();
+    let _silent = tcp_silent_target(&port);
+    let mixed = batch_file("tcp-batch-mixed.txt", "127.0.0.1\n127.0.0.2\n");
+    let output = sping_timed(30)
+        .args([
+            "--batch", &mixed, "--tcp", &port, "-c", "2", "-i", "200", "-W", "1", "--view", "json",
+        ])
+        .output()
+        .expect("failed to run");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    let lines: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("invalid JSON '{l}': {e}")))
+        .collect();
+    assert_eq!(lines.len(), 2, "{stdout}");
+    assert_eq!(lines[0]["tcp_state"], "open");
+    assert_eq!(lines[0]["received"], 2);
+    assert_eq!(lines[1]["tcp_state"], "timeout");
+    assert_eq!(lines[1]["received"], 0);
+    assert!(lines.iter().all(|l| l["probe"] == "tcp"), "{stdout}");
 }

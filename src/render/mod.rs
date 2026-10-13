@@ -9,3 +9,8 @@ pub mod view_compact;
 pub mod view_extended;
 pub mod view_json;
 pub mod view_table;
+
+#[cfg(test)]
+pub(crate) mod golden_icmp;
+#[cfg(test)]
+pub(crate) mod golden_tcp;

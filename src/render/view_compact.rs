@@ -13,7 +13,9 @@ use crate::probe::auxiliary::AuxiliaryState;
 use crate::probe::pulse::PulseScaler;
 use crate::probe::quality::Trend;
 use crate::probe::types::ProbeSnapshot;
-use crate::render::format::{fmt_elapsed, fmt_loss, fmt_rtt, fmt_rtt_opt};
+use crate::render::format::{
+    describe, fmt_elapsed, fmt_loss, fmt_rtt, fmt_rtt_opt, fmt_source, tcp_outcome,
+};
 use crate::render::icons;
 
 const VAL: Color = Color::DarkYellow;
@@ -44,7 +46,13 @@ pub fn draw_inline(
         host = snap.target_host,
         ip = snap.target_ip
     )?;
-    if let Some(ctx) = &snap.net_ctx {
+    if let Some(port) = snap.port {
+        write!(w, " tcp/{port}")?;
+    }
+    // No source address: no interface either (the Context line says so).
+    if let Some(ctx) = &snap.net_ctx
+        && !ctx.local_ip.is_unspecified()
+    {
         write!(w, " via {}", ctx.interface)?;
     }
     write!(w, "  ")?;
@@ -129,11 +137,7 @@ pub fn draw_inline(
     lines += 1;
 
     if let Some(ctx) = &snap.net_ctx {
-        write!(
-            w,
-            "Context    if {}{sep}{}/{}",
-            ctx.interface, ctx.local_ip, ctx.prefix_len
-        )?;
+        write!(w, "Context    {}", fmt_source(ctx, snap.target_ip, sep))?;
         let gw_ind = gw
             .map(|g| icons::reach_glyph(g.reachability).to_string())
             .unwrap_or_else(|| "?".into());
@@ -162,10 +166,10 @@ pub fn draw_inline(
             write!(w, ")")?;
         }
         let label = match q {
-            crate::probe::quality::QualityGrade::A => "stable",
-            crate::probe::quality::QualityGrade::B => "minor jitter",
-            crate::probe::quality::QualityGrade::C => "unstable",
-            crate::probe::quality::QualityGrade::D => "degraded",
+            crate::probe::quality::QualityGrade::A => "excellent",
+            crate::probe::quality::QualityGrade::B => "good",
+            crate::probe::quality::QualityGrade::C => "fair",
+            crate::probe::quality::QualityGrade::D => "poor",
         };
         write!(w, "{sep}{label}")?;
         if let Some(trend) = &snap.trend
@@ -181,22 +185,16 @@ pub fn draw_inline(
     writeln!(w)?;
     lines += 1;
 
-    let input = DiagInput {
-        target_reachable: snap.reachability == crate::diagnostics::health::Reachability::Online,
-        target_total_loss: snap.reachability == crate::diagnostics::health::Reachability::Offline,
-        loss_pct: snap.recent_loss_pct,
-        quality: snap.quality,
-        gateway: gw,
-        wan,
-        outage_duration: snap.outage_duration,
-        recovery_duration: snap.recovery_duration,
-        last_spike_rtt: snap.last_spike_rtt,
-        spike_guard: snap.spike_guard,
-        jitter: snap.jitter,
-        rtt_avg: snap.rtt_avg,
-    };
-    let mut events = correlator::diagnose(&input);
-    // A probe error goes first: it explains the loss the diagnostics describe.
+    let input = DiagInput::from_snapshot(snap, gw, wan);
+    let mut events: Vec<String> = correlator::diagnose(&input)
+        .iter()
+        .map(|finding| describe(finding, sep))
+        .collect();
+    // How the last TCP connect ended, or the probe error, goes first: it
+    // explains what the diagnostics describe.
+    if let Some(outcome) = tcp_outcome(snap, sep) {
+        events.insert(0, outcome);
+    }
     if let Some(error) = &snap.last_error {
         events.insert(0, error.clone());
     }
@@ -236,14 +234,18 @@ fn val(w: &mut impl Write, s: &str, color: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Guess the OS family from a reply TTL via the common initial TTLs:
-/// 64 (Linux/Unix), 128 (Windows), 255 (network gear). `None` for TTL 0.
+/// Hint at the kind of system that answered, only while the reply TTL is
+/// still one of the usual initial values: 64 (Unix-like: Linux, macOS, the
+/// BSDs), 128 (Windows), 255 (network gear). A heuristic: an initial TTL
+/// can be configured, and once a reply has crossed routers its TTL no longer
+/// says which system sent it (8.8.8.8 answers with 112, from no Windows
+/// host), so any other TTL gives `None`.
 pub fn guess_os(ttl: u8) -> Option<&'static str> {
     match ttl {
-        0 => None,
-        1..=64 => Some("Linux"),
-        65..=128 => Some("Windows"),
-        129..=255 => Some("network"),
+        64 => Some("Unix-like"),
+        128 => Some("Windows"),
+        255 => Some("network"),
+        _ => None,
     }
 }
 
@@ -263,28 +265,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_guess_os_linux() {
-        assert_eq!(guess_os(64), Some("Linux"));
-        assert_eq!(guess_os(52), Some("Linux"));
-        assert_eq!(guess_os(1), Some("Linux"));
-    }
-
-    #[test]
-    fn test_guess_os_windows() {
+    fn test_guess_os_initial_ttls() {
+        assert_eq!(guess_os(64), Some("Unix-like"));
         assert_eq!(guess_os(128), Some("Windows"));
-        assert_eq!(guess_os(116), Some("Windows"));
-        assert_eq!(guess_os(65), Some("Windows"));
-    }
-
-    #[test]
-    fn test_guess_os_network() {
         assert_eq!(guess_os(255), Some("network"));
-        assert_eq!(guess_os(250), Some("network"));
     }
 
+    /// A TTL lowered by routers gives no hint: 112 is what 8.8.8.8 answers
+    /// with, from no Windows host.
     #[test]
-    fn test_guess_os_zero() {
-        assert_eq!(guess_os(0), None);
+    fn test_guess_os_none_after_routers() {
+        for ttl in [0, 1, 52, 63, 65, 112, 127, 250, 254] {
+            assert_eq!(guess_os(ttl), None, "ttl {ttl}");
+        }
     }
 
     #[test]

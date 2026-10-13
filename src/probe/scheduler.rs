@@ -1,6 +1,6 @@
-//! Primary probe loop: fires one ICMP echo per tick at a fixed cadence and
-//! publishes a `ProbeSnapshot` after every probe. Ticks are anchored to probe
-//! start, so RTT and timeouts never stretch the period.
+//! Primary probe loop: fires one probe (ICMP echo or TCP connect) per tick at
+//! a fixed cadence and publishes a `ProbeSnapshot` after every probe. Ticks
+//! are anchored to probe start, so RTT and timeouts never stretch the period.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -9,7 +9,8 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 
-use crate::backends::IcmpBackend;
+use crate::backends::tcp::TcpProber;
+use crate::backends::{IcmpBackend, ProbeBackend};
 use crate::context::NetworkContext;
 use crate::context::dns::ResolvedAddr;
 use crate::diagnostics::health::HealthTracker;
@@ -17,7 +18,7 @@ use crate::diagnostics::outage::OutageTracker;
 use crate::diagnostics::spikes::SpikeDetector;
 use crate::probe::quality::QualityScorer;
 use crate::probe::stats::ProbeStats;
-use crate::probe::types::{ProbeOptions, ProbeResult, ProbeSnapshot};
+use crate::probe::types::{ProbeOptions, ProbeResult, ProbeSnapshot, TcpState};
 
 /// How often hostname targets are re-resolved (DNS failover detection).
 const RE_RESOLVE_INTERVAL: Duration = Duration::from_secs(60);
@@ -43,6 +44,10 @@ pub async fn run(
 ) {
     let backend = match create_backend(&opts) {
         Ok(b) => Arc::new(b),
+        Err(e) if opts.tcp_port.is_some() => {
+            eprintln!("error: cannot prepare the TCP probe: {e}");
+            return;
+        }
         Err(e) => {
             eprintln!("error: failed to create ICMP socket: {e}");
             crate::backends::eprint_icmp_hint();
@@ -61,14 +66,15 @@ pub async fn run(
     let mut health = HealthTracker::new(3, 2);
     let mut seq: u16 = 0;
     let mut last_ttl: Option<u8>;
+    let mut refused: u64 = 0;
+    // Fixed for the run (a DNS failover changes the target, not the port).
+    let tcp_port = opts.tcp_port;
 
     // Empty snapshot so renderers have state before the first reply.
-    let _ = probe_tx.send(Some(ProbeSnapshot::empty(
-        target_host.clone(),
-        target_ip,
-        dns_time,
-        net_ctx.clone(),
-    )));
+    let _ = probe_tx.send(Some(
+        ProbeSnapshot::empty(target_host.clone(), target_ip, dns_time, net_ctx.clone())
+            .with_tcp(opts.tcp_port),
+    ));
 
     // Periodic DNS re-resolution for hostname targets: a failover that changes
     // the record should redirect probes without restarting sping.
@@ -141,29 +147,17 @@ pub async fn run(
                 message: "probe task panicked".into(),
             });
 
-        match &result {
-            ProbeResult::Reply { rtt, ttl, .. } => {
-                stats.record_reply(*rtt);
-                quality.record_reply(*rtt);
-                spikes.record(*rtt);
-                outage.record_reply();
-                health.record_success();
-                last_ttl = Some(*ttl);
-            }
-            ProbeResult::Timeout { .. } => {
-                stats.record_timeout();
-                quality.record_loss();
-                outage.record_failure();
-                health.record_failure();
-                last_ttl = None;
-            }
-            ProbeResult::Error { .. } => {
-                stats.record_error();
-                quality.record_loss();
-                outage.record_failure();
-                health.record_failure();
-                last_ttl = None;
-            }
+        let recorded = record_result(
+            &result,
+            &mut stats,
+            &mut quality,
+            &mut spikes,
+            &mut outage,
+            &mut health,
+        );
+        last_ttl = recorded.ttl;
+        if matches!(result, ProbeResult::Refused { .. }) {
+            refused += 1;
         }
 
         let recovery_duration = outage.take_recovery();
@@ -195,10 +189,21 @@ pub async fn run(
             net_ctx: net_ctx.clone(),
             reachability: health.state(),
             recent_loss_pct: quality.window_loss_pct(),
+            high_jitter: quality.high_jitter(),
             last_error: match result {
                 ProbeResult::Error { message, .. } => Some(message),
                 _ => None,
             },
+            probe: None,
+            port: None,
+            refused: None,
+            tcp_state: None,
+        }
+        .with_tcp(tcp_port);
+        let snapshot = ProbeSnapshot {
+            refused: snapshot.refused.map(|_| refused),
+            tcp_state: snapshot.port.and(recorded.tcp_state),
+            ..snapshot
         };
         let _ = probe_tx.send(Some(snapshot));
 
@@ -208,14 +213,18 @@ pub async fn run(
     }
 }
 
-/// Create an ICMP backend matching the target's address family and apply
-/// socket options. An interface-bind failure only warns and continues unbound
+/// Create the probe for `opts`: a TCP connect with `--tcp`, otherwise an ICMP
+/// backend matching the target's address family, with the socket options
+/// applied. An interface-bind failure only warns and continues unbound
 /// (binding is unsupported on Windows and may require privileges elsewhere).
 ///
 /// # Errors
 ///
 /// Fails if socket creation, source binding, or setting the TTL fails.
-pub(crate) fn create_backend(opts: &ProbeOptions) -> std::io::Result<IcmpBackend> {
+pub(crate) fn create_backend(opts: &ProbeOptions) -> std::io::Result<ProbeBackend> {
+    if opts.tcp_port.is_some() {
+        return TcpProber::new(opts).map(ProbeBackend::Tcp);
+    }
     let backend = match opts.target {
         IpAddr::V4(_) => IcmpBackend::new()?,
         IpAddr::V6(_) => IcmpBackend::new_v6()?,
@@ -235,5 +244,54 @@ pub(crate) fn create_backend(opts: &ProbeOptions) -> std::io::Result<IcmpBackend
         backend.set_ttl(ttl)?;
     }
 
-    Ok(backend)
+    Ok(ProbeBackend::Icmp(backend))
+}
+
+/// What one probe result leaves for the snapshot.
+pub(crate) struct Recorded {
+    /// TTL of an ICMP reply; `None` for anything else.
+    pub ttl: Option<u8>,
+    /// The result as a TCP outcome; meaningful in TCP mode only.
+    pub tcp_state: Option<TcpState>,
+}
+
+/// Feed one probe result to a target's trackers. A TCP connect, established
+/// or refused, is an answer like an ICMP reply (`refused` is a subset of
+/// `received`); it carries no TTL.
+pub(crate) fn record_result(
+    result: &ProbeResult,
+    stats: &mut ProbeStats,
+    quality: &mut QualityScorer,
+    spikes: &mut SpikeDetector,
+    outage: &mut OutageTracker,
+    health: &mut HealthTracker,
+) -> Recorded {
+    let (rtt, ttl, tcp_state) = match result {
+        ProbeResult::Reply { rtt, ttl, .. } => (Some(*rtt), Some(*ttl), None),
+        ProbeResult::Connected { rtt, .. } => (Some(*rtt), None, Some(TcpState::Open)),
+        ProbeResult::Refused { rtt, .. } => (Some(*rtt), None, Some(TcpState::Refused)),
+        ProbeResult::Timeout { .. } => {
+            stats.record_timeout();
+            (None, None, Some(TcpState::Timeout))
+        }
+        ProbeResult::Error { .. } => {
+            stats.record_error();
+            (None, None, Some(TcpState::Error))
+        }
+    };
+    match rtt {
+        Some(rtt) => {
+            stats.record_reply(rtt);
+            quality.record_reply(rtt);
+            spikes.record(rtt);
+            outage.record_reply();
+            health.record_success();
+        }
+        None => {
+            quality.record_loss();
+            outage.record_failure();
+            health.record_failure();
+        }
+    }
+    Recorded { ttl, tcp_state }
 }
