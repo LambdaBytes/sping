@@ -66,6 +66,7 @@ google.com (216.58.…    13.7 ms    13.6 ms     0%    A100     stable        11
 | Method | Command | Platforms | Man page and completions |
 |--------|---------|-----------|--------------------------|
 | Homebrew | `brew install LambdaBytes/tap/sping` | macOS | yes |
+| Scoop | `scoop install lambdabytes/sping`, once the bucket is added (see below) | Windows x86_64 | no |
 | crates.io | `cargo install sping` | Linux, macOS, Windows, with Rust 1.88+ | no |
 | Pre-built binary | from the [Releases page](../../releases) | Linux, macOS, Windows | no |
 | Debian / Ubuntu package | `.deb` from the [Releases page](../../releases) | Debian 12, Ubuntu 22.04, Raspberry Pi OS (Bookworm) or later | yes |
@@ -79,6 +80,18 @@ the shell completions:
 ```bash
 brew install LambdaBytes/tap/sping
 ```
+
+### Scoop
+
+From v1.6.0 on. Installs the release's Windows binary, the one listed in its
+`SHA256SUMS`:
+
+```powershell
+scoop bucket add lambdabytes https://github.com/LambdaBytes/scoop-bucket
+scoop install lambdabytes/sping
+```
+
+`scoop update sping` moves it to a newer release.
 
 ### From crates.io
 
@@ -355,7 +368,7 @@ sudo setcap cap_net_raw+ep /usr/bin/sping
 **Distribution**
 - Binaries for Linux x86_64 and aarch64 (glibc 2.34+, and static with musl),
   macOS arm64 and Windows x86_64; `.deb` packages with the man page and the
-  shell completions; Homebrew and crates.io
+  shell completions; Homebrew, Scoop and crates.io
 - On GitHub releases: the macOS binary signed and notarized, and a build
   provenance attestation for every file
 
@@ -416,9 +429,9 @@ x86_64/aarch64 (glibc, and static with musl), macOS arm64 and Windows x86_64.
 
 ## Roadmap
 
-- Distribution packaging: AUR, Fedora/COPR, Debian/Raspberry Pi OS (work in
-  progress under [`packaging/`](packaging/)).
-- nixpkgs: the package is under review.
+- Distribution packaging: AUR (`lambdabytes-sping`), Fedora/COPR,
+  Debian/Raspberry Pi OS (work in progress under [`packaging/`](packaging/)).
+- WinGet (`LambdaBytes.Sping`) and nixpkgs: the packages are under review.
 
 ## Performance
 
