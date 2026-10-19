@@ -24,7 +24,7 @@ Context    if eth0 · 192.168.1.100/24 · gw ● · wan ● · public
 Quality    A (100) · excellent
 ```
 
-## What's new in 1.7.0
+## What's new in 1.7.1
 
 - **`--diagnose`** (experimental): when the target stops answering, sping
   probes further on its own (the other address family, TCP 443 and 80, a
@@ -130,7 +130,7 @@ gh attestation verify sping-vX.Y.Z-linux-x86_64 --repo LambdaBytes/sping
 ### Debian / Ubuntu (.deb)
 
 ```bash
-sudo dpkg -i sping_1.7.0-1_amd64.deb     # or _arm64.deb on aarch64
+sudo dpkg -i sping_1.7.1-1_amd64.deb     # or _arm64.deb on aarch64
 ```
 
 The package installs:

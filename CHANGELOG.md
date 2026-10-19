@@ -1,5 +1,33 @@
 # Changelog
 
+## v1.7.1
+
+The first release of 1.7 on GitHub, crates.io and the package channels.
+v1.7.0 was tagged but not published there: three of its integration tests
+failed where sping may not open an ICMP socket, as in Nix's Linux build
+sandbox and on GitHub's Ubuntu runner. Its binaries had no defect, and the
+code of 1.7.1 is the same. What 1.7 brings, in detail under v1.7.0 below:
+
+- `--diagnose` (experimental): when the target stops answering, sping probes
+  further on its own (the other address family, TCP 443 and 80, a bounded
+  traceroute) and says what still answers.
+- The name's lookups as evidence: a lookup that fails while the WAN
+  reference answers, or that gives no address of the family probed.
+- Context changes while monitoring: `context changed 00:03 ago: interface
+  eth0 → wlan0`, for the interface, source, prefix, default gateway and
+  target class.
+- Fixes on macOS (echo replies matched by identifier for IPv4 too), for a
+  target routed through an interface without an address of its family, and
+  for the views and options that could leave sping stuck or ignore what it
+  was told (`--view table` with one target, several targets piped, a
+  misspelt `--view`, `-o` without `--batch`).
+
+### Fixes
+- Tests: the two that drive the live views from a pseudo-terminal, and the
+  one with several targets piped, needed an ICMP socket and failed without
+  one. Where sping may not open one they now say so and skip what needs
+  probes, as the other tests that need ICMP already did.
+
 ## v1.7.0
 
 ### Added

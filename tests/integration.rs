@@ -527,11 +527,16 @@ fn test_several_targets_piped_print_only_their_summaries() {
     let stdout = String::from_utf8_lossy(&piped.stdout);
     let stderr = String::from_utf8_lossy(&piped.stderr);
     assert!(!stdout.contains('\x1b'), "{stdout:?}");
-    for host in ["127.0.0.1", "127.0.0.2"] {
-        assert!(
-            stdout.contains(&format!("--- {host} ({host}) sping statistics ---")),
-            "{stdout}"
-        );
+    // The summaries need probes; the note comes before the socket is opened.
+    if stderr.contains("failed to create ICMP socket") {
+        eprintln!("no ICMP permission here: the summaries not checked");
+    } else {
+        for host in ["127.0.0.1", "127.0.0.2"] {
+            assert!(
+                stdout.contains(&format!("--- {host} ({host}) sping statistics ---")),
+                "{stdout}"
+            );
+        }
     }
     assert!(stderr.contains("no live table"), "{stderr}");
     assert!(!stderr.contains("falling back to classic"), "{stderr}");
@@ -674,6 +679,23 @@ fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
     done()
 }
 
+/// Whether sping is refused an ICMP socket here, as in a build sandbox (Nix
+/// on Linux, GitHub's Ubuntu runner: no unprivileged ICMP, no CAP_NET_RAW).
+/// The live views need probes and send their stderr nowhere, so they ask
+/// first; only that error skips them, any other failure still fails.
+#[cfg(unix)]
+fn icmp_denied() -> bool {
+    let output = sping_timed(10)
+        .args(["127.0.0.1", "-c", "1", "-W", "1", "--view", "classic"])
+        .output()
+        .expect("failed to run");
+    let denied = String::from_utf8_lossy(&output.stderr).contains("failed to create ICMP socket");
+    if denied {
+        eprintln!("no ICMP permission here: not run");
+    }
+    denied
+}
+
 /// Ctrl+C and `q` quit every live view: compact, extended, `--view table`
 /// with one target (it drew in raw mode with no key listener: neither key
 /// did anything) and the table of several targets.
@@ -681,6 +703,9 @@ fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
 #[test]
 fn test_keys_quit_the_live_views() {
     use std::io::Write;
+    if icmp_denied() {
+        return;
+    }
     let views: [&[&str]; 4] = [
         &["127.0.0.1"],
         &["127.0.0.1", "--view", "extended"],
@@ -721,6 +746,9 @@ fn test_keys_quit_the_live_views() {
 #[cfg(unix)]
 #[test]
 fn test_no_terminal_for_keys_does_not_spin() {
+    if icmp_denied() {
+        return;
+    }
     let (master, slave) = open_pty();
     let mut child = sping_on_pty(&slave, false, &["127.0.0.1", "-i", "200"]);
     drop(slave);
