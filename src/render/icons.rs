@@ -107,6 +107,24 @@ pub fn ellipsis() -> char {
     if is_ascii() { '~' } else { '…' }
 }
 
+/// From one value to the next ("eth0 → wlan0").
+pub fn arrow() -> &'static str {
+    arrow_for(is_ascii())
+}
+
+fn arrow_for(ascii: bool) -> &'static str {
+    if ascii { "->" } else { "→" }
+}
+
+/// Marker of something still in progress ("diagnosing…").
+pub fn in_progress() -> &'static str {
+    in_progress_for(is_ascii())
+}
+
+fn in_progress_for(ascii: bool) -> &'static str {
+    if ascii { "..." } else { "…" }
+}
+
 /// Loss marker in the pulse strip.
 pub fn loss_char() -> char {
     if is_ascii() { 'x' } else { '✕' }
@@ -208,5 +226,17 @@ mod tests {
             assert_eq!(reach_glyph_for(r, true), ascii);
             assert!(reach_glyph_for(r, true).is_ascii());
         }
+    }
+
+    #[test]
+    fn arrow_is_ascii_in_ascii_mode() {
+        assert_eq!(arrow_for(false), "→");
+        assert_eq!(arrow_for(true), "->");
+    }
+
+    #[test]
+    fn in_progress_marker_is_ascii_in_ascii_mode() {
+        assert_eq!(in_progress_for(false), "…");
+        assert_eq!(in_progress_for(true), "...");
     }
 }

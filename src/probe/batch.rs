@@ -118,6 +118,9 @@ pub async fn probe_target(
         recent_loss_pct: quality.window_loss_pct(),
         high_jitter: quality.high_jitter(),
         last_error,
+        // Batch probes a fixed address: no re-resolution, no context watcher.
+        name: None,
+        context_change: None,
         probe: None,
         port: None,
         refused: None,

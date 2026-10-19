@@ -4,14 +4,25 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod linux_icmp;
 
-#[cfg(target_os = "windows")]
+// Compiled for tests everywhere: the trace's status table is tested off Windows.
+#[cfg(any(target_os = "windows", test))]
 pub mod windows_icmp;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod trace_unix;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use linux_icmp::LinuxIcmpBackend as IcmpBackend;
 
 #[cfg(target_os = "windows")]
 pub use windows_icmp::WindowsIcmpBackend as IcmpBackend;
+
+/// The trace prober of this platform (`probe::trace`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use trace_unix::UnixHopProber as TraceProber;
+
+#[cfg(target_os = "windows")]
+pub use windows_icmp::WindowsHopProber as TraceProber;
 
 pub mod tcp;
 

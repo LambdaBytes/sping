@@ -9,11 +9,12 @@ use crossterm::{cursor, queue, terminal};
 
 use crate::diagnostics::correlator::{self, DiagInput};
 use crate::probe::auxiliary::AuxiliaryState;
+use crate::probe::diagnose::DiagnoseState;
 use crate::probe::pulse::{PulseScaler, compute_rtt_dist, render_echo_path};
 use crate::probe::quality::Trend;
 use crate::probe::types::ProbeSnapshot;
 use crate::render::format::{
-    describe, fmt_elapsed, fmt_loss, fmt_rtt, fmt_rtt_opt, fmt_source, tcp_outcome,
+    events, fmt_elapsed, fmt_loss, fmt_rtt, fmt_rtt_opt, fmt_source, tcp_outcome, untested,
 };
 use crate::render::icons;
 use crate::render::view_compact::{estimate_hops, guess_os};
@@ -27,6 +28,7 @@ pub fn draw_inline(
     snap: &ProbeSnapshot,
     gw: Option<&AuxiliaryState>,
     wan: Option<&AuxiliaryState>,
+    diagnose: Option<&DiagnoseState>,
     spinner_idx: usize,
     lines_before: u16,
 ) -> io::Result<u16> {
@@ -203,10 +205,7 @@ pub fn draw_inline(
     lines += 1;
 
     let input = DiagInput::from_snapshot(snap, gw, wan);
-    let mut events: Vec<String> = correlator::diagnose(&input)
-        .iter()
-        .map(|finding| describe(finding, sep))
-        .collect();
+    let mut events = events(&correlator::diagnose(&input), diagnose, sep);
     // How the last TCP connect ended, or the probe error, goes first: it
     // explains what the diagnostics describe.
     if let Some(outcome) = tcp_outcome(snap, sep) {
@@ -221,6 +220,17 @@ pub fn draw_inline(
     queue!(w, terminal::Clear(terminal::ClearType::UntilNewLine))?;
     writeln!(w)?;
     lines += 1;
+
+    // `--diagnose`: what the diagnosis could not establish (its conclusions
+    // are on the Events line).
+    if let Some(state) = diagnose {
+        if let Some(untested) = untested(state, sep) {
+            write!(w, "Untested   {untested}")?;
+        }
+        queue!(w, terminal::Clear(terminal::ClearType::UntilNewLine))?;
+        writeln!(w)?;
+        lines += 1;
+    }
 
     if snap.sent > 0 {
         let target_str = snap.target_ip.to_string();

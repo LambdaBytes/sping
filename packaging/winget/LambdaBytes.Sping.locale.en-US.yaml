@@ -1,0 +1,22 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json
+
+PackageIdentifier: LambdaBytes.Sping
+PackageVersion: @VERSION@
+PackageLocale: en-US
+Publisher: LambdaBytes
+PublisherUrl: https://github.com/@OWNER@
+PackageName: sping
+PackageUrl: https://github.com/@REPOSITORY@
+License: MIT
+LicenseUrl: https://github.com/@REPOSITORY@/blob/v@VERSION@/LICENSE
+ShortDescription: Terminal-native real-time connectivity monitor with network context diagnostics
+Moniker: sping
+Tags:
+- diagnostics
+- latency
+- monitoring
+- network
+- ping
+ReleaseNotesUrl: https://github.com/@REPOSITORY@/releases/tag/v@VERSION@
+ManifestType: defaultLocale
+ManifestVersion: 1.12.0

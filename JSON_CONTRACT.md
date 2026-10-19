@@ -50,6 +50,7 @@ These fields are guaranteed present in every JSON line:
 | `gateway` | object | Single target only, once the gateway probe has a result: its state (see below; added in 1.6.0) |
 | `wan` | object | Single target only, once the WAN reference probe (`--wan-probe`) has a result: its state (see below; added in 1.6.0) |
 | `diagnosis` | array | Only when sping concludes something: the findings, in priority order (see below; added in 1.6.0) |
+| `active_diagnosis` | object | Only with `--diagnose`, while or after the target is down: what the extra probes found (see below; added in 1.7.0, experimental) |
 
 ## net_ctx Object
 
@@ -83,12 +84,14 @@ auxiliary probe. `"unknown"` means a result that has not decided a state yet.
 What sping concludes from the same line's fields, `gateway` and `wan`. Each
 finding is an object with a `code` and, for some, evidence fields. Codes are
 only ever added, never renamed or removed: a consumer ignores a code it does
-not know. Batch lines diagnose the target alone (no `gateway`/`wan`).
+not know. Batch lines diagnose the target alone (no `gateway`/`wan`). A
+finding may repeat on later lines (`context_changed`, with its age).
 
 | `code` | Evidence | Meaning |
 |--------|----------|---------|
 | `tcp_refused` | `port` | The last connect was refused: the host, or a firewall on the way, answered for the port |
 | `recovered` | `duration` (ms) | An outage just ended, after `duration` |
+| `context_changed` | `changes`, `age_s` | The target's `net_ctx` changed `age_s` seconds ago (re-detected every 15 s); repeated on every line for 30 s. `changes`: one `{"what", "from", "to"}` per field that changed, `what` a `net_ctx` key (`interface`, `local_ip`, `prefix_len`, `gateway`, `target_class`) and `from`/`to` its values as `net_ctx` writes them, `null` when unknown (`"unknown"`, `0.0.0.0`, `0`, no gateway). Single target only; never with `-I` or `-S`, where `net_ctx` is the system's route, not the probe's (added in 1.7.0) |
 | `outage` | `duration` (ms) | The target has not answered for `duration` |
 | `gateway_unreachable` | — | Target and gateway down: local network |
 | `upstream_outage` | — | Target and WAN reference down, gateway up |
@@ -98,6 +101,47 @@ not know. Batch lines diagnose the target alone (no `gateway`/`wan`).
 | `high_jitter` | — | No recent loss, but the last 20 probes' replies deviate from their mean by more than half of it (the quality grade's window and measure, not the lifetime `jitter` field) |
 | `intermittent_loss` | `recent_loss_pct` | Some, not all, of the last 20 probes were lost |
 | `wan_degraded` | — | Target reachable, WAN reference down, gateway up |
+| `name_lookup_failed` | `timed_out` | The last lookup of the target's name (repeated every 60 s) failed — `timed_out`: no answer within 5 s — while the WAN reference answers (its state `online` and its last probe answered); sping keeps probing the address it had (added in 1.7.0) |
+| `lookup_without_family` | `family` (`ipv4`/`ipv6`) | The last lookup of the target's name gave no address of the family probed; not that the name has none: a resolver may leave out what the host cannot reach (added in 1.7.0) |
+
+## active_diagnosis Object (added in 1.7.0, experimental)
+
+With `--diagnose` (single target), when the target stops answering sping
+probes further on its own sockets — the source the system has for the
+target, the same name's address of the other family, TCP 443 and 80 (or the
+`--tcp` port, on the other family), a bounded traceroute — and concludes from
+what it observed. `diagnosis` stays the correlator's, drawn from the line's
+own fields; this object comes from the extra probes. Experimental: its codes
+may still change before it leaves that state.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `target` | string | Address diagnosed (no zone, as `target_ip`) |
+| `state` | string | `"diagnosing"`, `"done"`, or `"incomplete"` |
+| `conclusions` | array | With `"done"`: what was observed, in order (see below) |
+| `gaps` | array | With `"done"`: what could not be established: `{"about": …, "reason": …, "detail"?: …}` |
+
+`"incomplete"` appears only on the last line of a `-c N` run, when the
+diagnosis did not conclude within its budget or was interrupted: that line
+waits for it (still one line per probe). Without `-c`, a stream that ends
+with `"diagnosing"` did not conclude either.
+
+| `code` | Fields | Meaning |
+|--------|--------|---------|
+| `no_source` | `family` | No route or source address of the target's family for it on this host |
+| `reported_unreachable` | `ttl`, `from`, `kind` | Hop `ttl` (`from`) reported the target unreachable (`net`, `host`, `protocol`, `port`, `admin_prohibited`, `other`) |
+| `silent_after` | `last_hop` (`{ttl, from[]}` or `null`), `silent` | The last hop that answered (every address that did, with load balancing) and how many hops after it stayed silent; `null`: none answered. Observed silence, not proof of a break: a target that filters ICMP behind silent routers looks the same |
+| `target_answers_icmp` | `ttl` | The target answered the traceroute's echo at hop `ttl` |
+| `answers_tcp` | `port`, `refused` | The target answered a TCP connect (`refused`: something answered for the port) |
+| `other_family_works` | `family`, `address` | That address of the other family (`ipv4`/`ipv6`) answered; not every address of the family |
+| `other_family_fails` | `family`, `address` | Probes to that address left and got no answer |
+
+`gaps[].about`: `main`, `other_family`, `tcp`, `trace`, `name`.
+`gaps[].reason`: `explicit_family` (`-4`/`-6`), `explicit_source` (`-S`),
+`literal` (an address was given), `no_address`, `no_source`,
+`resolve_failed`, `ceiling`, `unavailable` (`detail`: `permission` or
+`platform`), `inconclusive`, `failed`, `unknown`; `detail` carries the
+message where there is one.
 
 ## Semantics
 

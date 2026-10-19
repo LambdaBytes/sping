@@ -16,6 +16,8 @@ pub struct TcpProber {
     /// Interface to bind each socket to (`-I`); Linux only, and only when the
     /// first attempt worked.
     interface: Option<String>,
+    /// Write no warning (the probes of `--diagnose`, under a raw-mode view).
+    quiet: bool,
 }
 
 impl TcpProber {
@@ -29,18 +31,41 @@ impl TcpProber {
     ///
     /// The socket cannot be created or configured.
     pub fn new(opts: &ProbeOptions) -> io::Result<Self> {
-        let mut prober = Self { interface: None };
+        Self::build(opts, false)
+    }
+
+    /// As `new`, but warning about nothing: `-I` that cannot be bound leaves
+    /// the probe unbound, as `interface` then tells.
+    ///
+    /// # Errors
+    ///
+    /// The socket cannot be created or configured.
+    pub fn quiet(opts: &ProbeOptions) -> io::Result<Self> {
+        Self::build(opts, true)
+    }
+
+    fn build(opts: &ProbeOptions, quiet: bool) -> io::Result<Self> {
+        let mut prober = Self {
+            interface: None,
+            quiet,
+        };
         if let Some(iface) = &opts.interface {
-            match bind_interface(&stream_socket(opts)?, iface) {
+            match bind_interface(&stream_socket(opts)?, iface, quiet) {
                 Ok(true) => prober.interface = Some(iface.clone()),
                 Ok(false) => {}
-                Err(e) => warn_once(&format!(
+                Err(e) if !quiet => warn_once(&format!(
                     "warning: could not bind to interface {iface}: {e}"
                 )),
+                Err(_) => {}
             }
         }
         prober.socket(opts)?;
         Ok(prober)
+    }
+
+    /// The interface each connect is bound to, if any.
+    pub fn interface(&self) -> Option<&str> {
+        self.interface.as_deref()
     }
 
     /// A new socket for one connect, with the options applied in the ICMP
@@ -49,7 +74,7 @@ impl TcpProber {
     fn socket(&self, opts: &ProbeOptions) -> io::Result<Socket> {
         let socket = stream_socket(opts)?;
         if let Some(iface) = &self.interface {
-            bind_interface(&socket, iface)?;
+            bind_interface(&socket, iface, self.quiet)?;
         }
         if let Some(source) = opts.source {
             socket.bind(&SockAddr::from(with_port(source, 0, opts.scope_id)))?;
@@ -61,7 +86,7 @@ impl TcpProber {
             }
         }
         #[cfg(target_os = "windows")]
-        no_syn_retransmissions(&socket, opts.timeout);
+        no_syn_retransmissions(&socket, opts.timeout, self.quiet);
         Ok(socket)
     }
 
@@ -131,22 +156,29 @@ pub(crate) fn classify(outcome: io::Result<()>, elapsed: Duration, seq: u64) -> 
 }
 
 /// Bind `socket` to `iface`: `Ok(true)` when bound, `Ok(false)` where the
-/// platform does not bind (macOS accepts the flag without effect; Windows
-/// warns once).
+/// platform does not bind (macOS and Windows, which warn once, unless
+/// `quiet`).
 #[cfg(target_os = "linux")]
-fn bind_interface(socket: &Socket, iface: &str) -> io::Result<bool> {
+fn bind_interface(socket: &Socket, iface: &str, _quiet: bool) -> io::Result<bool> {
     socket.bind_device(Some(iface.as_bytes()))?;
     Ok(true)
 }
 
 #[cfg(target_os = "macos")]
-fn bind_interface(_socket: &Socket, _iface: &str) -> io::Result<bool> {
+fn bind_interface(_socket: &Socket, _iface: &str, quiet: bool) -> io::Result<bool> {
+    if !quiet {
+        warn_once("warning: interface binding not supported on macOS. Use -S <source-ip> instead.");
+    }
     Ok(false)
 }
 
 #[cfg(target_os = "windows")]
-fn bind_interface(_socket: &Socket, _iface: &str) -> io::Result<bool> {
-    warn_once("warning: interface binding not supported on Windows. Use -S <source-ip> instead.");
+fn bind_interface(_socket: &Socket, _iface: &str, quiet: bool) -> io::Result<bool> {
+    if !quiet {
+        warn_once(
+            "warning: interface binding not supported on Windows. Use -S <source-ip> instead.",
+        );
+    }
     Ok(false)
 }
 
@@ -159,9 +191,9 @@ fn bind_interface(_socket: &Socket, _iface: &str) -> io::Result<bool> {
 /// with `-W 5`): the estimate is `timeout` instead, so that the wait is the
 /// probe's `-W`, up to a limit of the system's: about 3 s (measured: `-W 2`
 /// waits 2 s, `-W 5` about 3 s). If the system refuses the setting, a warning
-/// (once): refusals then come late.
+/// (once, unless `quiet`): refusals then come late.
 #[cfg(target_os = "windows")]
-fn no_syn_retransmissions(socket: &Socket, timeout: Duration) {
+fn no_syn_retransmissions(socket: &Socket, timeout: Duration, quiet: bool) {
     use std::os::windows::io::AsRawSocket;
 
     /// `TCP_INITIAL_RTO_PARAMETERS` (mstcpip.h), its padding byte explicit
@@ -222,7 +254,7 @@ fn no_syn_retransmissions(socket: &Socket, timeout: Duration) {
             std::ptr::null_mut(),
         )
     };
-    if status != 0 {
+    if status != 0 && !quiet {
         let e = io::Error::last_os_error();
         static WARNED: Once = Once::new();
         WARNED.call_once(|| {
@@ -429,5 +461,20 @@ mod tests {
                 "{k:?}"
             );
         }
+    }
+
+    /// The probes of `--diagnose` warn about nothing: an interface that
+    /// cannot be bound leaves them unbound, and says so.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_quiet_prober_leaves_an_unbindable_interface_unbound() {
+        let opts = ProbeOptions {
+            target: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            tcp_port: Some(9),
+            interface: Some("nosuchif0".into()),
+            ..ProbeOptions::default()
+        };
+        let prober = TcpProber::quiet(&opts).unwrap();
+        assert_eq!(prober.interface(), None);
     }
 }

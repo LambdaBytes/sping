@@ -5,13 +5,16 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 
-const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Address family restriction (-4 / -6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Family {
+    #[serde(rename = "ipv4")]
     V4,
+    #[serde(rename = "ipv6")]
     V6,
 }
 
@@ -110,21 +113,8 @@ pub async fn resolve(
         return Ok((ResolvedAddr::unscoped(ip), None));
     }
 
-    let host = format!("{target}:0");
     let start = Instant::now();
-
-    let addrs = tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host(&host))
-        .await
-        .map_err(|_| anyhow::anyhow!("DNS resolution for '{target}' timed out after 5s"))?
-        .with_context(|| {
-            if is_literal(target) {
-                format!("unknown zone in '{target}' (use an interface name or index)")
-            } else {
-                format!("DNS resolution failed for '{target}'")
-            }
-        })?;
-
-    let all: Vec<ResolvedAddr> = addrs.map(ResolvedAddr::from).collect();
+    let all = lookup(target).await?;
 
     let chosen = match family {
         Some(f) => all.iter().copied().find(|a| f.matches(a.ip)),
@@ -152,31 +142,116 @@ pub async fn resolve(
     Ok((addr, elapsed))
 }
 
-/// Re-resolve a hostname, returning `Some(new)` only when `current` dropped
-/// out of the answer set (`None` for literal addresses, failure, timeout).
-/// Restricted to `current`'s family: the ICMP backend socket is family-bound.
-pub async fn re_resolve(target: &str, current: ResolvedAddr) -> Option<ResolvedAddr> {
+/// Look `target` up with the 5s timeout: a name, or a zoned literal whose
+/// zone only the system resolver can turn into an index.
+async fn lookup(target: &str) -> Result<Vec<ResolvedAddr>> {
+    let host = format!("{target}:0");
+    let addrs = tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host(&host))
+        .await
+        .map_err(|_| anyhow::anyhow!("DNS resolution for '{target}' timed out after 5s"))?
+        .with_context(|| {
+            if is_literal(target) {
+                format!("unknown zone in '{target}' (use an interface name or index)")
+            } else {
+                format!("DNS resolution failed for '{target}'")
+            }
+        })?;
+    Ok(addrs.map(ResolvedAddr::from).collect())
+}
+
+/// The first address of each family from one lookup, for comparing IPv4
+/// with IPv6. A missing family means the lookup gave none, not that the
+/// name has no record of it: some resolvers leave out what the host cannot
+/// reach. This lookup is not the probe's: the address the probe uses is the
+/// scheduler's (round-robin answers, DNS failover), not this one's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Families {
+    pub v4: Option<ResolvedAddr>,
+    pub v6: Option<ResolvedAddr>,
+    /// `None` for a literal address, as in `resolve`.
+    pub time: Option<Duration>,
+}
+
+/// Resolve `target` to the first address of each family, with timing. A
+/// literal address gives its own family only, with no lookup.
+///
+/// # Errors
+///
+/// As `resolve` without a family: timeout or lookup failure, an unknown
+/// zone, or no address at all. One family missing is not an error.
+pub async fn resolve_both(target: &str) -> Result<Families> {
+    if let Ok(ip) = target.parse::<IpAddr>() {
+        let (v4, v6) = first_of_each(&[ResolvedAddr::unscoped(ip)]);
+        return Ok(Families { v4, v6, time: None });
+    }
+
+    let start = Instant::now();
+    let all = lookup(target).await?;
+    let (v4, v6) = first_of_each(&all);
+    if v4.is_none() && v6.is_none() {
+        bail!("no address found for '{target}'");
+    }
+    if let Some(v6) = v6
+        && zone_lost(target, v6)
+    {
+        bail!("unknown zone in '{target}' (use an interface name or index)");
+    }
+
+    let time = (!is_literal(target)).then(|| start.elapsed());
+    Ok(Families { v4, v6, time })
+}
+
+/// The first IPv4 and the first IPv6 address of `all`, in its order.
+fn first_of_each(all: &[ResolvedAddr]) -> (Option<ResolvedAddr>, Option<ResolvedAddr>) {
+    let first = |family: Family| all.iter().copied().find(|a| family.matches(a.ip));
+    (first(Family::V4), first(Family::V6))
+}
+
+/// What a re-resolution of the target's name found, for the address being
+/// probed (`current`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolution {
+    /// `current` is still among the answers (round-robin reorders them).
+    Unchanged,
+    /// `current` dropped out: the first answer of its family instead.
+    Changed(ResolvedAddr),
+    /// The answer has no address of `current`'s family. Not that the name
+    /// has none: a resolver may leave out what the host cannot reach.
+    NoAddressOfFamily,
+    /// The lookup failed: no answer within the timeout, or an error.
+    Failed { timed_out: bool },
+}
+
+/// Re-resolve a hostname for the address being probed. The answer is
+/// restricted to `current`'s family: the probe's socket is bound to it. A
+/// literal address is `Unchanged`.
+pub async fn re_resolve(target: &str, current: ResolvedAddr) -> Resolution {
     if is_literal(target) {
-        return None;
+        return Resolution::Unchanged;
     }
 
     let host = format!("{target}:0");
-    let result = tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host(&host))
-        .await
-        .ok()?
-        .ok()?;
-
-    let candidates: Vec<ResolvedAddr> = result
-        .map(ResolvedAddr::from)
-        .filter(|a| a.ip.is_ipv4() == current.ip.is_ipv4())
-        .collect();
-
-    // Round-robin DNS rotates record order between queries; only retarget
-    // when the current address disappeared from the answer set entirely.
-    if candidates.is_empty() || candidates.contains(&current) {
-        return None;
+    match tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host(&host)).await {
+        Err(_) => Resolution::Failed { timed_out: true },
+        Ok(Err(_)) => Resolution::Failed { timed_out: false },
+        Ok(Ok(addrs)) => resolution(&addrs.map(ResolvedAddr::from).collect::<Vec<_>>(), current),
     }
-    candidates.first().copied()
+}
+
+/// What `answer` means for `current`. Round-robin DNS rotates the order of
+/// the records between queries: only an answer without `current` moves the
+/// probe, to its first address of the family.
+fn resolution(answer: &[ResolvedAddr], current: ResolvedAddr) -> Resolution {
+    let mut candidates = answer
+        .iter()
+        .copied()
+        .filter(|a| a.ip.is_ipv4() == current.ip.is_ipv4())
+        .peekable();
+    match candidates.peek() {
+        None => Resolution::NoAddressOfFamily,
+        Some(_) if answer.contains(&current) => Resolution::Unchanged,
+        Some(&first) => Resolution::Changed(first),
+    }
 }
 
 #[cfg(test)]
@@ -266,5 +341,104 @@ mod tests {
         assert_eq!(addr, ResolvedAddr::unscoped("::1".parse().unwrap()));
         assert!(time.is_none());
         assert!(resolve("::1", Some(Family::V4)).await.is_err());
+    }
+
+    fn addr(s: &str) -> ResolvedAddr {
+        ResolvedAddr::unscoped(s.parse().unwrap())
+    }
+
+    #[test]
+    fn first_of_each_takes_the_first_of_each_family() {
+        let (a4, b4) = (addr("192.0.2.1"), addr("192.0.2.2"));
+        let (a6, b6) = (addr("2001:db8::1"), addr("2001:db8::2"));
+        assert_eq!(first_of_each(&[a4, b4]), (Some(a4), None));
+        assert_eq!(first_of_each(&[a6, b6]), (None, Some(a6)));
+        // Each family in the answer's order, whichever family comes first.
+        assert_eq!(first_of_each(&[b6, a6, b4, a4]), (Some(b4), Some(b6)));
+        assert_eq!(first_of_each(&[a4, a6, b4]), (Some(a4), Some(a6)));
+        assert_eq!(first_of_each(&[]), (None, None));
+        // The zone travels with the address.
+        let zoned = ResolvedAddr {
+            ip: "fe80::1".parse().unwrap(),
+            scope_id: 7,
+        };
+        assert_eq!(first_of_each(&[zoned, a6]), (None, Some(zoned)));
+    }
+
+    #[tokio::test]
+    async fn literal_gives_its_own_family_only() {
+        let v4 = resolve_both("192.0.2.1").await.unwrap();
+        assert_eq!(
+            (v4.v4, v4.v6, v4.time),
+            (Some(addr("192.0.2.1")), None, None)
+        );
+        let v6 = resolve_both("2001:db8::1").await.unwrap();
+        assert_eq!(
+            (v6.v4, v6.v6, v6.time),
+            (None, Some(addr("2001:db8::1")), None)
+        );
+    }
+
+    /// A zoned literal goes through the resolver for its zone only: the zone
+    /// is kept and there is no resolution time.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn literal_keeps_its_zone() {
+        // SAFETY: a NUL-terminated name; the call only reads it.
+        let lo = unsafe { libc::if_nametoindex(c"lo".as_ptr()) };
+        assert_ne!(lo, 0);
+        let both = resolve_both("fe80::1%lo").await.unwrap();
+        let zoned = ResolvedAddr {
+            ip: "fe80::1".parse().unwrap(),
+            scope_id: lo,
+        };
+        assert_eq!((both.v4, both.v6, both.time), (None, Some(zoned), None));
+    }
+
+    /// What an answer means for the address probed: only an answer without
+    /// it moves the probe; one without its family is said apart.
+    #[test]
+    fn a_re_resolution_by_its_answer() {
+        let a = |s: &str| ResolvedAddr::unscoped(s.parse().unwrap());
+        let current = a("192.0.2.1");
+        for (answer, expected) in [
+            (vec![a("192.0.2.1")], Resolution::Unchanged),
+            // Round-robin: the same records, another order.
+            (vec![a("192.0.2.2"), a("192.0.2.1")], Resolution::Unchanged),
+            (
+                vec![a("2001:db8::1"), a("192.0.2.1")],
+                Resolution::Unchanged,
+            ),
+            (
+                vec![a("2001:db8::1"), a("192.0.2.7"), a("192.0.2.8")],
+                Resolution::Changed(a("192.0.2.7")),
+            ),
+            (vec![a("2001:db8::1")], Resolution::NoAddressOfFamily),
+            (vec![], Resolution::NoAddressOfFamily),
+        ] {
+            assert_eq!(resolution(&answer, current), expected, "{answer:?}");
+        }
+        let v6 = a("2001:db8::1");
+        assert_eq!(
+            resolution(&[a("192.0.2.1")], v6),
+            Resolution::NoAddressOfFamily
+        );
+        assert_eq!(
+            resolution(&[a("192.0.2.1"), a("2001:db8::9")], v6),
+            Resolution::Changed(a("2001:db8::9"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_literal_is_never_re_resolved() {
+        let current = ResolvedAddr::unscoped("192.0.2.1".parse().unwrap());
+        assert_eq!(
+            re_resolve("192.0.2.1", current).await,
+            Resolution::Unchanged
+        );
+        assert_eq!(
+            re_resolve("fe80::1%1", current).await,
+            Resolution::Unchanged
+        );
     }
 }

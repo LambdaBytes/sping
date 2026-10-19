@@ -55,17 +55,18 @@ jobs:
           - { name: macos-arm64,    os: macos-latest,    target: aarch64-apple-darwin }
           - { name: windows-x86_64, os: windows-latest,  target: x86_64-pc-windows-msvc }
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       # The same Rust as the Linux image.
-      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         if: ${{ !matrix.container }}
         with:
+          toolchain: 1.92.0
           targets: ${{ matrix.target }}
       # In the container, the image's own toolchain.
       - name: Add the Rust target
         if: matrix.container
         run: rustup target add ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install cross linker
         if: matrix.linker
@@ -224,7 +225,7 @@ jobs:
           codesign --verify --strict --verbose=2 "$staged"
           codesign --display --verbose=2 "$staged" 2>&1 | grep -E '^(Authority|TeamIdentifier|Timestamp)='
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: ${{ matrix.name }}
           path: dist/*
@@ -251,7 +252,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
@@ -303,7 +304,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           path: dist
           merge-multiple: true
@@ -342,14 +343,14 @@ jobs:
       # workflow run produced it. Verify a download with
       #   gh attestation verify <file> --repo <owner>/<repo>
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:
           subject-path: dist/*
 
       # A draft: published by hand once its files have been tried. A manual
       # run reuses the tag's draft and replaces its files.
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ env.TAG }}
           draft: true

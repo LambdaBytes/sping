@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::context::NetworkContext;
+use crate::context::{ContextChange, NetworkContext};
 use crate::probe::quality::{QualityGrade, Trend};
 
 /// Result of a single probe.
@@ -93,6 +93,26 @@ impl std::fmt::Display for TcpState {
             TcpState::Error => "error",
         })
     }
+}
+
+/// The last re-resolution of the target's name (names only; every 60 s).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameState {
+    /// The answer had an address of the probed family.
+    Answered,
+    /// The answer had no address of the probed family (a resolver may leave
+    /// one out: not proof that the name has none).
+    NoAddressOfFamily,
+    /// The lookup failed: no answer within the timeout, or an error.
+    Failed { timed_out: bool },
+}
+
+/// The last change of the network context, while recent (`context_changed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentChange {
+    pub changes: Vec<ContextChange>,
+    /// Since it was applied.
+    pub age: Duration,
 }
 
 /// Entry in the pulse ring buffer.
@@ -199,6 +219,16 @@ pub struct ProbeSnapshot {
     /// error is not mistaken for a lost reply; not serialized.
     #[serde(skip)]
     pub last_error: Option<String>,
+    /// The last re-resolution of the target's name, while it is current
+    /// (none yet, a literal target, or cleared by a context change: `None`).
+    /// Internal correlator input; not serialized.
+    #[serde(skip)]
+    pub name: Option<NameState>,
+    /// The last change of the network context in the last 30 s, single
+    /// target only, never with `-I`/`-S`. Internal correlator input; not
+    /// serialized.
+    #[serde(skip)]
+    pub context_change: Option<RecentChange>,
     /// TCP mode only (added in 1.6.0; absent from ICMP lines): `"tcp"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probe: Option<&'static str>,
@@ -251,6 +281,8 @@ impl ProbeSnapshot {
             recent_loss_pct: 0.0,
             high_jitter: false,
             last_error: None,
+            name: None,
+            context_change: None,
             probe: None,
             port: None,
             refused: None,

@@ -25,6 +25,11 @@ Two things always need `CAP_NET_RAW`:
 - the raw-socket fallback itself, and
 - binding to an interface with `-I`/`--interface` (`SO_BINDTODEVICE`, Linux).
 
+The traceroute of `--diagnose` opens its own ICMP socket the same way,
+datagram first and raw only if that is denied, and reads the routers' ICMP
+errors from it (on Linux from its error queue, `IP_RECVERR`); it needs nothing
+more. On macOS it covers IPv4 targets.
+
 Preferred way to grant just that capability, without setuid or running as root:
 
 ```sh

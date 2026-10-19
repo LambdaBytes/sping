@@ -3,7 +3,11 @@ name: Nixpkgs package validation
 # Builds the nixpkgs recipe for the version just tagged, from the published
 # tag, and prints the two hashes the recipe needs for that version. It only
 # validates and reports; the version bump in nixpkgs itself is a pull request
-# there. Run by hand, it validates the version in VERSION.
+# there. Run by hand, it validates the version in VERSION. It builds on Linux
+# and on macOS with the sandbox nixpkgs' builders and nixpkgs-review use
+# (Darwin's `relaxed`), so a test the sandbox breaks fails here first; the
+# recipe below is the one in nixpkgs (without `meta.maintainers`): keep them
+# the same.
 
 on:
   push:
@@ -19,9 +23,15 @@ env:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, sandbox: 'true' }
+          - { os: macos-latest, sandbox: relaxed }
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Read the version
         id: version
@@ -43,9 +53,11 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - uses: cachix/install-nix-action@v31
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
         with:
           nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ env.NIXPKGS_REV }}.tar.gz
+          extra_nix_config: |
+            sandbox = ${{ matrix.sandbox }}
 
       - name: Build the package and resolve its hashes
         env:
@@ -58,9 +70,11 @@ jobs:
           cat > "$recipe" <<EOF
           {
             lib,
+            stdenv,
             rustPlatform,
             fetchFromGitHub,
             installShellFiles,
+            darwin,
           }:
 
           rustPlatform.buildRustPackage (finalAttrs: {
@@ -68,6 +82,8 @@ jobs:
             version = "$VERSION";
 
             __structuredAttrs = true;
+            # The tests connect to TCP listeners on the loopback address.
+            __darwinAllowLocalNetworking = true;
 
             src = fetchFromGitHub {
               owner = "${GITHUB_REPOSITORY_OWNER}";
@@ -80,8 +96,14 @@ jobs:
 
             nativeBuildInputs = [ installShellFiles ];
 
-            # build.rs writes the man page and completions here (OUT_DIR
-            # otherwise).
+            # The Darwin build sandbox does not let /sbin/ifconfig run, and a test
+            # lists the interfaces with it: use the one from nixpkgs.
+            postPatch = lib.optionalString stdenv.hostPlatform.isDarwin ''
+              substituteInPlace src/context/iface.rs --replace-fail /sbin/ifconfig \${lib.getExe' darwin.network_cmds "ifconfig"}
+            '';
+
+            # build.rs writes the man page and the shell completions to
+            # SPING_ASSETS_DIR, an absolute path (\$OUT_DIR/assets otherwise).
             preBuild = ''
               export SPING_ASSETS_DIR="\$PWD/target/assets"
             '';
@@ -96,7 +118,7 @@ jobs:
             meta = {
               description = "Terminal-native real-time connectivity monitor with network context diagnostics";
               homepage = "https://github.com/${GITHUB_REPOSITORY}";
-              changelog = "https://github.com/${GITHUB_REPOSITORY}/releases/tag/v\${finalAttrs.version}";
+              changelog = "https://github.com/${GITHUB_REPOSITORY}/releases/tag/\${finalAttrs.src.tag}";
               license = lib.licenses.mit;
               mainProgram = "sping";
               platforms = lib.platforms.linux ++ lib.platforms.darwin;
@@ -127,7 +149,9 @@ jobs:
             echo "::error::Could not resolve the source hash."
             exit 1
           fi
-          sed -i "0,/hash = lib.fakeHash;/s||hash = \"$src_hash\";|" "$recipe"
+          # perl, not GNU sed: the macOS runner has BSD sed. The whole file at
+          # once (-0777), so only the first match is replaced.
+          H="$src_hash" perl -0777 -pi -e 's/hash = lib\.fakeHash;/hash = "$ENV{H}";/' "$recipe"
 
           cargo_hash="$(resolve_hash "$work/cargo-hash.log")" || true
           if [[ "$cargo_hash" != sha256-* ]]; then
@@ -135,7 +159,7 @@ jobs:
             echo "::error::Could not resolve cargoHash."
             exit 1
           fi
-          sed -i "0,/cargoHash = lib.fakeHash;/s||cargoHash = \"$cargo_hash\";|" "$recipe"
+          H="$cargo_hash" perl -0777 -pi -e 's/cargoHash = lib\.fakeHash;/cargoHash = "$ENV{H}";/' "$recipe"
 
           # The hashes are reported only for a recipe that really builds and
           # installs what it should.
@@ -148,7 +172,7 @@ jobs:
           test -f result/share/fish/vendor_completions.d/sping.fish
 
           {
-            echo "### nixpkgs recipe for sping $VERSION"
+            echo "### nixpkgs recipe for sping $VERSION ($RUNNER_OS, sandbox ${{ matrix.sandbox }})"
             echo
             echo "| Attribute | Value |"
             echo "|-----------|-------|"

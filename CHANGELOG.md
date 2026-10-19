@@ -1,5 +1,105 @@
 # Changelog
 
+## v1.7.0
+
+### Added
+- `--diagnose` (experimental, one target). When the target stops answering
+  (three probes lost in a row, or a run that gets no answer at all, even
+  with `-c 1`), sping probes further and says what it observed, nothing
+  more. It uses sockets of its own, never counted in the target's
+  statistics, and checks:
+  - the source address the system has for the target;
+  - the same name's address in the other family: three echoes, or with
+    `--tcp PORT` one connect to that port;
+  - TCP 443 and 80 on the target (not with `--tcp`, whose port the probe
+    already tries);
+  - a bounded traceroute: 30 hops, 3 probes each, 20 s at most, stopping
+    after 3 silent hops.
+
+  The views show `diagnosing…` and then the conclusions on the Events line
+  (`silent after hop 3 (203.0.113.1)`, `TCP 443 answers`, `IPv6 works`). The
+  extended view adds an `Untested` line with what could not be told and why,
+  the classic view prints `---` lines, and JSON lines gain
+  `active_diagnosis`.
+  - Traffic is bounded: at most 100 extra probes in any 60 s, three
+    operations at once, the traceroute alone.
+  - An address given, `-4`/`-6` or `-S` keep the other family out. `-W`,
+    `-s`, `-I` and `-S` apply to the extra probes; `-t` does not.
+  - With `-c N` the last line waits for the diagnosis, at most what is left
+    of its budget; otherwise it says `incomplete`.
+  - The traceroute runs on Linux, unprivileged where unprivileged ICMP is
+    allowed and otherwise with `CAP_NET_RAW`; on macOS, unprivileged, for
+    IPv4 targets (an IPv6 target gets `trace unavailable on this system`);
+    and on Windows.
+
+  Without the flag nothing changes.
+- The target's name as evidence, from the lookup sping repeats every 60 s
+  while monitoring:
+  - `last name lookup failed` (`(timeout)` after 5 s without an answer),
+    while the WAN reference answers;
+  - `last name lookup gave no IPv6 address` (or IPv4) for the family
+    probed.
+
+  sping keeps probing the address it had. JSON codes `name_lookup_failed`
+  and `lookup_without_family`. A DNS outage is not claimed: a resolver may
+  leave out a family the host cannot reach.
+- A change of the network context while monitoring one target, from the
+  detection repeated every 15 s:
+  `context changed 00:03 ago: interface eth0 → wlan0 · gateway 192.168.1.1 → 10.0.0.1`.
+  It covers the interface, source, prefix, IPv4 default gateway and target
+  class, and is shown for 30 s. Never with `-I` or `-S`, where the detected
+  context is the system's route rather than the probe's. JSON code
+  `context_changed`, each change named and valued as in `net_ctx`.
+
+### Fixes
+- macOS: an IPv4 probe takes as its reply only an echo reply that carries its
+  own identifier, as IPv6 already did. A macOS ICMP socket receives every
+  echo reply of the host, and one to another ping of the same target (or to
+  the traceroute of `--diagnose`) with the same sequence number could pass as
+  the probe's.
+- An IPv6 target routed through an interface without an IPv6 address (a
+  tunnel with `::/0`, for example) read `Init: if lo · ::1/128`, and JSON
+  `net_ctx` `"interface": "lo"`, `"local_ip": "::1"`. It now reads
+  `no IPv6 source`, and `net_ctx` says the detection failed (`"unknown"`,
+  `"0.0.0.0"`, `0`). The same holds for an IPv4 target routed through an
+  interface without an IPv4 address.
+- `--view table` with one target: Ctrl+C and `q` did nothing, so sping could
+  only be stopped from outside (closing the terminal, `kill`). With one
+  target the table is the compact view, as it already looked: Ctrl+C and `q`
+  quit, and with stdout not a terminal it falls back to the classic view, as
+  compact does.
+- Several targets with stdout not a terminal (a file, a pipe, cron): the live
+  table went into it as escape sequences, under a note that said
+  `falling back to classic view`, and with no terminal to read keys from a
+  thread kept a CPU core busy until sping stopped. Now nothing is drawn: each
+  target's summary is printed at the end (`-c N`, or Ctrl+C / SIGTERM), with
+  the same exit code. A live view that cannot read a terminal no longer
+  keeps a core busy either.
+- Several targets with `--view extended`, `classic` or `json`: the view was
+  ignored and the table drawn. It is now refused (exit 2); `--batch FILE`
+  prints each host's summary or JSON.
+- `--view` takes only its five names: a misspelt one was taken as the compact
+  view. `-o FILE` needs `--batch`: without it the file was never written.
+  Both are usage errors now (exit 2).
+- macOS: `-I` was accepted and ignored without a word. It now warns, as on
+  Windows, that binding to an interface is not supported there (`-S` binds
+  the source address).
+
+### Packaging
+- nixpkgs package validation builds the recipe on Linux and on macOS, each
+  with the build sandbox nixpkgs' builders use, so a test the sandbox breaks
+  fails at the release tag.
+- Scoop: `scoop bucket add lambdabytes https://github.com/LambdaBytes/scoop-bucket`,
+  then `scoop install lambdabytes/sping`, installs the release's Windows
+  binary. A published release goes to the bucket on its own.
+- WinGet: the manifests of `LambdaBytes.Sping` are made ready from each
+  published release; the package is under review at winget-pkgs.
+- The Arch recipe (`packaging/arch/PKGBUILD`) is now `lambdabytes-sping`: the
+  AUR's `sping` is another program. The command is still `sping`.
+- The GitHub workflows run every action at a fixed commit instead of a tag
+  that can be moved, and the minimum Rust (1.88) builds and passes the tests
+  before each release.
+
 ## v1.6.0
 
 ### Added
@@ -81,7 +181,7 @@
 ### Fixes
 - The interface of a loopback target: `if lo · 127.0.0.1/8` (`lo0` on macOS,
   the loopback adapter on Windows) instead of the default route's interface
-  with `/0` — on Windows its address (`if 192.168.6.233 · 127.0.0.1/0`).
+  with `/0` — on Windows its address (`if 192.0.2.10 · 127.0.0.1/0`).
   JSON `net_ctx` gets the same `interface` and `prefix_len`.
 - Without a source address no interface is looked up: JSON `net_ctx` has
   `"interface": "unknown"` and `"prefix_len": 0`, as documented, instead of

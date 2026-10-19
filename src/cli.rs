@@ -58,8 +58,12 @@ pub struct Args {
     #[arg(short = '6')]
     pub ipv6: bool,
 
-    /// Output view: compact, extended, classic, json, table
-    #[arg(short, long, default_value = "compact")]
+    /// Experimental: when the target stops answering, find out why (the other address family, TCP 443 and 80, a bounded traceroute) and show what was found. One target only
+    #[arg(long)]
+    pub diagnose: bool,
+
+    /// Output view; several targets are shown as the table
+    #[arg(short, long, default_value = "compact", value_parser = ["compact", "extended", "classic", "json", "table"])]
     pub view: String,
 
     /// Batch mode: read targets from file (one per line)
@@ -67,7 +71,7 @@ pub struct Args {
     pub batch: Option<String>,
 
     /// Output file (batch mode, default: stdout)
-    #[arg(short, long)]
+    #[arg(short, long, requires = "batch")]
     pub output: Option<String>,
 
     /// WAN reference probe for diagnostics

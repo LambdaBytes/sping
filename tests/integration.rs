@@ -187,6 +187,34 @@ fn test_dns_resolution_failure() {
     );
 }
 
+/// A misspelt view is a usage error; it was taken as the compact view.
+#[test]
+fn test_unknown_view_is_refused() {
+    let output = sping_cmd()
+        .args(["127.0.0.1", "-c", "1", "--view", "jsno"])
+        .output()
+        .expect("failed to run");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid value 'jsno'"), "{stderr}");
+}
+
+/// `-o` writes batch mode's output; without `--batch` it was ignored, with
+/// exit 0 and no file.
+#[test]
+fn test_output_file_needs_batch() {
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("o-without-batch.txt");
+    let _ = std::fs::remove_file(&path);
+    let output = sping_cmd()
+        .args(["127.0.0.1", "-c", "1", "-o", path.to_str().unwrap()])
+        .output()
+        .expect("failed to run");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--batch"), "{stderr}");
+    assert!(!path.exists());
+}
+
 // === TTY auto-detection ===
 
 #[test]
@@ -483,6 +511,246 @@ fn test_multi_target_dedup() {
         !stderr.contains("panic"),
         "Multi-target with dupes should not panic"
     );
+}
+
+/// Several targets are the live table, which needs a terminal. With stdout a
+/// pipe there is no table (its escape sequences went into the pipe, and the
+/// note said "falling back to classic"), only each target's summary; a view
+/// the table is not is refused (it was ignored).
+#[test]
+fn test_several_targets_piped_print_only_their_summaries() {
+    let piped = sping_timed(10)
+        .args(["127.0.0.1", "127.0.0.2", "-c", "1", "-i", "200", "-W", "1"])
+        .output()
+        .expect("failed to run");
+    assert!(!piped.timed_out);
+    let stdout = String::from_utf8_lossy(&piped.stdout);
+    let stderr = String::from_utf8_lossy(&piped.stderr);
+    assert!(!stdout.contains('\x1b'), "{stdout:?}");
+    for host in ["127.0.0.1", "127.0.0.2"] {
+        assert!(
+            stdout.contains(&format!("--- {host} ({host}) sping statistics ---")),
+            "{stdout}"
+        );
+    }
+    assert!(stderr.contains("no live table"), "{stderr}");
+    assert!(!stderr.contains("falling back to classic"), "{stderr}");
+
+    let json = sping_timed(5)
+        .args([
+            "127.0.0.1",
+            "127.0.0.2",
+            "-c",
+            "1",
+            "-i",
+            "200",
+            "--view",
+            "json",
+        ])
+        .output()
+        .expect("failed to run");
+    assert_eq!(json.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&json.stderr);
+    assert!(
+        stderr.contains("--view json works with one target"),
+        "{stderr}"
+    );
+}
+
+// === Keys and terminals (a pseudo-terminal: Unix) ===
+
+/// A pseudo-terminal: sping on the slave side sees a terminal, as in a
+/// terminal window; the test reads the screen and types on the master side.
+#[cfg(unix)]
+fn open_pty() -> (std::fs::File, std::fs::File) {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::OpenOptionsExt;
+    // `ptsname` returns a static buffer: one caller at a time.
+    static PTSNAME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // SAFETY: `posix_openpt` returns a new descriptor (checked), owned by
+    // the `File` from here on.
+    let master = unsafe {
+        let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(fd >= 0, "posix_openpt: {}", std::io::Error::last_os_error());
+        std::fs::File::from_raw_fd(fd)
+    };
+    let fd = master.as_raw_fd();
+    let os_error = std::io::Error::last_os_error;
+    // SAFETY: `fd` is the open master.
+    unsafe {
+        assert_eq!(libc::grantpt(fd), 0, "grantpt: {}", os_error());
+        assert_eq!(libc::unlockpt(fd), 0, "unlockpt: {}", os_error());
+    }
+    let name = {
+        let _one = PTSNAME.lock().unwrap();
+        // SAFETY: `fd` is an unlocked master; the static buffer is copied
+        // before the lock is released.
+        unsafe {
+            let ptr = libc::ptsname(fd);
+            assert!(!ptr.is_null(), "ptsname");
+            std::ffi::CStr::from_ptr(ptr).to_str().unwrap().to_owned()
+        }
+    };
+    let slave = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(name)
+        .unwrap();
+    // 80 x 24, room for every view. Set on the slave, as openpty(3) does:
+    // macOS refuses it on the master (-1, seen in CI).
+    let size = libc::winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: the slave is open; `size` outlives the call.
+    let set = unsafe {
+        libc::ioctl(
+            slave.as_raw_fd(),
+            libc::TIOCSWINSZ,
+            &size as *const libc::winsize,
+        )
+    };
+    assert_eq!(set, 0, "TIOCSWINSZ: {}", os_error());
+    (master, slave)
+}
+
+/// sping with stdout (and stdin, if `keys`) on the pty's `slave`, in a
+/// session of its own, so it never reaches the test runner's terminal
+/// through /dev/tty.
+#[cfg(unix)]
+fn sping_on_pty(slave: &std::fs::File, keys: bool, args: &[&str]) -> Child {
+    use std::os::unix::process::CommandExt;
+    let stdin = if keys {
+        Stdio::from(slave.try_clone().unwrap())
+    } else {
+        Stdio::null()
+    };
+    let mut cmd = sping_cmd();
+    cmd.args(args)
+        .stdin(stdin)
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::null());
+    // SAFETY: `setsid` is async-signal-safe, as a `pre_exec` hook must be.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn().expect("failed to run")
+}
+
+/// What sping draws on the pty, read until its slave side closes.
+#[cfg(unix)]
+fn screen(master: &std::fs::File) -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+    let mut master = master.try_clone().unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&seen);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        // An error (EIO) or 0 once no slave descriptor is open.
+        while let Ok(n @ 1..) = master.read(&mut buf) {
+            sink.lock().unwrap().extend_from_slice(&buf[..n]);
+        }
+    });
+    seen
+}
+
+#[cfg(unix)]
+fn wait_until(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    done()
+}
+
+/// Ctrl+C and `q` quit every live view: compact, extended, `--view table`
+/// with one target (it drew in raw mode with no key listener: neither key
+/// did anything) and the table of several targets.
+#[cfg(unix)]
+#[test]
+fn test_keys_quit_the_live_views() {
+    use std::io::Write;
+    let views: [&[&str]; 4] = [
+        &["127.0.0.1"],
+        &["127.0.0.1", "--view", "extended"],
+        &["127.0.0.1", "--view", "table"],
+        &["127.0.0.1", "127.0.0.2"],
+    ];
+    for view in views {
+        for key in ["\x03", "q"] {
+            let (master, slave) = open_pty();
+            let mut child = sping_on_pty(&slave, true, &[view, &["-i", "200"][..]].concat());
+            drop(slave);
+            let seen = screen(&master);
+            // The first frame is drawn in raw mode, with the key listener
+            // already started: from then on a key is read as a key.
+            let drawn = wait_until(Duration::from_secs(10), || !seen.lock().unwrap().is_empty());
+            (&master).write_all(key.as_bytes()).unwrap();
+            let quit = drawn
+                && wait_until(Duration::from_secs(5), || {
+                    matches!(child.try_wait(), Ok(Some(_)))
+                });
+            if !quit {
+                terminate(&mut child).unwrap();
+                child.wait().unwrap();
+            }
+            assert!(drawn, "{view:?}: nothing drawn");
+            assert!(quit, "{view:?}: {key:?} did not quit");
+            // A normal exit (0, or 1 before every target answered), not a
+            // panic or a usage error.
+            let status = child.wait().unwrap();
+            assert!(matches!(status.code(), Some(0 | 1)), "{view:?}: {status}");
+        }
+    }
+}
+
+/// A live view with no terminal to read keys from (stdin is not one and
+/// there is no controlling terminal: cron, systemd, nohup) costs no CPU. The
+/// key listener's polls failed at once, and it spun a core.
+#[cfg(unix)]
+#[test]
+fn test_no_terminal_for_keys_does_not_spin() {
+    let (master, slave) = open_pty();
+    let mut child = sping_on_pty(&slave, false, &["127.0.0.1", "-i", "200"]);
+    drop(slave);
+    let seen = screen(&master);
+    // The live view runs (a sping that stopped at once would cost no CPU
+    // either): it drew, and it is still running when measured.
+    let drawn = wait_until(Duration::from_secs(10), || !seen.lock().unwrap().is_empty());
+    std::thread::sleep(Duration::from_secs(2));
+    let running = matches!(child.try_wait(), Ok(None));
+    terminate(&mut child).unwrap();
+    let pid = child.id() as libc::pid_t;
+    let mut status = 0;
+    // SAFETY: an all-zero `rusage` is a valid value for `wait4` to fill.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `pid` is this test's child, not reaped yet; `status` and
+    // `usage` are live for the call.
+    let reaped = unsafe { libc::wait4(pid, &mut status, 0, &mut usage) };
+    assert_eq!(reaped, pid, "wait4: {}", std::io::Error::last_os_error());
+    assert!(drawn, "nothing drawn");
+    assert!(running, "sping stopped before the measurement");
+    // SIGTERM is a clean shutdown: a normal exit.
+    assert!(libc::WIFEXITED(status), "wait status {status:#x}");
+    assert!(
+        matches!(libc::WEXITSTATUS(status), 0 | 1),
+        "exit {}",
+        libc::WEXITSTATUS(status)
+    );
+    let seconds = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    let cpu = seconds(usage.ru_utime) + seconds(usage.ru_stime);
+    assert!(cpu < 1.0, "{cpu:.2} s of CPU in 2 s");
 }
 
 // === TCP connect (`--tcp`): needs no ICMP permission, so nothing is skipped ===
@@ -816,4 +1084,384 @@ fn test_tcp_batch_needs_every_answer() {
     assert_eq!(lines[1]["tcp_state"], "timeout");
     assert_eq!(lines[1]["received"], 0);
     assert!(lines.iter().all(|l| l["probe"] == "tcp"), "{stdout}");
+}
+
+// === --diagnose ===
+
+#[test]
+fn test_diagnose_needs_one_target() {
+    let hosts = batch_file("diagnose-batch.txt", "127.0.0.1\n");
+    for args in [
+        vec!["127.0.0.1", "127.0.0.2", "--diagnose"],
+        vec!["--batch", &hosts, "--diagnose"],
+    ] {
+        let output = sping_cmd().args(&args).output().expect("failed to run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("--diagnose works with one target"),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_help_lists_diagnose() {
+    let output = sping_cmd().arg("--help").output().expect("failed to run");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--diagnose"));
+}
+
+/// Nothing goes down: the lines are those of a run without the flag.
+#[test]
+fn test_diagnose_says_nothing_while_the_target_answers() {
+    let (code, lines, stderr) =
+        json_lines(&["127.0.0.1", "--diagnose", "-c", "3", "-i", "200"], 10);
+    if lines.is_empty() && stderr.contains("failed to create ICMP socket") {
+        eprintln!("no ICMP permission here: not run");
+        return;
+    }
+    // A build sandbox may open the socket and still drop the probes (Nix on
+    // Darwin): a whole run with no answer (exit 1, one line per probe) means
+    // 127.0.0.1 is down for sping, and this test's premise does not hold.
+    // Anything else goes to the checks below.
+    if code == Some(1)
+        && lines.len() == 3
+        && lines
+            .iter()
+            .all(|l| l["received"] == 0 && l.get("seq").is_some())
+    {
+        eprintln!("127.0.0.1 does not answer here: not run");
+        return;
+    }
+    assert_eq!(code, Some(0));
+    assert_eq!(lines.len(), 3);
+    for line in &lines {
+        assert!(line.get("active_diagnosis").is_none(), "{line}");
+        assert!(line.get("target_ip").is_some() && line.get("seq").is_some());
+    }
+}
+
+/// `sping ARGS --view json` under the watchdog: its exit code, its lines and
+/// what it wrote on stderr.
+fn json_lines(args: &[&str], secs: u64) -> (Option<i32>, Vec<serde_json::Value>, String) {
+    let mut timed = sping_timed(secs);
+    timed.cmd.args(args).args(["--view", "json"]);
+    let output = timed.output().expect("failed to run");
+    assert!(
+        !output.timed_out,
+        "sping {args:?} did not finish in {secs} s"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("invalid JSON '{l}': {e}")))
+        .collect();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    (output.status.code(), lines, stderr)
+}
+
+/// Run sping and send it SIGTERM after `after`: how long it took to exit
+/// once signalled, and what it wrote.
+#[cfg(target_os = "linux")]
+fn stopped_after(args: &[&str], after: Duration) -> (Duration, String) {
+    let mut child = sping_cmd()
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to run");
+    let stdout = drain(child.stdout.take());
+    let _stderr = drain(child.stderr.take());
+    std::thread::sleep(after);
+    let signalled = Instant::now();
+    terminate(&mut child).expect("cannot signal sping");
+    while child.try_wait().expect("cannot wait for sping").is_none() {
+        if signalled.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            panic!("sping {args:?} still running 10 s after SIGTERM");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let took = signalled.elapsed();
+    let stdout = String::from_utf8(stdout.join().expect("stdout reader panicked")).unwrap();
+    (took, stdout)
+}
+
+/// `--diagnose` against a real path, by case: run by
+/// `scripts/diagnose-bench.sh` inside its namespaces (client -> R1 -> R2 ->
+/// target, `dual.test` in its hosts file).
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "run by scripts/diagnose-bench.sh inside its network namespaces"]
+fn diagnose_bench() {
+    use serde_json::json;
+
+    let case = std::env::var("SPING_DIAG_CASE").expect("SPING_DIAG_CASE is not set");
+    // The last line's diagnosis, once every line was checked: one per
+    // probe, none counting an answer, the last one concluded.
+    let diagnosed = |args: &[&str]| -> serde_json::Value {
+        let mut all = args.to_vec();
+        all.extend(["--diagnose", "-c", "3", "-i", "200", "-W", "1"]);
+        let (code, lines, _) = json_lines(&all, 90);
+        assert_eq!(lines.len(), 3, "{args:?}: {lines:?}");
+        assert!(
+            lines.iter().all(|l| l["received"] == 0),
+            "{args:?}: {lines:?}"
+        );
+        assert_eq!(code, Some(1), "{args:?}");
+        let last = lines[2]["active_diagnosis"].clone();
+        assert_eq!(last["state"], "done", "{args:?}: {last}");
+        last
+    };
+    // R2 drops the target before it looks at the TTL: R1 is the last hop
+    // that answers.
+    let silent_after_r1 = |r1: &str| json!({"code": "silent_after", "last_hop": {"ttl": 1, "from": [r1]}, "silent": 3});
+    let ipv6_works =
+        json!({"code": "other_family_works", "family": "ipv6", "address": "fd00:3::2"});
+    let literal = json!({"about": "other_family", "reason": "literal"});
+
+    match case.as_str() {
+        "silent-tail" => {
+            for (target, r1) in [("10.0.3.2", "10.0.1.1"), ("fd00:3::2", "fd00:1::1")] {
+                let d = diagnosed(&[target]);
+                assert_eq!(d["conclusions"], json!([silent_after_r1(r1)]), "{d}");
+                assert_eq!(d["gaps"], json!([literal]), "{d}");
+                assert_eq!(d["target"], target);
+            }
+        }
+        "prohibited" => {
+            for (target, r2) in [("10.0.3.2", "10.0.2.2"), ("fd00:3::2", "fd00:2::2")] {
+                let d = diagnosed(&[target]);
+                let refused = json!({"code": "reported_unreachable", "ttl": 2, "from": r2, "kind": "admin_prohibited"});
+                assert_eq!(d["conclusions"], json!([refused]), "{d}");
+            }
+        }
+        "icmp-ignored" => {
+            for target in ["10.0.3.2", "fd00:3::2"] {
+                let d = diagnosed(&[target]);
+                let refused = json!({"code": "answers_tcp", "port": 443, "refused": true});
+                assert_eq!(d["conclusions"], json!([refused]), "{d}");
+                assert_eq!(d["gaps"], json!([literal]), "{d}");
+            }
+        }
+        "v4-broken" => {
+            let d = diagnosed(&["dual.test"]);
+            assert_eq!(
+                d["conclusions"],
+                json!([silent_after_r1("10.0.1.1"), ipv6_works]),
+                "{d}"
+            );
+            assert_eq!(d["gaps"], json!([]), "{d}");
+        }
+        "v6-only-host" => {
+            let d = diagnosed(&["dual.test"]);
+            let no_v4 = json!({"code": "no_source", "family": "ipv4"});
+            assert_eq!(d["conclusions"], json!([no_v4, ipv6_works]), "{d}");
+        }
+        "explicit" => {
+            let d = diagnosed(&["dual.test", "-4"]);
+            assert_eq!(
+                d["conclusions"],
+                json!([silent_after_r1("10.0.1.1")]),
+                "{d}"
+            );
+            assert_eq!(
+                d["gaps"],
+                json!([{"about": "other_family", "reason": "explicit_family"}]),
+                "{d}"
+            );
+
+            let d = diagnosed(&["dual.test", "-S", "10.0.1.2"]);
+            assert_eq!(
+                d["conclusions"],
+                json!([silent_after_r1("10.0.1.1")]),
+                "{d}"
+            );
+            assert_eq!(
+                d["gaps"],
+                json!([
+                    {"about": "other_family", "reason": "explicit_source"},
+                    {"about": "main", "reason": "unknown", "detail": "source check unavailable with -S/-I"},
+                ]),
+                "{d}"
+            );
+
+            // TCP main probe: the other family on that port only (refused:
+            // nothing listens), and the trace all the same.
+            let d = diagnosed(&["dual.test", "--tcp", "443"]);
+            assert_eq!(
+                d["conclusions"],
+                json!([silent_after_r1("10.0.1.1"), ipv6_works]),
+                "{d}"
+            );
+        }
+        "coexist" => {
+            for target in ["10.0.3.2", "fd00:3::2"] {
+                let d = diagnosed(&[target, "-t", "1"]);
+                assert_eq!(
+                    d["conclusions"],
+                    json!([{"code": "target_answers_icmp", "ttl": 3}]),
+                    "{d}"
+                );
+            }
+        }
+        "stop" => {
+            // In the wait after `-c 3`, during the trace: the held last line
+            // says it did not conclude.
+            let (took, out) = stopped_after(
+                &[
+                    "10.0.3.2",
+                    "--diagnose",
+                    "-c",
+                    "3",
+                    "-i",
+                    "200",
+                    "-W",
+                    "2",
+                    "--view",
+                    "json",
+                ],
+                Duration::from_secs(9),
+            );
+            assert!(took < Duration::from_secs(3), "{took:?}");
+            let lines: Vec<serde_json::Value> = out
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            assert_eq!(lines.len(), 3, "{out}");
+            assert_eq!(lines[2]["active_diagnosis"]["state"], "incomplete", "{out}");
+
+            // No count, classic, during the trace.
+            let (took, out) = stopped_after(
+                &[
+                    "10.0.3.2",
+                    "--diagnose",
+                    "-i",
+                    "200",
+                    "-W",
+                    "1",
+                    "--view",
+                    "classic",
+                ],
+                Duration::from_secs(5),
+            );
+            assert!(took < Duration::from_secs(2), "{took:?}");
+            assert!(
+                out.contains("--- diagnosing why 10.0.3.2 does not answer"),
+                "{out}"
+            );
+            assert!(out.trim_end().ends_with("diagnosis incomplete"), "{out}");
+        }
+        "context" => context_bench(),
+        other => panic!("unknown case {other}"),
+    }
+}
+
+/// The `context` case of `diagnose_bench`: the default route changes during
+/// a run (`scripts/diagnose-bench.sh` adds 10.0.1.3 to the client and
+/// 10.0.1.254 to R1). The context is re-detected every 15 s: runs of 22
+/// probes, one a second, the route changed 3 s in.
+#[cfg(target_os = "linux")]
+fn context_bench() {
+    use serde_json::{Value, json};
+
+    let run = |args: &[&str]| {
+        let mut all: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        all.extend(["-c", "22", "-i", "1000", "-W", "1"].map(String::from));
+        std::thread::spawn(move || {
+            let args: Vec<&str> = all.iter().map(String::as_str).collect();
+            let (code, lines, stderr) = json_lines(&args, 60);
+            assert_eq!(code, Some(0), "{args:?}: {stderr}");
+            (args.join(" "), lines)
+        })
+    };
+    let route = |args: &[&str]| {
+        let status = Command::new("ip")
+            .args(["route", "replace", "default"])
+            .args(args)
+            .status()
+            .expect("cannot run ip");
+        assert!(status.success(), "ip route replace default {args:?}");
+    };
+    let change_of = |line: &Value| -> Option<Value> {
+        line["diagnosis"]
+            .as_array()?
+            .iter()
+            .find(|f| f["code"] == "context_changed")
+            .cloned()
+    };
+    // No line says the context changed.
+    let none = |(args, lines): (String, Vec<Value>)| {
+        assert_eq!(lines.len(), 22, "{args}: {lines:?}");
+        assert!(
+            lines.iter().all(|l| change_of(l).is_none()),
+            "{args}: {lines:?}"
+        );
+        lines
+    };
+    // From the re-detection on, every line says it, older each time; the
+    // context of the lines changes with it.
+    let changed = |(args, lines): (String, Vec<Value>), changes: Value, ctx: (&str, &str)| {
+        assert_eq!(lines.len(), 22, "{args}: {lines:?}");
+        let first = lines
+            .iter()
+            .position(|l| change_of(l).is_some())
+            .unwrap_or_else(|| panic!("{args}: no context_changed in {lines:?}"));
+        assert!((12..=18).contains(&first), "{args}: first at {first}");
+        let mut age = 0;
+        for (i, line) in lines.iter().enumerate() {
+            let (field, value) = ctx;
+            if i < first {
+                assert!(change_of(line).is_none(), "{args}: {line}");
+                assert_ne!(line["net_ctx"][field], value, "{args}: {line}");
+                continue;
+            }
+            let change = change_of(line).unwrap_or_else(|| panic!("{args}: {line}"));
+            assert_eq!(change["changes"], changes, "{args}: {line}");
+            let now = change["age_s"].as_u64().unwrap();
+            assert!(now >= age && now < 30, "{args}: {line}");
+            if i == first {
+                assert!(now <= 1, "{args}: {line}");
+            }
+            age = now;
+            assert_eq!(line["net_ctx"][field], value, "{args}: {line}");
+        }
+    };
+
+    // No change: a re-detection that finds the same context says nothing.
+    none(run(&["10.0.3.2"]).join().unwrap());
+
+    // The default route's source changes. With -S or -I the context is the
+    // system's route, not the probe's: applied, never reported.
+    let runs = [
+        run(&["10.0.3.2"]),
+        run(&["10.0.3.2", "-S", "10.0.1.2"]),
+        run(&["10.0.3.2", "-I", "c0"]),
+    ];
+    std::thread::sleep(Duration::from_secs(3));
+    route(&["via", "10.0.1.1", "src", "10.0.1.3"]);
+    let [plain, source, interface] = runs.map(|r| r.join().unwrap());
+    route(&["via", "10.0.1.1"]);
+    changed(
+        plain,
+        json!([{"what": "local_ip", "from": "10.0.1.2", "to": "10.0.1.3"}]),
+        ("local_ip", "10.0.1.3"),
+    );
+    for bound in [source, interface] {
+        let lines = none(bound);
+        assert_eq!(lines[21]["net_ctx"]["local_ip"], "10.0.1.3", "{lines:?}");
+    }
+
+    // The default gateway changes.
+    let plain = run(&["10.0.3.2"]);
+    std::thread::sleep(Duration::from_secs(3));
+    route(&["via", "10.0.1.254"]);
+    let plain = plain.join().unwrap();
+    route(&["via", "10.0.1.1"]);
+    changed(
+        plain,
+        json!([{"what": "gateway", "from": "10.0.1.1", "to": "10.0.1.254"}]),
+        ("gateway", "10.0.1.254"),
+    );
 }

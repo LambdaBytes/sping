@@ -11,10 +11,10 @@ use crate::config::{Config, ViewMode};
 use crate::context;
 use crate::context::dns;
 use crate::probe::types::ProbeSnapshot;
-use crate::probe::{auxiliary, batch, scheduler};
+use crate::probe::{auxiliary, batch, diagnose, scheduler};
 use crate::render::format::fmt_source;
 use crate::render::icons;
-use crate::render::terminal::{self, AuxChannels};
+use crate::render::terminal::{self, AuxChannels, DiagnoseView};
 use crate::runtime::bus::Bus;
 
 const AUX_PROBE_INTERVAL: Duration = Duration::from_secs(3);
@@ -154,8 +154,17 @@ pub async fn run(cfg: Config) -> anyhow::Result<i32> {
     // changes (WiFi → Ethernet, VPN up/down) to the scheduler and retargets
     // the GW auxiliary probe. The scheduler reports a DNS failover through
     // `target_tx`: the context is always that of the address being probed.
-    let (ctx_tx, ctx_rx) = watch::channel(net_ctx.clone());
+    let (ctx_tx, ctx_rx) = watch::channel(context::Detected {
+        target: target_addr,
+        context: net_ctx.clone(),
+    });
     let (target_tx, mut target_rx) = watch::channel(target_addr);
+    // `--diagnose`: the diagnosis follows the same address and context.
+    let diagnose_inputs = cfg.diagnose.then(|| diagnose::Inputs {
+        probe_rx: bus.subscribe_probe(),
+        target_rx: target_tx.subscribe(),
+        ctx_rx: ctx_tx.subscribe(),
+    });
     let gw_channel = net_ctx
         .gateway
         .as_deref()
@@ -186,9 +195,16 @@ pub async fn run(cfg: Config) -> anyhow::Result<i32> {
                 // detect() reads /proc or runs external tools — keep it
                 // off the async runtime.
                 let detected = tokio::task::spawn_blocking(move || context::detect(current)).await;
-                if let Ok(new_ctx) = detected
-                    && *ctx_tx.borrow() != new_ctx
+                // Sent with the address it was detected for: the scheduler
+                // takes it only for the address it probes then.
+                let new = detected.map(|context| context::Detected {
+                    target: current,
+                    context,
+                });
+                if let Ok(new) = new
+                    && *ctx_tx.borrow() != new
                 {
+                    let new_ctx = &new.context;
                     if let (Some(gw_tx), Some(gw_ip)) = (
                         &gw_target_tx,
                         new_ctx
@@ -198,7 +214,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<i32> {
                     ) {
                         let _ = gw_tx.send(gw_ip);
                     }
-                    let _ = ctx_tx.send(new_ctx);
+                    let _ = ctx_tx.send(new);
                 }
             }
         });
@@ -228,12 +244,39 @@ pub async fn run(cfg: Config) -> anyhow::Result<i32> {
         .await;
     });
 
+    // `--diagnose`: the planner runs next to the probe; its state goes to
+    // the views.
+    let (diagnose_state_tx, diagnose_state_rx) = watch::channel(diagnose::DiagnoseState::Idle);
+    let diagnosis = diagnose_inputs.map(|inputs| {
+        let extra = diagnose::Extra::from_config(&cfg);
+        let planner = crate::diagnostics::planner::Planner::new(extra.scope());
+        let budget = extra.budget();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(diagnose::run(
+            planner,
+            diagnose::Executor::new(extra),
+            inputs,
+            budget,
+            finished_rx,
+            bus.subscribe_shutdown(),
+            diagnose_state_tx,
+        ));
+        (finished_tx, handle)
+    });
+
     // When the scheduler finishes (count reached or socket error), shut down
-    // the renderer so the summary prints and the process exits.
+    // the renderer so the summary prints and the process exits. With
+    // `--diagnose`, the diagnosis in progress gets the rest of its budget
+    // first and publishes its last state: the renderer reads it after the
+    // shutdown.
     {
         let shutdown_tx = bus.shutdown_sender();
         tokio::spawn(async move {
             let _ = scheduler_handle.await;
+            if let Some((finished_tx, handle)) = diagnosis {
+                let _ = finished_tx.send(());
+                let _ = handle.await;
+            }
             let _ = shutdown_tx.send(true);
         });
     }
@@ -272,6 +315,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<i32> {
     let aux = AuxChannels {
         gateway_rx: bus.subscribe_gateway(),
         wan_rx: bus.subscribe_wan(),
+        diagnose: cfg.diagnose.then(|| DiagnoseView {
+            state_rx: diagnose_state_rx,
+            last_seq: cfg.count,
+        }),
     };
     let view = cfg.view;
     let quiet = cfg.quiet;
@@ -359,7 +406,12 @@ pub async fn run_multi(cfg: Config) -> anyhow::Result<i32> {
 
     let (shutdown_tx, _) = watch::channel(false);
 
-    terminal::start_key_listener(shutdown_tx.clone());
+    // The live table, or with stdout not a terminal (`Config::from_args`)
+    // only each target's summary at the end: no raw mode, no keys to read.
+    let live = cfg.view == ViewMode::Table;
+    if live {
+        terminal::start_key_listener(shutdown_tx.clone());
+    }
     spawn_signal_listener(shutdown_tx.clone());
 
     let mut probe_rxs: Vec<watch::Receiver<Option<ProbeSnapshot>>> = Vec::new();
@@ -412,7 +464,7 @@ pub async fn run_multi(cfg: Config) -> anyhow::Result<i32> {
 
     let shutdown_rx = shutdown_tx.subscribe();
     let renderer = tokio::spawn(async move {
-        terminal::run_table(probe_rxs, shutdown_rx).await;
+        terminal::run_table(probe_rxs, shutdown_rx, live).await;
     });
 
     let _ = renderer.await;
@@ -506,7 +558,7 @@ pub async fn run_batch(cfg: Config) -> anyhow::Result<i32> {
     if is_json {
         for snap in &results {
             // No gateway or WAN probe in batch: the target's diagnosis only.
-            match crate::render::view_json::line(snap, None, None) {
+            match crate::render::view_json::line(snap, None, None, None) {
                 Ok(json) => {
                     output.push_str(&json);
                     output.push('\n');

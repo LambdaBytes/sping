@@ -18,7 +18,7 @@ use crate::probe::types::{ProbeOptions, ProbeResult};
 
 /// Internet checksum (RFC 1071): one's-complement sum of 16-bit big-endian
 /// words, with an odd trailing byte padded on the right.
-fn checksum(data: &[u8]) -> u16 {
+pub(super) fn checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let mut i = 0;
     while i + 1 < data.len() {
@@ -72,9 +72,10 @@ fn build_echo_request_v6(seq: u16, identifier: u16, payload_size: usize) -> Vec<
 ///
 /// `expected_source` filters by source IP — critical on RAW sockets, which
 /// receive every ICMP packet on the host (multi-target cross-talk).
-/// `expected_id` is `Some(id)` for RAW sockets (the kernel preserves our
-/// identifier); for DGRAM pass `None`: Linux rewrites and demuxes it, and on
-/// macOS the sender check above tells the replies apart.
+/// `expected_id` is `Some(id)` where the socket also receives other sockets'
+/// replies with the identifier intact (RAW; macOS DGRAM), and then the
+/// checksum is checked too; for Linux DGRAM pass `None`: the kernel rewrites
+/// and demuxes it.
 fn parse_echo_reply_v4(
     data: &[u8],
     expected_seq: u16,
@@ -108,7 +109,8 @@ fn parse_echo_reply_v4(
         Some(id) => u16::from_be_bytes([icmp[4], icmp[5]]) == id,
         None => true,
     };
-    // RAW sockets bypass kernel checksum validation; reject corrupted replies.
+    // RAW sockets bypass kernel checksum validation; reject corrupted replies
+    // (on macOS too: a valid reply's checksum arrives intact, step 1b of 1.7).
     let checksum_ok = expected_id.is_none() || checksum(icmp) == 0;
     let matched = icmp[0] == 0
         && icmp[1] == 0
@@ -150,7 +152,12 @@ fn parse_echo_reply_v6(data: &[u8], expected_seq: u16, expected_id: Option<u16>)
 /// A link-local target is one host per zone: when both the target and the
 /// sender carry a zone index, they must agree. A sender reported without one
 /// is matched by address alone.
-fn v6_source_ok(is_raw: bool, source: Option<SocketAddr>, target: IpAddr, scope_id: u32) -> bool {
+pub(super) fn v6_source_ok(
+    is_raw: bool,
+    source: Option<SocketAddr>,
+    target: IpAddr,
+    scope_id: u32,
+) -> bool {
     if !is_raw {
         return true;
     }
@@ -318,14 +325,30 @@ fn identifier_for(pid: u16, n: u16) -> u16 {
     pid ^ n.wrapping_mul(0x9E37)
 }
 
+/// The identifier of every trace of this process (`backends::trace_unix`),
+/// drawn the first time one is asked for. Once drawn, `next_identifier` never
+/// hands it out again.
+static TRACE_IDENTIFIER: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+
 /// Identifier for a new backend, unique among the backends of this process:
 /// a socket that also receives the replies of the others (RAW; macOS DGRAM)
 /// recognizes its own by it. Their sequence numbers advance in lockstep, so
-/// the sequence number alone cannot.
+/// the sequence number alone cannot. The traces' identifier is skipped, also
+/// after the counter wraps, so no probe ever shares it.
 fn next_identifier() -> u16 {
     static CREATED: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-    let n = CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    identifier_for(std::process::id() as u16, n)
+    loop {
+        let n = CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = identifier_for(std::process::id() as u16, n);
+        if TRACE_IDENTIFIER.get() != Some(&id) {
+            return id;
+        }
+    }
+}
+
+/// The identifier reserved for traces (see [`TRACE_IDENTIFIER`]).
+pub(super) fn trace_identifier() -> u16 {
+    *TRACE_IDENTIFIER.get_or_init(next_identifier)
 }
 
 /// A value drawn once per process from the operating system's random source
@@ -347,6 +370,73 @@ fn process_salt() -> u64 {
 /// a mix-up between processes improbable; it cannot rule it out.
 fn seq_on_wire(seq: u16, offset: u16) -> u16 {
     seq.wrapping_add(offset)
+}
+
+/// Bind `socket` to a network interface (`SO_BINDTODEVICE`): `-I` for the
+/// probe and for traces.
+///
+/// # Errors
+///
+/// `InvalidInput` on a NUL byte in the name; `PermissionDenied` without
+/// `CAP_NET_RAW`/root.
+#[cfg(target_os = "linux")]
+pub(super) fn bind_device(socket: &Socket, iface: &str) -> io::Result<()> {
+    use std::ffi::CString;
+    let name = CString::new(iface)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid interface name"))?;
+    // SAFETY: `name` is a live NUL-terminated C string; the length
+    // passed includes the terminator, as SO_BINDTODEVICE expects.
+    unsafe {
+        let ret = libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            name.as_ptr() as *const libc::c_void,
+            name.to_bytes_with_nul().len() as libc::socklen_t,
+        );
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::PermissionDenied {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "permission denied binding to interface '{iface}'. \
+                         SO_BINDTODEVICE requires CAP_NET_RAW or root."
+                    ),
+                ));
+            }
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// macOS has no `SO_BINDTODEVICE`: `-I` is refused with `Unsupported`, and
+/// the scheduler warns, as on Windows, rather than ignore it.
+#[cfg(not(target_os = "linux"))]
+pub(super) fn bind_device(_socket: &Socket, _iface: &str) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "interface binding not supported on macOS. Use -S <source-ip> instead.",
+    ))
+}
+
+/// Bind `socket` to a source address (`-S`) for the probe and for traces.
+/// `scope_id` is the target's IPv6 zone: a link-local source lives in the
+/// same zone as the target it talks to, and the kernel refuses to bind one
+/// without it.
+///
+/// # Errors
+///
+/// OS error if the address is not local or its family mismatches.
+pub(super) fn bind_source_addr(socket: &Socket, addr: IpAddr, scope_id: u32) -> io::Result<()> {
+    let sa = match addr {
+        IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80 => {
+            SocketAddr::V6(std::net::SocketAddrV6::new(v6, 0, 0, scope_id))
+        }
+        _ => SocketAddr::new(addr, 0),
+    };
+    socket.bind(&SockAddr::from(sa))
 }
 
 /// Linux/macOS ICMP backend (DGRAM, with RAW fallback when DGRAM is denied).
@@ -382,7 +472,7 @@ fn enable_rx_timestamps(_socket: &Socket) {}
 
 /// Try DGRAM first; on `PermissionDenied`, fall back to RAW. Returns
 /// `(socket, is_raw)`.
-fn open_icmp_socket(domain: Domain, proto: Protocol) -> io::Result<(Socket, bool)> {
+pub(super) fn open_icmp_socket(domain: Domain, proto: Protocol) -> io::Result<(Socket, bool)> {
     match Socket::new(domain, Type::DGRAM, Some(proto)) {
         Ok(s) => Ok((s, false)),
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
@@ -476,42 +566,7 @@ impl LinuxIcmpBackend {
     /// `InvalidInput` on a NUL byte in the name; `PermissionDenied` without
     /// `CAP_NET_RAW`/root.
     pub fn bind_interface(&self, iface: &str) -> io::Result<()> {
-        #[cfg(target_os = "linux")]
-        {
-            use std::ffi::CString;
-            let name = CString::new(iface).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "invalid interface name")
-            })?;
-            // SAFETY: `name` is a live NUL-terminated C string; the length
-            // passed includes the terminator, as SO_BINDTODEVICE expects.
-            unsafe {
-                let ret = libc::setsockopt(
-                    self.socket.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_BINDTODEVICE,
-                    name.as_ptr() as *const libc::c_void,
-                    name.to_bytes_with_nul().len() as libc::socklen_t,
-                );
-                if ret < 0 {
-                    let err = io::Error::last_os_error();
-                    if err.kind() == io::ErrorKind::PermissionDenied {
-                        return Err(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            format!(
-                                "permission denied binding to interface '{iface}'. \
-                                 SO_BINDTODEVICE requires CAP_NET_RAW or root."
-                            ),
-                        ));
-                    }
-                    return Err(err);
-                }
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = iface;
-        }
-        Ok(())
+        bind_device(&self.socket, iface)
     }
 
     /// Bind to a specific source address. `scope_id` is the target's IPv6
@@ -522,24 +577,19 @@ impl LinuxIcmpBackend {
     ///
     /// OS error if the address is not local or its family mismatches.
     pub fn bind_source(&self, addr: IpAddr, scope_id: u32) -> io::Result<()> {
-        let sa = match addr {
-            IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80 => {
-                SocketAddr::V6(std::net::SocketAddrV6::new(v6, 0, 0, scope_id))
-            }
-            _ => SocketAddr::new(addr, 0),
-        };
-        self.socket.bind(&SockAddr::from(sa))
+        bind_source_addr(&self.socket, addr, scope_id)
     }
 
     /// The identifier a reply must carry, where that can be checked. A RAW
     /// socket receives every echo reply on the host with its identifier
-    /// intact. So does a macOS DGRAM ICMPv6 socket: the kernel hands every
-    /// ICMPv6 socket every echo reply and does not rewrite the identifier.
-    /// (macOS DGRAM IPv4 keeps matching by sender, from the IP header.)
-    /// Linux DGRAM sockets get their own replies only, under an identifier
-    /// the kernel chose: nothing to check.
+    /// intact. So does a macOS DGRAM socket, IPv4 and IPv6: the kernel hands
+    /// every ICMP socket every echo reply and does not rewrite the
+    /// identifier (IPv4 measured on macOS 27, step 1b of 1.7), so a trace's
+    /// reply from the target, same sender, is not ours. Linux DGRAM sockets
+    /// get their own replies only, under an identifier the kernel chose:
+    /// nothing to check.
     fn expected_id(&self) -> Option<u16> {
-        (self.is_raw || (cfg!(target_os = "macos") && self.is_v6)).then_some(self.identifier)
+        (self.is_raw || cfg!(target_os = "macos")).then_some(self.identifier)
     }
 
     /// Whether replies are read with `recvmsg` (ancillary data) instead of
@@ -874,6 +924,17 @@ mod tests {
     /// Two processes may hold the same identifier; with different offsets
     /// their sequence numbers differ for every probe, and the caller's
     /// numbering is untouched by the offset.
+    /// The traces' identifier is never handed to a probe, not even after the
+    /// 16-bit counter wraps.
+    #[test]
+    fn the_trace_identifier_is_never_reused() {
+        let reserved = trace_identifier();
+        for _ in 0..=u16::MAX as u32 + 16 {
+            assert_ne!(next_identifier(), reserved);
+        }
+        assert_eq!(trace_identifier(), reserved);
+    }
+
     #[test]
     fn wire_sequence_starts_from_the_process_offset() {
         assert_eq!(seq_on_wire(1, 0), 1);
@@ -914,6 +975,48 @@ mod tests {
             };
             assert!(
                 !parse_echo_reply_v6(&buf[..n], seq, ours.expected_id()),
+                "took another backend's reply for our own"
+            );
+        }
+    }
+
+    /// `-I` on macOS is refused, so the scheduler warns (it was ignored
+    /// without a word).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn interface_binding_is_refused_on_macos() {
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap();
+        let err = bind_device(&socket, "en0").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    /// So does every ICMP socket over IPv4 (step 1b of 1.7, E2): a trace's
+    /// reply from the target has the probe's sender and maybe its sequence
+    /// number, and must not pass as the probe's reply.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn v4_reply_to_another_backend_is_not_ours() {
+        let target = std::net::Ipv4Addr::LOCALHOST;
+        let (Ok(ours), Ok(other)) = (LinuxIcmpBackend::new(), LinuxIcmpBackend::new()) else {
+            return; // no ICMP socket permission in this environment
+        };
+        assert_ne!(ours.identifier, other.identifier);
+        assert_eq!(ours.expected_id(), Some(ours.identifier));
+        let seq = 9;
+        let packet = build_echo_request_v4(seq, other.identifier, 8);
+        let dest = SockAddr::from(SocketAddr::new(IpAddr::V4(target), 0));
+        if other.socket.send_to(&packet, &dest).is_err() {
+            return; // no loopback in this environment
+        }
+        let start = Instant::now();
+        let budget = std::time::Duration::from_millis(500);
+        let mut buf = [0u8; 128];
+        while ours.rearm_timeout(start, budget).is_some() {
+            let Ok((n, ..)) = recv_with_ttl(ours.as_raw_fd(), &mut buf) else {
+                break;
+            };
+            assert!(
+                !parse_echo_reply_v4(&buf[..n], seq, target, ours.expected_id()).0,
                 "took another backend's reply for our own"
             );
         }

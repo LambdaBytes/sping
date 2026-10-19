@@ -27,6 +27,8 @@ pub struct Config {
     pub quiet: bool,
     /// Forced address family; `None` lets DNS resolution decide.
     pub family: Option<Family>,
+    /// `--diagnose` (single target only).
+    pub diagnose: bool,
     /// Effective view after TTY auto-detection.
     pub view: ViewMode,
     /// `Some` enables batch mode.
@@ -44,11 +46,13 @@ pub enum ViewMode {
     Compact,
     /// Multi-line live TUI view (requires a TTY).
     Extended,
-    /// Traditional `ping`-style line-per-probe output.
+    /// Traditional `ping`-style line-per-probe output (several targets with
+    /// stdout not a terminal: only each target's summary).
     Classic,
     /// NDJSON, one snapshot per line (contract frozen, see `JSON_CONTRACT.md`).
     Json,
-    /// Multi-target dashboard table.
+    /// Multi-target dashboard table (with one target, `Compact`; with stdout
+    /// not a terminal, `Classic`).
     Table,
 }
 
@@ -76,15 +80,6 @@ impl Config {
         };
 
         let is_batch = args.batch.is_some();
-
-        // Piped compact/extended fall back to classic (no TTY for raw mode).
-        if !is_batch
-            && !std::io::stdout().is_terminal()
-            && matches!(view, ViewMode::Compact | ViewMode::Extended)
-        {
-            eprintln!("note: stdout is not a TTY, falling back to classic view");
-            view = ViewMode::Classic;
-        }
 
         let source = match &args.source {
             Some(s) => {
@@ -160,6 +155,55 @@ impl Config {
                 .collect();
         }
 
+        if args.diagnose && (is_batch || targets.len() > 1) {
+            return Err(
+                "--diagnose works with one target (not with several or with --batch)".into(),
+            );
+        }
+
+        // One target has no table: the single-target renderer draws `table`
+        // as the compact view, so it is that view everywhere, with its key
+        // listener (Ctrl+C, `q`) and TTY fallback. Without this it was drawn
+        // in raw mode with no key listener, and Ctrl+C did nothing.
+        if !is_batch && targets.len() == 1 && view == ViewMode::Table {
+            view = ViewMode::Compact;
+        }
+
+        // Several targets are the live table (`app::run_multi`), a frame
+        // redrawn in place in raw mode: a view it is not is refused rather
+        // than ignored. With stdout not a terminal there is no table (its
+        // escape sequences went into the file), only each target's summary
+        // at the end: `Classic`, with no raw mode and no key listener.
+        if !is_batch && targets.len() > 1 {
+            if matches!(
+                view,
+                ViewMode::Extended | ViewMode::Classic | ViewMode::Json
+            ) {
+                return Err(format!(
+                    "--view {} works with one target: several are shown as a table \
+                     (--batch FILE prints a summary or JSON)",
+                    args.view
+                ));
+            }
+            view = if std::io::stdout().is_terminal() {
+                ViewMode::Table
+            } else {
+                eprintln!(
+                    "note: stdout is not a TTY: no live table, each target's summary at the end"
+                );
+                ViewMode::Classic
+            };
+        }
+
+        // Piped compact/extended fall back to classic (no TTY for raw mode).
+        if !is_batch
+            && !std::io::stdout().is_terminal()
+            && matches!(view, ViewMode::Compact | ViewMode::Extended)
+        {
+            eprintln!("note: stdout is not a TTY, falling back to classic view");
+            view = ViewMode::Classic;
+        }
+
         // Batch mode keeps its historical default of 10 probes per target.
         let count = args.count.or(if is_batch { Some(10) } else { None });
 
@@ -175,6 +219,7 @@ impl Config {
             count,
             quiet: args.quiet,
             family,
+            diagnose: args.diagnose,
             view,
             batch_file: args.batch.clone(),
             output_file: args.output.clone(),
@@ -226,5 +271,49 @@ impl Config {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn config(args: &[&str]) -> Result<Config, String> {
+        let args = Args::parse_from(std::iter::once("sping").chain(args.iter().copied()));
+        Config::from_args(&args)
+    }
+
+    fn view_of(args: &[&str]) -> ViewMode {
+        config(args).expect("valid arguments").view
+    }
+
+    /// `--view table` with one target is the compact view, the one its
+    /// renderer draws, so it gets that view's key listener (Ctrl+C, `q`)
+    /// and TTY fallback; whatever stdout is here, both end the same. Two
+    /// spellings of one host are one target.
+    #[test]
+    fn one_target_table_is_the_compact_view() {
+        let compact = view_of(&["192.0.2.1", "--view", "compact"]);
+        assert_eq!(view_of(&["192.0.2.1", "--view", "table"]), compact);
+        assert_eq!(
+            view_of(&["Host.example", "host.example", "--view", "table"]),
+            compact
+        );
+    }
+
+    /// Several targets are always the table: a view it is not is refused
+    /// (it was ignored), whatever stdout is.
+    #[test]
+    fn several_targets_refuse_a_view_the_table_is_not() {
+        for view in ["extended", "classic", "json"] {
+            let err = config(&["192.0.2.1", "192.0.2.2", "--view", view])
+                .err()
+                .expect("refused");
+            assert!(
+                err.starts_with(&format!("--view {view} works with one target")),
+                "{err}"
+            );
+        }
     }
 }

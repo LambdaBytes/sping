@@ -4,7 +4,7 @@ A modern ping for humans. Terminal-native, real-time connectivity monitor that d
 
 <p align="center"><img src="docs/sping-logo.png" alt="sping" width="300"></p>
 
-![sping 1.6.0: the live view, several targets, the classic view, and TCP probes to a host that blocks ping](docs/sping-1.6.0.gif)
+![sping 1.7.0: --diagnose on a host that stops answering ping and on a dead path, a cable to Wi-Fi change while monitoring, and the classic view](docs/sping-1.7.0.gif)
 
 **Status:** functional and in active use, with a frozen JSON contract.
 Linux, macOS and Windows; x86_64, aarch64 and armv7 (Raspberry Pi).
@@ -24,26 +24,19 @@ Context    if eth0 · 192.168.1.100/24 · gw ● · wan ● · public
 Quality    A (100) · excellent
 ```
 
-## What's new in 1.6.0
+## What's new in 1.7.0
 
-- **TCP connect probe** (`--tcp PORT`): times the TCP handshake where ICMP is
-  filtered or not allowed. An open port and a refused one both answer; see
-  [TCP connect](#tcp-connect).
-- **The diagnosis as data**: JSON lines carry `diagnosis`, the findings as
-  stable codes with their evidence, and in single-target mode the `gateway`
-  and `wan` state they come from (see [JSON_CONTRACT.md](JSON_CONTRACT.md)).
-- **Clearer wording**: the quality grades are named `excellent`, `good`,
-  `fair` and `poor`; the TTL's OS hint appears only while the TTL is still an
-  initial value; a loopback target is `loopback`.
-- **Steadier scoring**: the grade and the jitter warning read the same 20
-  probes, changes under 0.1 ms are noise, and lost probes count in the trend.
-- **Static Linux binaries** (musl) for x86_64 and aarch64: Alpine and systems
-  older than glibc 2.34 included.
-- **Homebrew**: `brew install LambdaBytes/tap/sping`; every release also goes
-  to crates.io.
-- **Fixes**: `127.0.0.1` gets its loopback interface with `/8` on Linux,
-  macOS and Windows; on macOS the gateway and the interfaces are found under
-  cron too.
+- **`--diagnose`** (experimental): when the target stops answering, sping
+  probes further on its own (the other address family, TCP 443 and 80, a
+  bounded traceroute) and says what still answers; see
+  [Diagnose](#diagnose-experimental).
+- **The name's lookups as evidence**: a lookup that fails while the WAN
+  reference answers, or that gives no address of the family probed.
+- **Context changes while monitoring**: `context changed 00:03 ago:
+  interface eth0 → wlan0`, for the interface, source, prefix, default gateway
+  and target class.
+- **Fix**: an IPv6 target routed through an interface without IPv6 reads
+  `no IPv6 source`, not `lo ::1/128`.
 
 Every change, version by version: [CHANGELOG.md](CHANGELOG.md).
 
@@ -61,6 +54,10 @@ Target                      RTT        Avg   Loss    Qual      Trend        TTL 
 google.com (216.58.…    13.7 ms    13.6 ms     0%    A100     stable        112   ~16
 ```
 
+The table is live and needs a terminal: with stdout a file or a pipe, sping
+prints only each target's summary at the end (`-c N` stops it). Batch mode
+(`--batch`, below) prints per-host results or JSON.
+
 ## Install
 
 | Method | Command | Platforms | Man page and completions |
@@ -68,8 +65,8 @@ google.com (216.58.…    13.7 ms    13.6 ms     0%    A100     stable        11
 | Homebrew | `brew install LambdaBytes/tap/sping` | macOS | yes |
 | Scoop | `scoop install lambdabytes/sping`, once the bucket is added (see below) | Windows x86_64 | no |
 | crates.io | `cargo install sping` | Linux, macOS, Windows, with Rust 1.88+ | no |
-| Pre-built binary | from the [Releases page](../../releases) | Linux, macOS, Windows | no |
-| Debian / Ubuntu package | `.deb` from the [Releases page](../../releases) | Debian 12, Ubuntu 22.04, Raspberry Pi OS (Bookworm) or later | yes |
+| Pre-built binary | from the [Releases page](https://github.com/LambdaBytes/sping/releases) | Linux, macOS, Windows | no |
+| Debian / Ubuntu package | `.deb` from the [Releases page](https://github.com/LambdaBytes/sping/releases) | Debian 12, Ubuntu 22.04, Raspberry Pi OS (Bookworm) or later | yes |
 | From source | `cargo build --release` | Linux, macOS, Windows, with Rust 1.88+ | no |
 
 ### Homebrew
@@ -104,7 +101,7 @@ cargo install sping
 
 ### Pre-built binaries
 
-Download from the [Releases page](../../releases):
+Download from the [Releases page](https://github.com/LambdaBytes/sping/releases):
 
 | Platform | Asset |
 |----------|-------|
@@ -133,7 +130,7 @@ gh attestation verify sping-vX.Y.Z-linux-x86_64 --repo LambdaBytes/sping
 ### Debian / Ubuntu (.deb)
 
 ```bash
-sudo dpkg -i sping_1.6.0-1_amd64.deb     # or _arm64.deb on aarch64
+sudo dpkg -i sping_1.7.0-1_amd64.deb     # or _arm64.deb on aarch64
 ```
 
 The package installs:
@@ -200,6 +197,9 @@ sping fe80::1%eth0                # IPv6 link-local: the zone is required
 # TCP connect instead of ICMP (see "TCP connect" below)
 sping example.com --tcp 443
 sping 192.168.1.1 10.0.0.5 --tcp 22   # every target, the same port
+
+# When the target stops answering, find out why (experimental; one target)
+sping example.com --diagnose
 
 # ASCII-only output: automatic on non-UTF-8 locales and on the legacy
 # Windows console (SPING_ASCII=0 forces Unicode); NO_COLOR honored
@@ -294,6 +294,50 @@ ICMP; it works in every mode (single target, multi-target, batch) and view.
   established leaves a `TIME_WAIT` entry on this host, as any short
   connection does.
 
+### Diagnose (experimental)
+
+`--diagnose` finds out, when the target stops answering, what still answers
+on the way, and says what it observed, nothing more. One target only.
+
+```bash
+sping example.com --diagnose
+sping 203.0.113.7 --diagnose -c 30 --view json
+```
+
+- It starts when the target goes offline (three probes lost in a row), or at
+  the end of a run that got no answer at all (`-c 1 --diagnose` too).
+- It uses sockets of its own, never counted in the target's statistics, and
+  checks:
+  - the source address the system has for the target;
+  - the same name's address in the other family: three echoes, or with
+    `--tcp PORT` one connect to that port;
+  - TCP 443 and 80 on the target (not with `--tcp`, whose port the probe
+    already tries);
+  - a bounded traceroute: 30 hops, 3 probes each, 20 s at most, stopping
+    after 3 silent hops.
+- Events shows `diagnosing…`, then the conclusions:
+  `silent after hop 3 (203.0.113.1)`, `hop 5 (198.51.100.9) reports host
+  unreachable`, `target answers the trace at hop 7`, `TCP 443 answers`,
+  `IPv6 works`.
+  - The extended view adds an `Untested` line with what could not be told
+    and why (`other family not tried (address given)`, `trace unavailable:
+    needs privileges`).
+  - The classic view prints `---` lines.
+  - JSON lines carry `active_diagnosis` (see
+    [JSON_CONTRACT.md](JSON_CONTRACT.md)).
+- Traffic is bounded: at most 100 extra probes in any 60 s, three operations
+  at once, the traceroute alone.
+- An address given, `-4`/`-6` or `-S` keep the other family out. `-W`, `-s`,
+  `-I` and `-S` apply to the extra probes; `-t` does not.
+- With `-c N`, the last line waits for the diagnosis, at most what is left of
+  its budget; otherwise it says `incomplete`. Ctrl+C stops it at once. The
+  exit codes do not change.
+- The traceroute runs on Linux (with the same sockets and permissions as the
+  probe, see [ICMP permissions](#icmp-permissions)), on macOS for IPv4
+  targets, without privileges, and on Windows. An IPv6 target on macOS gets
+  no traceroute yet: `trace unavailable on this system`.
+- Experimental: its texts and JSON codes may still change.
+
 ### ICMP permissions
 
 sping works without admin/sudo on all platforms. On Linux it uses unprivileged
@@ -341,8 +385,15 @@ sudo setcap cap_net_raw+ep /usr/bin/sping
   "gateway unreachable · local network issue likely"; in JSON as stable codes
   with their evidence
 - While monitoring, hostnames are resolved again every 60 s: when the address
-  leaves the DNS answer, sping moves to another one of the same family. In
-  single-target mode the context is detected again every 15 s
+  leaves the DNS answer, sping moves to another one of the same family. A
+  lookup that fails while the WAN reference answers, or that gives no address
+  of the family probed, is shown
+- In single-target mode the context is detected again every 15 s, and a
+  change (interface, source, prefix, default gateway, target class) is shown
+  for 30 s
+- **`--diagnose`** (experimental): when the target stops answering, the
+  other address family, TCP 443 and 80 and a bounded traceroute say what
+  still answers
 - IPv6 link-local targets with their zone (`fe80::1%eth0`)
 
 **Views and modes**
@@ -384,6 +435,7 @@ sudo setcap cap_net_raw+ep /usr/bin/sping
 | `-I` interface | SO_BINDTODEVICE | accepted, no effect | warning, unbound |
 | `-S` source | bind() | bind() | OS routes (TCP: bind()) |
 | TCP connect | socket2 | socket2 | socket2 (Winsock) |
+| Traceroute (`--diagnose`) | ICMP errors (`IP_RECVERR`) | DGRAM socket, IPv4 only | IcmpSendEcho with TTL |
 | Admin required | No | No | No |
 | All views | full | full | full |
 
@@ -396,6 +448,11 @@ Own ICMP implementation per platform. No third-party ping libraries.
   IPv6 hop limit
 - Windows: `IcmpSendEcho` / `Icmp6SendEcho2` FFI from `iphlpapi.dll`
 - TCP connect (`--tcp`): `socket2` on every platform, one connection per probe
+- Traceroute (`--diagnose`): echoes with a rising TTL on an ICMP socket of
+  its own. Linux reads the routers' errors from the socket's error queue
+  (`IP_RECVERR`); macOS (IPv4) receives them with every other ICMP message of
+  the host and keeps its own; Windows uses `IcmpSendEcho` /
+  `Icmp6SendEcho2` with the TTL
 
 Async Tokio runtime, `watch` channels, single-writer renderer at 10 FPS.
 
@@ -426,6 +483,8 @@ x86_64/aarch64 (glibc, and static with musl), macOS arm64 and Windows x86_64.
   they are disabled with a warning and show `?`.
 - An IPv6 link-local target needs its zone: `fe80::1%eth0`, or the interface
   index (`fe80::1%2`), which is the only form Windows takes.
+- `--diagnose` is experimental and takes one target; on macOS its
+  traceroute is IPv4 only.
 
 ## Roadmap
 
@@ -437,11 +496,20 @@ x86_64/aarch64 (glibc, and static with musl), macOS arm64 and Windows x86_64.
 
 | Metric | Value |
 |--------|-------|
-| Binary | 1.6 MiB (stripped + LTO) |
+| Binary | 1.8 MiB (stripped + LTO) |
 | RAM | ~4 MB resident |
 | CPU | < 1% at two probes per second |
-| Code | ~10,800 lines Rust |
-| Tests | 207 (177 unit + 30 E2E) |
+| Code | ~19,300 lines Rust |
+| Tests | 315 (277 unit + 38 E2E) |
+
+## Around the web
+
+Where sping has been reviewed, listed or written about:
+
+- [LinuxLinks — sping: ping utility with advanced network diagnostics](https://www.linuxlinks.com/sping-ping-utility-advanced-network-diagnostics/)
+- [Terminal Trove — sping](https://terminaltrove.com/sping/)
+- [Awesome Rust — System tools](https://github.com/rust-unofficial/awesome-rust#system-tools)
+- [DEV Community — Your ping works. Your connection doesn't. Meet sping.](https://dev.to/antonio_cotos_0e227a64226/sping-advanced-ping-cli-522c) *(by the author)*
 
 ## License
 

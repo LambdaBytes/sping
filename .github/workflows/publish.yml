@@ -1,15 +1,22 @@
 name: Publish
 
 # After the owner publishes a release — the draft that release.yml made,
-# tried on real machines first — the crate goes to crates.io and the formula
-# to the Homebrew tap, both from that release's tag. Each destination is
-# switched on by its owner setting and is safe to run again: a version that
-# is already there is left alone, and the tap never goes back to an older
-# version.
+# tried on real machines first — the crate goes to crates.io, the formula to
+# the Homebrew tap, the package to the AUR and the manifest to the Scoop
+# bucket, all from that release's tag and files; the WinGet manifests are
+# made ready for a pull request opened by hand. Each destination is switched
+# on by its owner setting and is safe to run again: a version that is
+# already there is left alone, and none goes back to an older version.
 #
 #   crates.io  repository variable CRATES_IO_TRUSTED_PUBLISHING=true, once
 #              crates.io trusts this repository's publish.yml
 #   Homebrew   secret HOMEBREW_TAP_TOKEN: write access to <owner>/homebrew-tap
+#   AUR        secret AUR_SSH_PRIVATE_KEY: the SSH key of the AUR account that
+#              maintains lambdabytes-sping
+#   Scoop      secret SCOOP_BUCKET_TOKEN: contents write on <owner>/scoop-bucket
+#   WinGet     repository variable WINGET_MANIFESTS=true: the manifests are
+#              built, checked and kept as the run's artifact; the pull request
+#              to microsoft/winget-pkgs is opened by hand
 
 on:
   release:
@@ -42,6 +49,9 @@ jobs:
       crates: ${{ steps.destinations.outputs.crates }}
       tap: ${{ steps.tap.outputs.action }}
       tap-sha: ${{ steps.tap.outputs.sha }}
+      aur: ${{ steps.destinations.outputs.aur }}
+      scoop: ${{ steps.destinations.outputs.scoop }}
+      winget: ${{ steps.destinations.outputs.winget }}
     steps:
       # A final version, published (not a draft, not a pre-release).
       - name: The release
@@ -66,19 +76,33 @@ jobs:
         id: destinations
         env:
           CRATES: ${{ vars.CRATES_IO_TRUSTED_PUBLISHING }}
-          # Whether the token is set, not the token.
+          WINGET: ${{ vars.WINGET_MANIFESTS }}
+          # Whether each secret is set, not the secret.
           HAS_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+          HAS_AUR_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY != '' }}
+          HAS_SCOOP_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN != '' }}
         run: |
           set -euo pipefail
-          crates=false tap=false
+          crates=false tap=false aur=false scoop=false winget=false
           [ "$CRATES" = true ] && crates=true
           [ "$HAS_TAP_TOKEN" = true ] && tap=true
-          echo "crates=$crates" >> "$GITHUB_OUTPUT"
-          echo "tap=$tap" >> "$GITHUB_OUTPUT"
+          [ "$HAS_AUR_KEY" = true ] && aur=true
+          [ "$HAS_SCOOP_TOKEN" = true ] && scoop=true
+          [ "$WINGET" = true ] && winget=true
+          {
+            echo "crates=$crates"
+            echo "tap=$tap"
+            echo "aur=$aur"
+            echo "scoop=$scoop"
+            echo "winget=$winget"
+          } >> "$GITHUB_OUTPUT"
           {
             echo "### $TAG"
             echo "- crates.io: $([ "$crates" = true ] && echo enabled || echo 'not enabled (CRATES_IO_TRUSTED_PUBLISHING)')"
             echo "- Homebrew tap: $([ "$tap" = true ] && echo enabled || echo 'not enabled (HOMEBREW_TAP_TOKEN)')"
+            echo "- AUR: $([ "$aur" = true ] && echo enabled || echo 'not enabled (AUR_SSH_PRIVATE_KEY)')"
+            echo "- Scoop bucket: $([ "$scoop" = true ] && echo enabled || echo 'not enabled (SCOOP_BUCKET_TOKEN)')"
+            echo "- WinGet: $([ "$winget" = true ] && echo enabled || echo 'not enabled (WINGET_MANIFESTS)')"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # The tap moves forward only: the same version is done, a newer one
@@ -122,11 +146,13 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ env.TAG }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
 
       - name: The crate is the tag's version
         run: |
@@ -172,7 +198,7 @@ jobs:
       VERSION: ${{ needs.check.outputs.version }}
       TAP: ${{ github.repository_owner }}/homebrew-tap
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ env.TAG }}
           persist-credentials: false
@@ -211,3 +237,275 @@ jobs:
           [ -z "$BLOB" ] || args+=(-f "sha=$BLOB")
           gh api "${args[@]}" --jq .commit.sha
           echo "- Homebrew tap: sping $VERSION written" >> "$GITHUB_STEP_SUMMARY"
+
+  # Every file of the release has its one line in SHA256SUMS, and the Windows
+  # file that the Scoop and WinGet manifests point at is one of them.
+  assets:
+    needs: check
+    if: needs.check.outputs.scoop == 'true' || needs.check.outputs.winget == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Each file has its checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' > names.txt
+          bad=0
+          while read -r name; do
+            case "$name" in SHA256SUMS | SHA256SUMS.asc) continue ;; esac
+            if ! awk -v f="$name" '$2 == f || $2 == "*" f { n++ } END { exit n != 1 }' SHA256SUMS; then
+              echo "::error::$name: not exactly one line in SHA256SUMS."
+              bad=1
+            fi
+          done < names.txt
+          if ! grep -qxF "sping-$TAG-windows-x86_64.exe" names.txt; then
+            echo "::error::The release has no sping-$TAG-windows-x86_64.exe."
+            bad=1
+          fi
+          exit "$bad"
+
+  aur:
+    needs: check
+    if: needs.check.outputs.aur == 'true'
+    runs-on: ubuntu-latest
+    # A clean Arch Linux: the package is built, checked and installed there
+    # before the AUR gets it.
+    container: archlinux:base-devel
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      PKG: lambdabytes-sping
+    steps:
+      - name: Tools
+        run: pacman -Syu --noconfirm --needed git openssh namcap rust
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+
+      # The tag's PKGBUILD with the digest of the tag's archive, built as an
+      # unprivileged user (makepkg checks the source against the digest and
+      # runs check()), linted, installed and removed.
+      - name: Build, check and try the package
+        run: |
+          set -euo pipefail
+          recipe=packaging/arch/PKGBUILD
+          grep -qxF "pkgname=$PKG" "$recipe" || { echo "::error::$recipe is not $PKG."; exit 1; }
+          grep -qxF "pkgver=$VERSION" "$recipe" || { echo "::error::$recipe is not $VERSION."; exit 1; }
+          [ "$(grep -cxF "sha256sums=('SKIP')" "$recipe")" -eq 1 ] || { echo "::error::$recipe has no single sha256sums=('SKIP') to fill."; exit 1; }
+          sha="$(curl -fsSL "https://github.com/$GITHUB_REPOSITORY/archive/refs/tags/$TAG.tar.gz" | sha256sum | cut -d ' ' -f 1)"
+          useradd -m builder
+          install -d -o builder -g builder /home/builder/pkg
+          sed "s|^sha256sums=('SKIP')\$|sha256sums=('$sha')|" "$recipe" > /home/builder/pkg/PKGBUILD
+          chown builder:builder /home/builder/pkg/PKGBUILD
+          cd /home/builder/pkg
+          su builder -c 'cd /home/builder/pkg && makepkg --printsrcinfo > .SRCINFO && makepkg'
+          { namcap PKGBUILD; namcap ./*.pkg.tar.zst; } | tee namcap.txt
+          if grep -q ' E: ' namcap.txt; then
+            echo "::error::namcap reports errors."
+            exit 1
+          fi
+          pacman -U --noconfirm ./*.pkg.tar.zst
+          got="$(su builder -c 'sping --version')"
+          [ "$got" = "sping $VERSION" ] || { echo "::error::The package's sping says '$got'."; exit 1; }
+          pacman -R --noconfirm "$PKG"
+
+      # The AUR moves forward only: the same version is done, a newer one
+      # stays (a publication of an older release run again).
+      - name: The AUR's version
+        id: aur
+        run: |
+          set -euo pipefail
+          git clone --quiet "https://aur.archlinux.org/$PKG.git" aur
+          srcinfo() { sed -nE "s/^\t$1 = (.*)$/\1/p" "$2"; }
+          ours="$(srcinfo pkgver /home/builder/pkg/.SRCINFO)-$(srcinfo pkgrel /home/builder/pkg/.SRCINFO)"
+          current=""
+          [ ! -f aur/.SRCINFO ] || current="$(srcinfo pkgver aur/.SRCINFO)-$(srcinfo pkgrel aur/.SRCINFO)"
+          action="write"
+          if [ "$current" = "$ours" ]; then
+            action="done"
+            echo "- AUR: $PKG $ours was already there" >> "$GITHUB_STEP_SUMMARY"
+          elif [ -n "$current" ] && [ "$(vercmp "$current" "$ours")" -gt 0 ]; then
+            action="done"
+            echo "- AUR: holds $PKG $current, newer than $ours: left alone" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "action=$action" >> "$GITHUB_OUTPUT"
+          echo "release=$ours" >> "$GITHUB_OUTPUT"
+
+      # The key reaches this step alone, in a private directory removed on
+      # exit; no agent, and only the AUR's published host key is trusted. The
+      # push is never forced: if the AUR changed since the clone above, it is
+      # refused and a run again compares once more. The commit is the
+      # recipe's maintainer's.
+      - name: Push it to the AUR
+        if: steps.aur.outputs.action == 'write'
+        env:
+          AUR_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          RELEASE: ${{ steps.aur.outputs.release }}
+        run: |
+          set -euo pipefail
+          dir="$(mktemp -d "$RUNNER_TEMP/aur-ssh.XXXXXX")"
+          trap 'rm -rf "$dir"' EXIT
+          (umask 077 && printf '%s\n' "$AUR_KEY" > "$dir/key")
+          # Ed25519 SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4, as aur.archlinux.org lists it.
+          echo 'aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN' > "$dir/known_hosts"
+          cp /home/builder/pkg/PKGBUILD /home/builder/pkg/.SRCINFO aur/
+          name="$(sed -nE 's/^# Maintainer: (.*) <(.*)>$/\1/p' aur/PKGBUILD)"
+          email="$(sed -nE 's/^# Maintainer: (.*) <(.*)>$/\2/p' aur/PKGBUILD)"
+          if [ -z "$name" ] || [ -z "$email" ]; then
+            echo "::error::No '# Maintainer: Name <email>' line in the PKGBUILD."
+            exit 1
+          fi
+          cd aur
+          git add PKGBUILD .SRCINFO
+          git -c user.name="$name" -c user.email="$email" -c commit.gpgsign=false commit --quiet -m "$PKG $RELEASE"
+          export GIT_SSH_COMMAND="ssh -i $dir/key -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$dir/known_hosts"
+          git push "ssh://aur@aur.archlinux.org/$PKG.git" HEAD:master
+          echo "- AUR: $PKG $RELEASE pushed" >> "$GITHUB_STEP_SUMMARY"
+
+  scoop:
+    needs: [check, assets]
+    if: needs.check.outputs.scoop == 'true'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      BUCKET: ${{ github.repository_owner }}/scoop-bucket
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+
+      - name: The Windows file, checked against SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir release
+          cd release
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --pattern "sping-$TAG-windows-x86_64.exe"
+          awk -v f="sping-$TAG-windows-x86_64.exe" '$2 == f' SHA256SUMS | sha256sum -c -
+
+      - name: Render and check the manifest
+        run: bash packaging/scoop/render.sh "$GITHUB_REPOSITORY" "$VERSION" release/SHA256SUMS out
+
+      # The bucket moves forward only, as the tap. `write` when the manifest
+      # is to be written, with the blob read here: the write is refused if
+      # the bucket changed in between, and a run again reads it once more.
+      - name: The bucket's version
+        id: bucket
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          current="" sha=""
+          if gh api "repos/$BUCKET/contents/bucket/sping.json" > manifest.json 2> api.err; then
+            sha="$(jq -r .sha manifest.json)"
+            current="$(jq -r .content manifest.json | base64 --decode | jq -r .version)"
+            [[ "$current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::$BUCKET's bucket/sping.json says version '$current'."; exit 1; }
+          elif ! grep -q 'HTTP 404' api.err; then
+            cat api.err
+            exit 1
+          fi
+          action="write"
+          if [ "$current" = "$VERSION" ]; then
+            action="done"
+            echo "- Scoop bucket: sping $VERSION was already there" >> "$GITHUB_STEP_SUMMARY"
+          elif [ -n "$current" ] && [ "$(printf '%s\n' "$current" "$VERSION" | sort -V | tail -n 1)" != "$VERSION" ]; then
+            action="done"
+            echo "- Scoop bucket: holds sping $current, newer than $VERSION: left alone" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "action=$action" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      # The token reaches this step alone. The commit is its owner's.
+      - name: Write it to the bucket
+        if: steps.bucket.outputs.action == 'write'
+        env:
+          GH_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          BLOB: ${{ steps.bucket.outputs.sha }}
+        run: |
+          set -euo pipefail
+          args=(-X PUT "repos/$BUCKET/contents/bucket/sping.json" -f "message=sping $VERSION" -f "content=$(base64 < out/sping.json | tr -d '\n')")
+          [ -z "$BLOB" ] || args+=(-f "sha=$BLOB")
+          gh api "${args[@]}" --jq .commit.sha
+          echo "- Scoop bucket: sping $VERSION written" >> "$GITHUB_STEP_SUMMARY"
+
+  # Semi-automatic: the manifests are rendered, checked and kept as this
+  # run's artifact; the pull request to microsoft/winget-pkgs is opened by
+  # hand. Nothing here writes anywhere.
+  winget:
+    needs: [check, assets]
+    if: needs.check.outputs.winget == 'true'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      UPSTREAM: microsoft/winget-pkgs
+      PACKAGE_DIR: manifests/l/LambdaBytes/Sping
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+
+      - name: The Windows file, checked against SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir release
+          cd release
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --pattern "sping-$TAG-windows-x86_64.exe"
+          awk -v f="sping-$TAG-windows-x86_64.exe" '$2 == f' SHA256SUMS | sha256sum -c -
+
+      - name: Render and check the manifests
+        run: bash packaging/winget/render.sh "$GITHUB_REPOSITORY" "$VERSION" release/SHA256SUMS out
+
+      # winget-pkgs moves forward only. A pull request for this version, by
+      # anyone, is taken into account: open or merged, nothing to propose;
+      # closed without merging, the owner's to decide: no other one is
+      # proposed.
+      - name: The version in winget-pkgs
+        id: winget
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh api "repos/$UPSTREAM/contents/$PACKAGE_DIR" --jq '.[] | select(.type == "dir") | .name' > versions.txt 2> api.err; then
+            grep -q 'HTTP 404' api.err || { cat api.err; exit 1; }
+            : > versions.txt
+          fi
+          if grep -qxF "$VERSION" versions.txt; then
+            echo "- WinGet: LambdaBytes.Sping $VERSION is in $UPSTREAM" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          newest="$({ cat versions.txt; echo "$VERSION"; } | sort -V | tail -n 1)"
+          if [ "$newest" != "$VERSION" ]; then
+            echo "- WinGet: $UPSTREAM holds LambdaBytes.Sping $newest, newer than $VERSION: nothing to propose" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # Titles in use there: "New package: LambdaBytes.Sping version X.Y.Z",
+          # "New version: LambdaBytes.Sping version X.Y.Z", and the template's
+          # "Update: LambdaBytes.Sping to X.Y.Z".
+          gh pr list --repo "$UPSTREAM" --state all --limit 100 --search "LambdaBytes.Sping $VERSION in:title" --json state,title,url > prs.json
+          jq -r --arg v "$VERSION" '.[] | select(.title | test("LambdaBytes\\.Sping ((version|to) )?" + ($v | gsub("\\."; "\\.")) + "( |$)")) | "\(.state) \(.url)"' prs.json > prs.txt
+          if grep -qE '^(OPEN|MERGED) ' prs.txt; then
+            echo "- WinGet: $(grep -m 1 -E '^(OPEN|MERGED) ' prs.txt)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if grep -q '^CLOSED ' prs.txt; then
+            echo "::error::A pull request for LambdaBytes.Sping $VERSION was closed without merging ($(grep -m 1 '^CLOSED ' prs.txt | cut -d ' ' -f 2)): the owner decides."
+            exit 1
+          fi
+          echo "propose=true" >> "$GITHUB_OUTPUT"
+          echo "- WinGet: LambdaBytes.Sping $VERSION ready for a pull request (artifact winget-manifests-$VERSION)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the manifests
+        if: steps.winget.outputs.propose == 'true'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: winget-manifests-${{ env.VERSION }}
+          path: out/manifests
+          if-no-files-found: error

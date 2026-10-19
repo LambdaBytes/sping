@@ -1,0 +1,23 @@
+{
+    "version": "@VERSION@",
+    "description": "Terminal-native real-time connectivity monitor with network context diagnostics",
+    "homepage": "https://github.com/@REPOSITORY@",
+    "license": "MIT",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/@REPOSITORY@/releases/download/v@VERSION@/sping-v@VERSION@-windows-x86_64.exe#/sping.exe",
+            "hash": "@SHA256@"
+        }
+    },
+    "bin": "sping.exe",
+    "checkver": {
+        "github": "https://github.com/@REPOSITORY@"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/@REPOSITORY@/releases/download/v$version/sping-v$version-windows-x86_64.exe#/sping.exe"
+            }
+        }
+    }
+}

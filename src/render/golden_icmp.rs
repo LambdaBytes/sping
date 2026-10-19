@@ -107,13 +107,13 @@ pub(crate) fn classic(snap: &ProbeSnapshot) -> String {
 
 pub(crate) fn compact(snap: &ProbeSnapshot) -> String {
     let mut out = Vec::new();
-    view_compact::draw_inline(&mut out, snap, None, None, 0, 0).unwrap();
+    view_compact::draw_inline(&mut out, snap, None, None, None, 0, 0).unwrap();
     visible(&out)
 }
 
 pub(crate) fn extended(snap: &ProbeSnapshot) -> String {
     let mut out = Vec::new();
-    view_extended::draw_inline(&mut out, snap, None, None, 0, 0).unwrap();
+    view_extended::draw_inline(&mut out, snap, None, None, None, 0, 0).unwrap();
     visible(&out)
 }
 

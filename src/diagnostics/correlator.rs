@@ -7,10 +7,12 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::context::ContextChange;
+use crate::context::dns::Family;
 use crate::diagnostics::health::Reachability;
 use crate::probe::auxiliary::AuxiliaryState;
 use crate::probe::quality::QualityGrade;
-use crate::probe::types::{ProbeSnapshot, TcpState};
+use crate::probe::types::{NameState, ProbeSnapshot, RecentChange, TcpState};
 
 /// Diagnostic input for the correlator.
 pub struct DiagInput<'a> {
@@ -38,13 +40,19 @@ pub struct DiagInput<'a> {
     pub high_jitter: bool,
     /// The port, when the last TCP connect was refused.
     pub tcp_refused_port: Option<u16>,
+    /// The last re-resolution of the target's name, while current.
+    pub name: Option<NameState>,
+    /// The family of the address probed.
+    pub family: Family,
+    /// The last change of the network context, while recent.
+    pub context_change: Option<&'a RecentChange>,
 }
 
 impl<'a> DiagInput<'a> {
     /// The input for one snapshot and the auxiliary probes' state (`None`
     /// where no such probe runs, or it has no result yet).
     pub fn from_snapshot(
-        snap: &ProbeSnapshot,
+        snap: &'a ProbeSnapshot,
         gateway: Option<&'a AuxiliaryState>,
         wan: Option<&'a AuxiliaryState>,
     ) -> Self {
@@ -63,6 +71,13 @@ impl<'a> DiagInput<'a> {
             tcp_refused_port: snap
                 .port
                 .filter(|_| snap.tcp_state == Some(TcpState::Refused)),
+            name: snap.name,
+            family: if snap.target_ip.is_ipv4() {
+                Family::V4
+            } else {
+                Family::V6
+            },
+            context_change: snap.context_change.as_ref(),
         }
     }
 }
@@ -81,6 +96,13 @@ pub enum Finding {
     Recovered {
         #[serde(serialize_with = "crate::probe::types::ser_duration_ms")]
         duration: Duration,
+    },
+    /// The observed network context changed `age_s` seconds ago (shown for
+    /// 30 s): interface, source, prefix, IPv4 default gateway or the target's
+    /// class.
+    ContextChanged {
+        changes: Vec<ContextChange>,
+        age_s: u64,
     },
     /// The target has not answered for `duration`.
     Outage {
@@ -112,10 +134,19 @@ pub enum Finding {
     IntermittentLoss { recent_loss_pct: f64 },
     /// Target reachable, WAN reference down, gateway up.
     WanDegraded,
+    /// The last lookup of the target's name failed (`timed_out`: no answer
+    /// in 5 s) while the WAN reference answers: its state is `Online` and
+    /// its last probe got a reply. sping keeps probing the address it had.
+    NameLookupFailed { timed_out: bool },
+    /// The last lookup of the target's name gave no address of the family
+    /// probed. Not that the name has none: a resolver may leave out what the
+    /// host cannot reach. sping keeps probing the address it had.
+    LookupWithoutFamily { family: Family },
 }
 
 /// Findings in priority order: the TCP refusal, recovery, then outage
-/// localization (gateway vs upstream vs target), then quality events.
+/// localization (gateway vs upstream vs target), then the name's lookup, then
+/// quality events.
 pub fn diagnose(input: &DiagInput) -> Vec<Finding> {
     let mut findings = Vec::new();
 
@@ -141,6 +172,13 @@ pub fn diagnose(input: &DiagInput) -> Vec<Finding> {
         findings.push(Finding::Recovered { duration });
     }
 
+    if let Some(change) = input.context_change {
+        findings.push(Finding::ContextChanged {
+            changes: change.changes.clone(),
+            age_s: change.age.as_secs(),
+        });
+    }
+
     if input.target_total_loss {
         if let Some(duration) = input.outage_duration {
             findings.push(Finding::Outage { duration });
@@ -158,7 +196,26 @@ pub fn diagnose(input: &DiagInput) -> Vec<Finding> {
         } else {
             findings.push(Finding::TargetUnreachable { wan_online });
         }
-    } else if input.target_reachable {
+    }
+
+    // The WAN reference answering now: its hysteresis stays `Online` for two
+    // losses, so its last probe must have got a reply too.
+    let wan_answers = input
+        .wan
+        .is_some_and(|w| w.reachability == Reachability::Online && w.last_rtt.is_some());
+    match input.name {
+        Some(NameState::Failed { timed_out }) if wan_answers => {
+            findings.push(Finding::NameLookupFailed { timed_out });
+        }
+        Some(NameState::NoAddressOfFamily) => {
+            findings.push(Finding::LookupWithoutFamily {
+                family: input.family,
+            });
+        }
+        _ => {}
+    }
+
+    if !input.target_total_loss && input.target_reachable {
         if let Some(rtt) = input.last_spike_rtt
             && input.spike_guard
         {
@@ -202,6 +259,9 @@ mod tests {
             spike_guard: false,
             high_jitter: false,
             tcp_refused_port: None,
+            name: None,
+            family: Family::V4,
+            context_change: None,
         }
     }
 
@@ -395,5 +455,104 @@ mod tests {
         ] {
             assert_eq!(json(&finding), format!(r#"{{"code":"{code}"}}"#));
         }
+    }
+
+    /// The name's last lookup: a failure only with the WAN reference
+    /// answering now (state and last probe), whatever the target's state; a
+    /// missing family always; nothing once it answered again.
+    #[test]
+    fn the_names_last_lookup() {
+        let wan = |reachability, answered: bool| AuxiliaryState {
+            label: "WAN".into(),
+            target: "1.1.1.1".parse().unwrap(),
+            reachability,
+            last_rtt: answered.then(|| Duration::from_millis(9)),
+        };
+        let failed = Some(NameState::Failed { timed_out: true });
+        let answering = wan(Reachability::Online, true);
+        for (wan, expected) in [
+            (Some(&answering), true),
+            // Online by hysteresis, its last probe lost.
+            (Some(&wan(Reachability::Online, false)), false),
+            (Some(&wan(Reachability::Offline, false)), false),
+            (Some(&wan(Reachability::Unknown, true)), false),
+            (None, false),
+        ] {
+            let mut input = base_input();
+            input.name = failed;
+            input.wan = wan;
+            let found = diagnose(&input).contains(&Finding::NameLookupFailed { timed_out: true });
+            assert_eq!(found, expected, "{wan:?}");
+        }
+
+        // Target down too: after the outage's localization.
+        let mut input = base_input();
+        input.target_reachable = false;
+        input.target_total_loss = true;
+        input.name = Some(NameState::Failed { timed_out: false });
+        input.wan = Some(&answering);
+        assert_eq!(
+            diagnose(&input),
+            [
+                Finding::TargetUnreachable { wan_online: true },
+                Finding::NameLookupFailed { timed_out: false },
+            ]
+        );
+
+        // No address of the family: said with or without the WAN, before
+        // the quality events.
+        let mut input = base_input();
+        input.name = Some(NameState::NoAddressOfFamily);
+        input.family = Family::V6;
+        input.loss_pct = 5.0;
+        assert_eq!(
+            diagnose(&input),
+            [
+                Finding::LookupWithoutFamily { family: Family::V6 },
+                Finding::IntermittentLoss {
+                    recent_loss_pct: 5.0
+                },
+            ]
+        );
+
+        let mut input = base_input();
+        input.name = Some(NameState::Answered);
+        input.wan = Some(&answering);
+        assert!(diagnose(&input).is_empty());
+    }
+
+    /// A recent change of the context, right after the recovery, with its
+    /// age; whatever the target's state.
+    #[test]
+    fn a_recent_context_change() {
+        use crate::context::{ContextChange, ContextField, ContextValue};
+        use crate::probe::types::RecentChange;
+        let change = RecentChange {
+            changes: vec![ContextChange {
+                what: ContextField::Gateway,
+                from: Some(ContextValue::Text("192.168.1.1".into())),
+                to: Some(ContextValue::Text("10.0.0.1".into())),
+            }],
+            age: Duration::from_millis(12_700),
+        };
+        let mut input = base_input();
+        input.recovery_duration = Some(Duration::from_secs(4));
+        input.loss_pct = 5.0;
+        input.context_change = Some(&change);
+        assert_eq!(
+            diagnose(&input),
+            [
+                Finding::Recovered {
+                    duration: Duration::from_secs(4)
+                },
+                Finding::ContextChanged {
+                    changes: change.changes.clone(),
+                    age_s: 12
+                },
+                Finding::IntermittentLoss {
+                    recent_loss_pct: 5.0
+                },
+            ]
+        );
     }
 }

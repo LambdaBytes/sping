@@ -2,6 +2,7 @@
 //! IPv6 address table, macOS via `ifconfig`, Windows via the adapter API
 //! (`ipconfig` text as a fallback). Best-effort.
 
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 
 use crate::context::dns::ResolvedAddr;
@@ -15,18 +16,61 @@ pub struct InterfaceInfo {
     pub prefix_len: u8,
 }
 
-/// Detect the local IP used to reach `target` (UDP connect trick: no packet
-/// is sent, the kernel only selects a source address). `None` if no route.
+/// Detect the local IP used to reach `target`. `None` if no route.
 pub fn detect_local_ip(target: ResolvedAddr) -> Option<IpAddr> {
+    route_source(target).ok()
+}
+
+/// The source address the system picks to reach `target` (UDP connect
+/// trick: no packet is sent, the kernel only selects a source address).
+fn route_source(target: ResolvedAddr) -> io::Result<IpAddr> {
     let bind = if target.ip.is_ipv6() {
         "[::]:0"
     } else {
         "0.0.0.0:0"
     };
-    let sock = UdpSocket::bind(bind).ok()?;
-    sock.connect(target.socket_addr(80)).ok()?;
-    let local = sock.local_addr().ok()?;
-    Some(local.ip())
+    let sock = UdpSocket::bind(bind)?;
+    sock.connect(target.socket_addr(80))?;
+    Ok(sock.local_addr()?.ip())
+}
+
+/// The address the system would send from to reach `target`, for comparing
+/// IPv4 with IPv6.
+///
+/// - `Ok(Some)`: that address. A link-local one reaches only the
+///   destinations on its link: routers do not forward link-local sources,
+///   so the caller cannot take it for a working source to anything else.
+/// - `Ok(None)`: no address it could send from — no route, no address of
+///   the family, or none that leaves the host. With no address on the
+///   route's interface, Linux hands out `::1` for IPv6 (also while the
+///   link-local address is tentative) and `0.0.0.0` for IPv4.
+/// - `Err`: it could not tell (a local error: a denied socket, a
+///   `prohibit` or `blackhole` route).
+pub fn usable_source(target: ResolvedAddr) -> io::Result<Option<IpAddr>> {
+    source_state(route_source(target), target.ip)
+}
+
+/// What `route_source` found for `target`, as `usable_source` reports it.
+fn source_state(found: io::Result<IpAddr>, target: IpAddr) -> io::Result<Option<IpAddr>> {
+    match found {
+        // No address, or a loopback one, which never leaves the host.
+        Ok(source) if source.is_unspecified() || source.is_loopback() && !target.is_loopback() => {
+            Ok(None)
+        }
+        Ok(source) => Ok(Some(source)),
+        // No route (or an `unreachable` one) and no address to send from.
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NetworkUnreachable
+                    | io::ErrorKind::HostUnreachable
+                    | io::ErrorKind::AddrNotAvailable
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Find the interface name and prefix for `local_ip`. `None` when no data
@@ -624,6 +668,93 @@ Adaptador de Ethernet Ethernet 3:
             "fe80::9d2e:4bfb:a4a2:eb3",
         ] {
             assert_eq!(entry(&list, ip).name, "Adaptador de Ethernet Ethernet 3");
+        }
+    }
+
+    /// A source that cannot leave the host is no source; a link-local one
+    /// reaches its link, whatever the destination's prefix.
+    #[test]
+    fn a_loopback_source_serves_only_a_loopback_target() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let state = |source, target| source_state(Ok(ip(source)), ip(target)).unwrap();
+        for (source, target) in [
+            ("2001:db8:5::2", "2001:db8::1"),
+            ("fd00:1::2", "2001:db8::1"),
+            ("10.0.5.2", "198.51.100.1"),
+            ("::1", "::1"),
+            ("127.0.0.1", "127.0.0.1"),
+            ("127.0.0.1", "127.0.0.2"),
+            // Link-local sources, to destinations on their link.
+            ("fe80::1", "fd00:9::1"),
+            ("fe80::1", "fe80::2"),
+            ("fe80::1", "ff02::1"),
+            ("169.254.1.2", "10.9.0.1"),
+        ] {
+            assert_eq!(
+                state(source, target),
+                Some(ip(source)),
+                "{source} -> {target}"
+            );
+        }
+        for (source, target) in [
+            ("::1", "2001:db8::1"),
+            ("::1", "fe80::2"),
+            ("127.0.0.1", "198.51.100.1"),
+            ("::", "2001:db8::1"),
+            ("0.0.0.0", "198.51.100.1"),
+        ] {
+            assert_eq!(state(source, target), None, "{source} -> {target}");
+        }
+    }
+
+    /// No route and no address to send from are no source; any other local
+    /// error leaves the source unknown.
+    #[test]
+    fn other_local_errors_leave_the_source_unknown() {
+        use io::ErrorKind;
+        let target: IpAddr = "2001:db8::1".parse().unwrap();
+        for kind in [
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::HostUnreachable,
+            ErrorKind::AddrNotAvailable,
+        ] {
+            assert_eq!(
+                source_state(Err(kind.into()), target).unwrap(),
+                None,
+                "{kind:?}"
+            );
+        }
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidInput,
+            ErrorKind::Other,
+        ] {
+            let err = source_state(Err(kind.into()), target).unwrap_err();
+            assert_eq!(err.kind(), kind);
+        }
+
+        // The system's own codes, as std maps them.
+        #[cfg(unix)]
+        let (none, unknown) = (
+            [libc::ENETUNREACH, libc::EHOSTUNREACH, libc::EADDRNOTAVAIL],
+            // A denied socket, a `prohibit` route, a `blackhole` route or a
+            // link-local address without its zone, a kernel without IPv6.
+            [libc::EPERM, libc::EACCES, libc::EINVAL, libc::EAFNOSUPPORT],
+        );
+        // WSAENETUNREACH, WSAEHOSTUNREACH, WSAEADDRNOTAVAIL; WSAEACCES,
+        // WSAEINVAL, WSAEAFNOSUPPORT.
+        #[cfg(windows)]
+        let (none, unknown) = ([10051, 10065, 10049], [10013, 10022, 10047]);
+        #[cfg(any(unix, windows))]
+        {
+            for code in none {
+                let err = io::Error::from_raw_os_error(code);
+                assert_eq!(source_state(Err(err), target).unwrap(), None, "code {code}");
+            }
+            for code in unknown {
+                let err = io::Error::from_raw_os_error(code);
+                assert!(source_state(Err(err), target).is_err(), "code {code}");
+            }
         }
     }
 }

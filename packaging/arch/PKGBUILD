@@ -1,14 +1,24 @@
 # Maintainer: Antonio Cotos <acf981@protonmail.com>
-pkgname=sping
-pkgver=1.6.0
+# The AUR name `sping` belongs to another program: this package is
+# lambdabytes-sping, its command is still `sping`.
+pkgname=lambdabytes-sping
+_pkgname=sping
+pkgver=1.7.0
 pkgrel=1
 pkgdesc="Terminal-native real-time connectivity monitor with network context diagnostics"
 arch=('x86_64' 'aarch64' 'armv7h')
 url="https://github.com/LambdaBytes/sping"
 license=('MIT')
-depends=('gcc-libs')
+depends=('glibc' 'libgcc')
 makedepends=('cargo')
-source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# Each of these installs /usr/bin/sping: sping and sping-git are other
+# programs, sping-bin is a third party's repackaging of this one's release
+# binaries.
+conflicts=('sping' 'sping-git' 'sping-bin')
+# The release profile strips the binary (Cargo.toml): a -debug package
+# would be empty.
+options=('!debug')
+source=("$_pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 # Replace SKIP with the real digest once a v$pkgver tag exists:
 #   updpkgsums   (from pacman-contrib)
 sha256sums=('SKIP')
@@ -38,7 +48,7 @@ check() {
 
 package() {
   cd "sping-$pkgver"
-  install -Dm0755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm0755 "target/release/$_pkgname" "$pkgdir/usr/bin/$_pkgname"
   install -Dm0644 target/assets/man/sping.1 "$pkgdir/usr/share/man/man1/sping.1"
   install -Dm0644 target/assets/completions/sping.bash \
     "$pkgdir/usr/share/bash-completion/completions/sping"

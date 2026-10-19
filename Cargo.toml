@@ -1,6 +1,6 @@
 [package]
 name = "sping"
-version = "1.6.0"
+version = "1.7.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Antonio Cotos <acf981@protonmail.com>"]
@@ -30,6 +30,10 @@ socket2 = { version = "0.5", features = ["all"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# The same tokio, with its paused clock for the `--diagnose` loop's tests.
+tokio = { version = "1", features = ["test-util"] }
 
 [build-dependencies]
 clap = { version = "4", features = ["derive"] }
