@@ -1,8 +1,20 @@
-# sping
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/LambdaBytes/sping/HEAD/docs/brand/sping-logo-on-dark.png">
+    <img src="docs/brand/sping-logo-on-light.png" alt="sping" width="240">
+  </picture>
+  <br><br>
+  <a href="https://github.com/LambdaBytes/sping/releases/latest"><img src="https://img.shields.io/github/v/release/LambdaBytes/sping?style=flat&labelColor=0B0E10&color=C9A227&logo=github&logoColor=white" alt="GitHub release"></a>
+  <a href="https://crates.io/crates/sping"><img src="https://img.shields.io/crates/v/sping?style=flat&labelColor=0B0E10&color=C9A227&logo=rust&logoColor=white" alt="crates.io"></a>
+  <a href="https://github.com/LambdaBytes/sping/releases"><img src="https://img.shields.io/github/downloads/LambdaBytes/sping/total?style=flat&labelColor=0B0E10&color=C9A227&logo=github&logoColor=white" alt="Downloads"></a>
+  <br>
+  <a href="https://github.com/LambdaBytes/sping/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/LambdaBytes/sping/ci.yml?branch=main&style=flat&label=CI&labelColor=0B0E10&logo=githubactions&logoColor=white" alt="CI"></a>
+  <a href="https://github.com/LambdaBytes/sping/stargazers"><img src="https://img.shields.io/github/stars/LambdaBytes/sping?style=flat&labelColor=0B0E10&color=D8DEE4&logo=github&logoColor=white" alt="GitHub stars"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/LambdaBytes/sping?style=flat&labelColor=0B0E10&color=D8DEE4" alt="License: MIT"></a>
+  <br><br>
+</div>
 
 A modern ping for humans. Terminal-native, real-time connectivity monitor that doesn't just measure packets — **it interprets network context**.
-
-<p align="center"><img src="docs/sping-logo.png" alt="sping" width="300"></p>
 
 ![sping 1.7.0: --diagnose on a host that stops answering ping and on a dead path, a cable to Wi-Fi change while monitoring, and the classic view](docs/sping-1.7.0.gif)
 
