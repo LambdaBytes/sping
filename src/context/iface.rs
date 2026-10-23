@@ -243,30 +243,54 @@ fn pick_in_zone(
 /// <ifindex, hex> <prefix len, hex> <scope> <flags> <name>`.
 #[cfg(any(target_os = "linux", test))]
 fn parse_if_inet6(text: &str) -> Vec<(u32, InterfaceInfo)> {
-    text.lines()
-        .filter_map(|line| {
-            let mut f = line.split_whitespace();
-            let (addr, index, prefix, _scope, _flags, name) = (
-                f.next()?,
-                f.next()?,
-                f.next()?,
-                f.next()?,
-                f.next()?,
-                f.next()?,
-            );
-            let bits = u128::from_str_radix(addr, 16).ok()?;
-            let index = u32::from_str_radix(index, 16).ok()?;
-            let prefix_len = u8::from_str_radix(prefix, 16).ok()?;
-            Some((
-                index,
+    if_inet6_lines(text)
+        .map(|line| {
+            (
+                line.index,
                 InterfaceInfo {
-                    name: name.to_string(),
-                    ip: IpAddr::V6(std::net::Ipv6Addr::from(bits)),
-                    prefix_len,
+                    name: line.name.to_string(),
+                    ip: IpAddr::V6(line.ip),
+                    prefix_len: line.prefix_len,
                 },
-            ))
+            )
         })
         .collect()
+}
+
+/// One line of `/proc/net/if_inet6`.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) struct IfInet6Line<'a> {
+    pub index: u32,
+    pub ip: std::net::Ipv6Addr,
+    pub prefix_len: u8,
+    /// `IFA_F_*` (`linux/if_addr.h`): `TEMPORARY` 0x01, `DADFAILED` 0x08,
+    /// `DEPRECATED` 0x20, `TENTATIVE` 0x40, ...; `None` when the field does
+    /// not read as hex (the line still gives its address).
+    pub flags: Option<u32>,
+    pub name: &'a str,
+}
+
+/// The well-formed lines of `/proc/net/if_inet6`'s text.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn if_inet6_lines(text: &str) -> impl Iterator<Item = IfInet6Line<'_>> {
+    text.lines().filter_map(|line| {
+        let mut f = line.split_whitespace();
+        let (addr, index, prefix, _scope, flags, name) = (
+            f.next()?,
+            f.next()?,
+            f.next()?,
+            f.next()?,
+            f.next()?,
+            f.next()?,
+        );
+        Some(IfInet6Line {
+            index: u32::from_str_radix(index, 16).ok()?,
+            ip: std::net::Ipv6Addr::from(u128::from_str_radix(addr, 16).ok()?),
+            prefix_len: u8::from_str_radix(prefix, 16).ok()?,
+            flags: u32::from_str_radix(flags, 16).ok(),
+            name,
+        })
+    })
 }
 
 // ── macOS: ifconfig parsing ──────────────────────────────────────────
@@ -289,11 +313,16 @@ fn interface_index(name: &str) -> u32 {
     unsafe { libc::if_nametoindex(name.as_ptr()) }
 }
 
+/// `ifconfig` by absolute path, like route (`route::default_gateway_macos`):
+/// cron's PATH, /usr/bin:/bin, does not reach /sbin. Written here alone:
+/// the nixpkgs recipe (`.github/workflows/nixpkgs-validation.yml`) points it
+/// at nixpkgs' own on Darwin by replacing it in this file.
+#[cfg(target_os = "macos")]
+pub(crate) const IFCONFIG: &str = "/sbin/ifconfig";
+
 #[cfg(target_os = "macos")]
 fn list_interfaces_ifconfig() -> Vec<InterfaceInfo> {
-    // By absolute path, like route (`route::default_gateway_macos`): cron's
-    // PATH, /usr/bin:/bin, does not reach /sbin.
-    let output = std::process::Command::new("/sbin/ifconfig").output().ok();
+    let output = std::process::Command::new(IFCONFIG).output().ok();
     let Some(output) = output else {
         return Vec::new();
     };

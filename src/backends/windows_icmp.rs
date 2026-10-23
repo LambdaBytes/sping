@@ -236,18 +236,9 @@ mod imp {
         fn ping_v4(&self, opts: &ProbeOptions, seq: u16, ip: u32) -> ProbeResult {
             match self.echo_v4(ip, opts.payload_size, opts.timeout) {
                 Err(err) => Self::api_failure(err, seq),
-                Ok(reply) => match reply.status {
-                    0 => ProbeResult::Reply {
-                        seq: seq as u64,
-                        rtt: reply.rtt,
-                        ttl: reply.ttl,
-                    },
-                    IP_REQ_TIMED_OUT => ProbeResult::Timeout { seq: seq as u64 },
-                    status => ProbeResult::Error {
-                        seq: seq as u64,
-                        message: format!("ICMP error status {status}"),
-                    },
-                },
+                Ok(reply) => {
+                    super::echo_result(seq, reply.status, false, reply.from, reply.rtt, reply.ttl)
+                }
             }
         }
 
@@ -311,19 +302,11 @@ mod imp {
         fn ping_v6(&self, opts: &ProbeOptions, seq: u16, addr: [u8; 16]) -> ProbeResult {
             match self.echo_v6(addr, opts.scope_id, opts.payload_size, opts.timeout) {
                 Err(err) => Self::api_failure(err, seq),
-                Ok(reply) => match reply.status {
-                    0 => ProbeResult::Reply {
-                        seq: seq as u64,
-                        rtt: reply.rtt,
-                        // Icmp6SendEcho2 replies carry no hop-limit information.
-                        ttl: 0,
-                    },
-                    IP_REQ_TIMED_OUT => ProbeResult::Timeout { seq: seq as u64 },
-                    status => ProbeResult::Error {
-                        seq: seq as u64,
-                        message: format!("ICMPv6 error status {status}"),
-                    },
-                },
+                // Icmp6SendEcho2 replies carry no hop-limit information
+                // (`reply.ttl` is 0).
+                Ok(reply) => {
+                    super::echo_result(seq, reply.status, true, reply.from, reply.rtt, reply.ttl)
+                }
             }
         }
 
@@ -624,6 +607,40 @@ pub(crate) fn trace_outcome(status: u32, is_v6: bool) -> TraceOutcome {
     }
 }
 
+/// The probe's result from a reply `Status`: an echo reply; a timeout
+/// (`IP_REQ_TIMED_OUT`); a destination unreachable, by the trace's reading
+/// of the table, from `from` (a router, or this host when it found no route
+/// or no neighbor); anything else an error that names the status.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn echo_result(
+    seq: u16,
+    status: u32,
+    is_v6: bool,
+    from: std::net::IpAddr,
+    rtt: std::time::Duration,
+    ttl: u8,
+) -> crate::probe::types::ProbeResult {
+    use crate::probe::trace::ReplyKind;
+    use crate::probe::types::ProbeResult;
+    let seq = seq as u64;
+    match (status, trace_outcome(status, is_v6)) {
+        (0, _) => ProbeResult::Reply { seq, rtt, ttl },
+        // Only IP_REQ_TIMED_OUT (11010).
+        (_, TraceOutcome::Silent) => ProbeResult::Timeout { seq },
+        (_, TraceOutcome::Reply(ReplyKind::Unreachable(kind))) => {
+            ProbeResult::Unreachable { seq, from, kind }
+        }
+        (status, _) => ProbeResult::Error {
+            seq,
+            message: if is_v6 {
+                format!("ICMPv6 error status {status}")
+            } else {
+                format!("ICMP error status {status}")
+            },
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,5 +692,44 @@ mod tests {
             trace_outcome(11004, true),
             reply(ReplyKind::Unreachable(AdminProhibited))
         );
+    }
+
+    /// The probe's reading of a reply: unreachables as such, with who sent
+    /// them; the rest as before 1.8 (reply, timeout, or an error naming the
+    /// status, time exceeded included).
+    #[test]
+    fn echo_statuses_as_probe_results() {
+        use crate::probe::types::ProbeResult;
+        use std::time::Duration;
+        let rtt = Duration::from_millis(4);
+        let router: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let summary = |r: ProbeResult| match r {
+            ProbeResult::Reply { seq, rtt, ttl } => format!("reply {seq} {rtt:?} {ttl}"),
+            ProbeResult::Timeout { seq } => format!("timeout {seq}"),
+            ProbeResult::Unreachable { seq, from, kind } => {
+                format!("unreachable {seq} {from} {kind:?}")
+            }
+            ProbeResult::Error { seq, message } => format!("error {seq} {message}"),
+            other => format!("{other:?}"),
+        };
+        for (status, v6, expected) in [
+            (0, false, "reply 7 4ms 57"),
+            (11010, false, "timeout 7"),
+            (11003, false, "unreachable 7 192.0.2.1 Host"),
+            (11002, true, "unreachable 7 192.0.2.1 Net"),
+            (11004, false, "unreachable 7 192.0.2.1 Protocol"),
+            (11004, true, "unreachable 7 192.0.2.1 AdminProhibited"),
+            (11005, false, "unreachable 7 192.0.2.1 Port"),
+            (11040, true, "unreachable 7 192.0.2.1 Other"),
+            (11013, false, "error 7 ICMP error status 11013"),
+            (11009, true, "error 7 ICMPv6 error status 11009"),
+            (11050, false, "error 7 ICMP error status 11050"),
+        ] {
+            assert_eq!(
+                summary(echo_result(7, status, v6, router, rtt, 57)),
+                expected,
+                "{status} v6={v6}"
+            );
+        }
     }
 }

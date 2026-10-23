@@ -12,7 +12,7 @@ use crate::diagnostics::evidence::{Gap, Outcome, Reason, Role};
 use crate::diagnostics::planner::{Conclusion, Diagnosis};
 use crate::probe::diagnose::DiagnoseState;
 use crate::probe::trace::{HopProbe, Unavailable, UnreachableKind};
-use crate::probe::types::{ProbeSnapshot, TcpState};
+use crate::probe::types::{ProbeSnapshot, TcpState, Unreachable};
 
 /// Format a `Duration` as ms ("23.4 ms"), switching to seconds at or above
 /// 1000 ms. Precision decreases with magnitude (2, 1, then 0 decimals).
@@ -89,6 +89,16 @@ pub fn tcp_outcome(snap: &ProbeSnapshot, sep: &str) -> Option<String> {
         TcpState::Timeout => Some(format!("TCP {port} timeout{sep}no answer")),
         TcpState::Refused | TcpState::Error => None,
     }
+}
+
+/// The latest probe's destination unreachable as the Events line says it:
+/// who reported what, not why.
+pub fn unreachable_event(unreachable: &Unreachable) -> String {
+    format!(
+        "{} reports {}",
+        unreachable.from,
+        unreachable_name(unreachable.kind)
+    )
 }
 
 /// A finding as the Events line says it.

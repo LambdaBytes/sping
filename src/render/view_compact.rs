@@ -15,7 +15,7 @@ use crate::probe::pulse::PulseScaler;
 use crate::probe::quality::Trend;
 use crate::probe::types::ProbeSnapshot;
 use crate::render::format::{
-    events, fmt_elapsed, fmt_loss, fmt_rtt, fmt_rtt_opt, fmt_source, tcp_outcome,
+    events, fmt_elapsed, fmt_loss, fmt_rtt, fmt_rtt_opt, fmt_source, tcp_outcome, unreachable_event,
 };
 use crate::render::icons;
 
@@ -189,13 +189,17 @@ pub fn draw_inline(
 
     let input = DiagInput::from_snapshot(snap, gw, wan);
     let mut events = events(&correlator::diagnose(&input), diagnose, sep);
-    // How the last TCP connect ended, or the probe error, goes first: it
-    // explains what the diagnostics describe.
+    // How the last TCP connect ended, the probe error, or who reported the
+    // target unreachable, goes first: it explains what the diagnostics
+    // describe.
     if let Some(outcome) = tcp_outcome(snap, sep) {
         events.insert(0, outcome);
     }
     if let Some(error) = &snap.last_error {
         events.insert(0, error.clone());
+    }
+    if let Some(unreachable) = &snap.icmp_unreachable {
+        events.insert(0, unreachable_event(unreachable));
     }
     if !events.is_empty() {
         write!(w, "Events     {}", events.join(sep))?;

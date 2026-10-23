@@ -8,6 +8,11 @@
 //! source); 2, a few probes (TCP ports of the main address, the other
 //! family); 3, the trace of the main address.
 //!
+//! A long outage is diagnosed again: `RENEW` after a diagnosis concludes,
+//! while the outage lasts in the same generation, another round gathers the
+//! evidence anew from level 1. The diagnosis standing stays until that round
+//! concludes and replaces it whole; nothing of one round enters another.
+//!
 //! Traffic: a request's probes (its worst case) count from its start until
 //! `WINDOW` after its outcome, and what counts never passes `CEILING`, so no
 //! window of that length sees more probes sent, however long an operation
@@ -43,6 +48,10 @@ pub const WINDOW: Duration = Duration::from_secs(60);
 pub const MAX_IN_FLIGHT: usize = 3;
 /// Echo requests sent to the other family.
 pub const OTHER_FAMILY_ECHOES: u8 = 3;
+/// How long a diagnosis stands before a long outage is diagnosed again,
+/// from when it concluded. A traffic bound (one round of probes per period
+/// at most), not a diagnostic threshold.
+pub const RENEW: Duration = Duration::from_secs(300);
 
 /// What the planner may try; the executor builds it from the command line.
 #[derive(Debug, Clone)]
@@ -101,7 +110,8 @@ pub enum Status<'a> {
     /// The main target is not down.
     Idle,
     Diagnosing,
-    /// Concluded; it stands while the outage and the generation last.
+    /// Concluded; it stands while the outage and the generation last, until
+    /// the next round (`RENEW`) concludes.
     Done(&'a Diagnosis),
 }
 
@@ -208,8 +218,12 @@ struct Incident {
     started: Instant,
     /// Started and without an outcome.
     pending: Vec<Request>,
+    /// The current round's (or the last one's, once it concluded).
     evidence: Vec<Evidence>,
-    done: Option<Diagnosis>,
+    /// The diagnosis standing and when its round concluded.
+    done: Option<(Diagnosis, Instant)>,
+    /// A round runs while `done` stands.
+    renewing: bool,
 }
 
 impl Planner {
@@ -256,6 +270,7 @@ impl Planner {
                     pending: Vec::new(),
                     evidence: Vec::new(),
                     done: None,
+                    renewing: false,
                 });
             }
         } else {
@@ -314,7 +329,7 @@ impl Planner {
             None => Status::Idle,
             Some(Incident { done: None, .. }) => Status::Diagnosing,
             Some(Incident {
-                done: Some(diagnosis),
+                done: Some((diagnosis, _)),
                 ..
             }) => Status::Done(diagnosis),
         }
@@ -341,19 +356,29 @@ impl Planner {
 
     /// Starts what the incident needs next, as far as the slots and the
     /// traffic window allow, in order; concludes once nothing is missing or
-    /// pending.
+    /// pending. `RENEW` after a conclusion, a round starts again from level
+    /// 1: the round before concluded with nothing pending, so no outcome of
+    /// it can come into the new one.
     fn advance(&mut self, now: Instant) -> Vec<Request> {
         let Some(incident) = self.incident.as_mut() else {
             return Vec::new();
         };
-        if incident.done.is_some() {
-            return Vec::new();
+        if let Some((_, concluded)) = &incident.done
+            && !incident.renewing
+        {
+            if now.saturating_duration_since(*concluded) < RENEW {
+                return Vec::new();
+            }
+            incident.renewing = true;
+            incident.evidence.clear();
         }
         self.started.retain(|s| s.counts_at(now));
 
         let needed = needs(&self.scope, incident.target, &incident.evidence);
         if needed.is_empty() && incident.pending.is_empty() {
-            incident.done = Some(conclude(&self.scope, incident.target, &incident.evidence));
+            let diagnosis = conclude(&self.scope, incident.target, &incident.evidence);
+            incident.done = Some((diagnosis, now));
+            incident.renewing = false;
             return Vec::new();
         }
         let mut start = Vec::new();
@@ -1940,5 +1965,307 @@ mod tests {
             traces >= 5,
             "only {traces} traces: the run does not exercise the ceiling"
         );
+    }
+
+    impl Run {
+        /// Answers the round `RENEW` started with `script` until it
+        /// concludes, ticking the main target down once a second when
+        /// nothing runs; the diagnosis it renews stands until then.
+        fn settle_renewal(&mut self, mut script: impl FnMut(&Request) -> Outcome) -> Diagnosis {
+            let Status::Done(standing) = self.planner.status() else {
+                panic!("nothing concluded: {:?}", self.planner.status());
+            };
+            let standing = standing.clone();
+            for _ in 0..1000 {
+                match self.planner.status() {
+                    Status::Done(diagnosis) if *diagnosis != standing => return diagnosis.clone(),
+                    Status::Done(_) => {}
+                    status => panic!("{status:?} while renewing"),
+                }
+                if self.queue.is_empty() {
+                    self.now += 1;
+                    self.tick(Reachability::Offline);
+                } else {
+                    self.answer_next(&mut script);
+                }
+            }
+            panic!("the renewal never concluded");
+        }
+    }
+
+    /// The path changed: its second hop reports the target unreachable.
+    fn prohibited(r: &Request) -> Outcome {
+        match r.action {
+            Action::Trace { .. } => trace(
+                TraceStatus::Unreachable {
+                    ttl: 2,
+                    from: ip("192.0.2.9"),
+                    kind: UnreachableKind::AdminProhibited,
+                },
+                vec![hop(1, vec![reply("192.0.2.1", 1); 3])],
+            ),
+            _ => base(r),
+        }
+    }
+
+    /// A long outage: `RENEW` after the diagnosis concluded every level is
+    /// asked again, and the diagnosis stands until the new one replaces it,
+    /// here after the path changed.
+    #[test]
+    fn a_long_outage_is_diagnosed_again() {
+        let (mut run, first) = diagnose(icmp(&[443, 80]), base);
+        assert!(matches!(
+            conclusions(&first)[0],
+            Conclusion::SilentAfter { .. }
+        ));
+        let concluded = run.now;
+        let asked = run.started.len();
+        for now in concluded + 1..concluded + RENEW.as_secs() {
+            run.now = now;
+            assert_eq!(run.tick(Reachability::Offline), Step::default(), "at {now}");
+        }
+        assert_eq!(run.planner.status(), Status::Done(&first));
+
+        run.now = concluded + RENEW.as_secs();
+        let step = run.tick(Reachability::Offline);
+        let level1: Vec<_> = step
+            .start
+            .iter()
+            .map(|r| (r.role, r.action.clone()))
+            .collect();
+        assert_eq!(
+            level1,
+            [
+                (Role::Main, Action::Source { target: addr(MAIN) }),
+                (Role::Name, Action::Resolve),
+            ]
+        );
+        assert_eq!(run.planner.status(), Status::Done(&first));
+
+        let second = run.settle_renewal(prohibited);
+        assert_eq!(
+            conclusions(&second)[0],
+            Conclusion::ReportedUnreachable {
+                ttl: 2,
+                from: ip("192.0.2.9"),
+                kind: UnreachableKind::AdminProhibited
+            }
+        );
+        let actions = run.actions();
+        assert_eq!(
+            actions[asked..],
+            actions[..asked],
+            "the same requests again"
+        );
+    }
+
+    /// A round starts from nothing: TCP 443 answered in the first and spared
+    /// the trace; in the second it does not, and the trace runs. Nothing of
+    /// the first round is in the second's diagnosis.
+    #[test]
+    fn a_renewal_takes_none_of_the_round_before() {
+        let (mut run, first) = diagnose(icmp(&[443]), |r| match r.action {
+            Action::Connect { .. } => Outcome::Connect(Connection::Open),
+            _ => base(r),
+        });
+        assert!(!run.started_any(is_trace));
+        assert!(conclusions(&first).contains(&Conclusion::AnswersTcp {
+            port: 443,
+            refused: false
+        }));
+
+        run.now += RENEW.as_secs();
+        run.tick(Reachability::Offline);
+        let second = run.settle_renewal(base);
+        assert!(run.started_any(is_trace));
+        assert!(
+            !conclusions(&second)
+                .iter()
+                .any(|c| matches!(c, Conclusion::AnswersTcp { .. })),
+            "{second:?}"
+        );
+        assert!(
+            second
+                .evidence
+                .iter()
+                .all(|e| first.evidence.iter().all(|f| f.id != e.id))
+        );
+        assert_eq!(
+            second.evidence.len(),
+            first.evidence.len() + 1,
+            "and the trace"
+        );
+    }
+
+    /// Recovery or a new generation during a renewal closes the incident as
+    /// at any other time: what runs is to be cancelled and its outcome
+    /// refused; a new generation is diagnosed from its first round.
+    #[test]
+    fn a_renewal_ends_with_the_outage() {
+        for recovery in [true, false] {
+            let (mut run, _) = diagnose(icmp(&[443, 80]), base);
+            run.now += RENEW.as_secs();
+            run.tick(Reachability::Offline);
+            let renewal: Vec<_> = run.queue.iter().map(|r| r.id).collect();
+            assert_eq!(renewal.len(), 2, "level 1");
+
+            run.now += 1;
+            let step = if recovery {
+                run.tick(Reachability::Online)
+            } else {
+                run.target = addr("198.51.100.8");
+                run.tick(Reachability::Offline)
+            };
+            assert_eq!(step.cancel, renewal);
+            if recovery {
+                assert_eq!(run.planner.status(), Status::Idle);
+            } else {
+                assert_eq!(run.planner.status(), Status::Diagnosing);
+                assert_eq!(step.start[0].action, Action::Source { target: run.target });
+            }
+            for id in renewal {
+                let outcome = Outcome::Failed("cancelled".into());
+                assert_eq!(run.answer(id, outcome), Err(Rejected::Stale));
+            }
+        }
+    }
+
+    /// A round whose trace takes longer than another `RENEW` starts no round
+    /// on top of it; the next starts `RENEW` after it concluded.
+    #[test]
+    fn a_slow_renewal_starts_no_other() {
+        let (mut run, _) = diagnose(icmp(&[443, 80]), base);
+        run.now += RENEW.as_secs();
+        run.tick(Reachability::Offline);
+        run.settle_until(is_trace);
+        let trace = run.queue.front().cloned().unwrap();
+        let asked = run.started.len();
+        for _ in 0..RENEW.as_secs() + 60 {
+            run.now += 1;
+            assert_eq!(run.tick(Reachability::Offline), Step::default());
+        }
+        assert_eq!(run.started.len(), asked);
+
+        run.answer(trace.id, base(&trace)).unwrap();
+        let Status::Done(second) = run.planner.status() else {
+            panic!("not concluded: {:?}", run.planner.status());
+        };
+        assert!(second.evidence.iter().any(|e| e.id == trace.id));
+        let concluded = run.now;
+        for _ in 1..RENEW.as_secs() {
+            run.now += 1;
+            assert_eq!(run.tick(Reachability::Offline), Step::default());
+        }
+        run.now += 1;
+        assert!(!run.tick(Reachability::Offline).start.is_empty());
+        assert_eq!(run.now, concluded + RENEW.as_secs());
+    }
+
+    /// An outcome counts once: one repeated, or one of the round before, is
+    /// refused and leaves the renewal as it was.
+    #[test]
+    fn a_renewal_takes_each_outcome_once() {
+        let (mut run, first) = diagnose(icmp(&[443, 80]), base);
+        let old = first.evidence[0].id;
+        run.now += RENEW.as_secs();
+        run.tick(Reachability::Offline);
+        let source = run.queue.front().cloned().unwrap();
+        assert_eq!(run.answer(old, base(&source)), Err(Rejected::NotRunning));
+        run.answer(source.id, base(&source)).unwrap();
+        assert_eq!(
+            run.answer(source.id, base(&source)),
+            Err(Rejected::NotRunning)
+        );
+
+        let second = run.settle_renewal(base);
+        let ids: Vec<_> = second.evidence.iter().map(|e| e.id).collect();
+        assert_eq!(ids.iter().filter(|id| **id == source.id).count(), 1);
+        assert!(!ids.contains(&old));
+        assert_eq!(conclusions(&second), conclusions(&first));
+    }
+
+    /// An hour down, operations taking their time (the trace 17 s): each
+    /// round starts `RENEW` after the previous one concluded, no sooner, and
+    /// no 60 s see more than the ceiling sent.
+    #[test]
+    fn renewals_keep_the_traffic_bounded() {
+        let scope = icmp(&[443, 80]);
+        let mut run = Run::new(scope.clone());
+        let lasts = |action: &Action| match action {
+            Action::Source { .. } | Action::Resolve => 0,
+            Action::Connect { .. } => 1,
+            Action::Echo { .. } => 3,
+            Action::Trace { .. } => 17,
+        };
+        let mut due: Vec<(u64, Request)> = Vec::new();
+        let mut seen = 0;
+        // The second each round concluded.
+        let mut concluded = Vec::new();
+        let mut standing: Option<Diagnosis> = None;
+        for t in 0..3600 {
+            run.now = t;
+            loop {
+                due.extend(
+                    run.started[seen..]
+                        .iter()
+                        .map(|(at, r)| (at + lasts(&r.action), r.clone())),
+                );
+                seen = run.started.len();
+                due.sort_by_key(|(at, r)| (*at, r.id.0));
+                if due.first().is_none_or(|(at, _)| *at > t) {
+                    break;
+                }
+                let (_, request) = due.remove(0);
+                run.answer(request.id, base(&request)).unwrap();
+            }
+            run.tick(Reachability::Offline);
+            if let Status::Done(diagnosis) = run.planner.status()
+                && standing.as_ref() != Some(diagnosis)
+            {
+                concluded.push(t);
+                standing = Some(diagnosis.clone());
+            }
+        }
+
+        // A round's first request is the main address' source check.
+        let rounds: Vec<u64> = run
+            .started
+            .iter()
+            .filter(|(_, r)| r.role == Role::Main)
+            .map(|&(at, _)| at)
+            .collect();
+        assert!(rounds.len() >= 2, "{rounds:?}");
+        assert!(
+            rounds.len() as u64 <= 1 + 3600 / RENEW.as_secs(),
+            "{rounds:?}"
+        );
+        assert_eq!(rounds[0], 0);
+        for (start, previous) in rounds[1..].iter().zip(&concluded) {
+            assert_eq!(
+                *start,
+                previous + RENEW.as_secs(),
+                "{rounds:?} {concluded:?}"
+            );
+        }
+
+        let cost_of = |action: &Action| match action {
+            Action::Echo { count, .. } => u32::from(*count),
+            Action::Connect { .. } => 1,
+            Action::Trace { .. } => scope.trace_probes,
+            Action::Source { .. } | Action::Resolve => 0,
+        };
+        let ended = |id: RequestId| run.ended.iter().find(|(e, _)| *e == id).map(|&(_, at)| at);
+        for w in 0..3600 {
+            let in_window: u32 = run
+                .started
+                .iter()
+                .filter(|(start, r)| *start <= w && ended(r.id).is_none_or(|end| w < end + 60))
+                .map(|(_, r)| cost_of(&r.action))
+                .sum();
+            assert!(
+                in_window <= CEILING,
+                "{in_window} probes in the 60 s up to {w}"
+            );
+        }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "sping"
-version = "1.7.1"
+version = "1.8.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Antonio Cotos <acf981@protonmail.com>"]
@@ -20,7 +20,7 @@ exclude = [
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "net"] }
 clap = { version = "4", features = ["derive"] }
-crossterm = "0.28"
+crossterm = "0.29"
 thiserror = "2"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
@@ -38,7 +38,7 @@ tokio = { version = "1", features = ["test-util"] }
 [build-dependencies]
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-clap_mangen = "0.2"
+clap_mangen = "0.3"
 
 [profile.release]
 strip = true

@@ -214,7 +214,8 @@ impl Config {
             interval: Duration::from_millis(args.interval_ms),
             timeout: Duration::from_secs_f64(args.timeout),
             payload_size,
-            tcp_port: args.tcp,
+            // `--icmp` is the ICMP probe; clap refuses it with `--tcp`.
+            tcp_port: if args.icmp { None } else { args.tcp },
             ttl: args.ttl,
             count,
             quiet: args.quiet,
@@ -300,6 +301,41 @@ mod tests {
             view_of(&["Host.example", "host.example", "--view", "table"]),
             compact
         );
+    }
+
+    /// `--icmp` is the probe sping runs without it: the same probe options
+    /// for each target, one or several (batch takes the same options), with
+    /// any other option alongside.
+    #[test]
+    fn icmp_is_the_probe_without_it() {
+        let target = crate::context::dns::ResolvedAddr::unscoped("192.0.2.1".parse().unwrap());
+        for args in [
+            &["192.0.2.1"][..],
+            &["192.0.2.1", "192.0.2.2"],
+            &["192.0.2.1", "-s", "120", "-t", "9", "-W", "1", "-6"],
+            &["192.0.2.1", "--diagnose", "--view", "json"],
+        ] {
+            let plain = config(args).expect("valid arguments");
+            let with = config(&[args, &["--icmp"]].concat()).expect("valid arguments");
+            assert_eq!(with.tcp_port, None, "{args:?}");
+            assert_eq!(
+                format!("{:?}", with.probe_options(target)),
+                format!("{:?}", plain.probe_options(target)),
+                "{args:?}"
+            );
+            assert_eq!((with.view, with.diagnose), (plain.view, plain.diagnose));
+        }
+    }
+
+    /// `--icmp` and `--tcp` name two probes: refused as a conflict, before
+    /// any configuration.
+    #[test]
+    fn icmp_and_tcp_conflict() {
+        let err = Args::try_parse_from(["sping", "192.0.2.1", "--icmp", "--tcp", "443"])
+            .expect_err("refused");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let text = err.to_string();
+        assert!(text.contains("--icmp") && text.contains("--tcp"), "{text}");
     }
 
     /// Several targets are always the table: a view it is not is refused

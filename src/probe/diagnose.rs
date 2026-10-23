@@ -29,7 +29,8 @@ use crate::probe::types::{ProbeOptions, ProbeResult, ProbeSnapshot};
 /// TCP ports tried on the main address when the main probe is ICMP.
 const TCP_PORTS: [u16; 2] = [443, 80];
 /// How often the planner is asked again while nothing else happens: requests
-/// the traffic window held back start without waiting for the next probe.
+/// the traffic window held back, and a long outage's renewal, start without
+/// waiting for the next probe.
 const TICK: Duration = Duration::from_secs(1);
 
 /// What the views show of the diagnosis.
@@ -239,7 +240,8 @@ impl Extra {
 
 /// The echoes as evidence. An error does not tell whether its request left
 /// (it also comes after sending): with no reply and an error, the outcome is
-/// that error, not a silence.
+/// that error, not a silence. A destination unreachable says the request
+/// left and the target did not answer it, as a timeout does.
 pub(crate) fn echo_outcome(results: &[ProbeResult]) -> Outcome {
     let replies = results
         .iter()
@@ -248,7 +250,12 @@ pub(crate) fn echo_outcome(results: &[ProbeResult]) -> Outcome {
     let sent = replies
         + results
             .iter()
-            .filter(|r| matches!(r, ProbeResult::Timeout { .. }))
+            .filter(|r| {
+                matches!(
+                    r,
+                    ProbeResult::Timeout { .. } | ProbeResult::Unreachable { .. }
+                )
+            })
             .count();
     if replies == 0
         && let Some(message) = results.iter().find_map(|r| match r {
@@ -272,6 +279,9 @@ pub(crate) fn connect_outcome(result: ProbeResult) -> Outcome {
         ProbeResult::Timeout { .. } => Outcome::Connect(Connection::Timeout),
         ProbeResult::Error { message, .. } => Outcome::Failed(message),
         ProbeResult::Reply { .. } => Outcome::Failed("an ICMP reply to a TCP connect".into()),
+        ProbeResult::Unreachable { .. } => {
+            Outcome::Failed("an ICMP answer to a TCP connect".into())
+        }
     }
 }
 
@@ -353,7 +363,8 @@ pub struct Inputs {
 
 /// Runs the planner until `shutdown`, or until probing `finished` and the
 /// diagnosis in progress, if any, concluded or ran out of its `budget`
-/// (counted from when it started). After `finished`, a run where nothing
+/// (counted from when it started); a renewal is not waited for, the
+/// diagnosis standing is the last state. After `finished`, a run where nothing
 /// answered is diagnosed as down even before the hysteresis says so (`-c 1`).
 /// The last state is published before returning; on `shutdown` the
 /// operations still running are cancelled and nothing waits for them.
@@ -502,8 +513,8 @@ mod tests {
     use super::*;
     use crate::cli::Args;
     use crate::context::classify::TargetClass;
-    use crate::diagnostics::planner::Conclusion;
-    use crate::probe::trace::{Hop, HopProbe, ReplyKind, TraceResult};
+    use crate::diagnostics::planner::{Conclusion, RENEW};
+    use crate::probe::trace::{Hop, HopProbe, ReplyKind, TraceResult, UnreachableKind};
     use clap::Parser;
     use std::sync::Mutex;
 
@@ -524,6 +535,9 @@ mod tests {
         };
         for (args, main, other_family) in [
             (&["example.com"][..], icmp.clone(), None),
+            // `--icmp` fixes the main probe, the one sping runs without it:
+            // the diagnosis keeps its own probes, TCP included.
+            (&["example.com", "--icmp"], icmp.clone(), None),
             (
                 &["example.com", "--tcp", "8443"],
                 MainProbe::Tcp { port: 8443 },
@@ -640,7 +654,30 @@ mod tests {
             seq: 1,
             message: m.into(),
         };
+        let unreachable = || ProbeResult::Unreachable {
+            seq: 1,
+            from: "192.0.2.1".parse().unwrap(),
+            kind: UnreachableKind::Host,
+        };
         for (results, outcome) in [
+            // A destination unreachable: the request left and the target did
+            // not answer it. The same as the timeouts Linux gave for that
+            // network before 1.8; on Windows, where it was an error (a gap
+            // in the diagnosis), it is now the same evidence too.
+            (
+                vec![unreachable(), unreachable(), unreachable()],
+                Outcome::Echo {
+                    sent: 3,
+                    replies: 0,
+                },
+            ),
+            (
+                vec![unreachable(), reply(), timeout()],
+                Outcome::Echo {
+                    sent: 3,
+                    replies: 1,
+                },
+            ),
             (
                 vec![reply(), reply(), reply()],
                 Outcome::Echo {
@@ -698,6 +735,14 @@ mod tests {
                 message: "connect failed: x".into()
             }),
             Outcome::Failed("connect failed: x".into())
+        );
+        assert_eq!(
+            connect_outcome(ProbeResult::Unreachable {
+                seq: 1,
+                from: "192.0.2.1".parse().unwrap(),
+                kind: UnreachableKind::Host,
+            }),
+            Outcome::Failed("an ICMP answer to a TCP connect".into())
         );
     }
 
@@ -1119,5 +1164,96 @@ mod tests {
             "{:?}",
             b.state()
         );
+    }
+
+    /// The trace of a path that changed: its second hop reports the target
+    /// unreachable.
+    fn prohibited() -> Outcome {
+        Outcome::Trace(TraceResult {
+            status: TraceStatus::Unreachable {
+                ttl: 2,
+                from: "192.0.2.9".parse().unwrap(),
+                kind: UnreachableKind::AdminProhibited,
+            },
+            hops: vec![],
+        })
+    }
+
+    /// The target down and diagnosed (source check, trace): its state.
+    async fn diagnosed(b: &Bench) -> DiagnoseState {
+        b.probe_tx
+            .send(snapshot(3, 0, Reachability::Offline))
+            .unwrap();
+        settle().await;
+        b.script.answer(0, usable());
+        settle().await;
+        b.script.answer(1, reached());
+        settle().await;
+        let state = b.state();
+        assert!(matches!(state, DiagnoseState::Done { .. }), "{state:?}");
+        state
+    }
+
+    /// A long outage: `RENEW` after the diagnosis concluded, a new round runs
+    /// while the diagnosis stays published; the new one replaces it when it
+    /// concludes.
+    #[tokio::test(start_paused = true)]
+    async fn a_long_outage_is_diagnosed_again() {
+        let b = Bench::new();
+        let first = diagnosed(&b).await;
+        tokio::time::sleep(RENEW - Duration::from_secs(2)).await;
+        settle().await;
+        assert_eq!(b.script.actions().len(), 2, "{:?}", b.script.actions());
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        settle().await;
+        assert_eq!(
+            b.script.actions()[2],
+            Action::Source {
+                target: addr("198.51.100.7")
+            }
+        );
+        assert_eq!(b.state(), first, "the diagnosis stands");
+        b.script.answer(2, usable());
+        settle().await;
+        assert!(matches!(b.script.actions()[3], Action::Trace { .. }));
+        assert_eq!(b.state(), first, "the diagnosis stands");
+
+        b.script.answer(3, prohibited());
+        settle().await;
+        let DiagnoseState::Done { diagnosis, .. } = b.state() else {
+            panic!("not concluded: {:?}", b.state());
+        };
+        assert_eq!(
+            diagnosis.conclusions[0].conclusion,
+            Conclusion::ReportedUnreachable {
+                ttl: 2,
+                from: "192.0.2.9".parse().unwrap(),
+                kind: UnreachableKind::AdminProhibited
+            }
+        );
+    }
+
+    /// Probing finished, or a shutdown, during a renewal: the loop returns at
+    /// once with the diagnosis standing, and the renewal is cancelled.
+    #[tokio::test(start_paused = true)]
+    async fn the_end_during_a_renewal_keeps_the_diagnosis() {
+        for shutdown in [false, true] {
+            let mut b = Bench::new();
+            let first = diagnosed(&b).await;
+            tokio::time::sleep(RENEW + Duration::from_secs(1)).await;
+            settle().await;
+            assert_eq!(b.script.actions().len(), 3, "{:?}", b.script.actions());
+
+            if shutdown {
+                b.shutdown_tx.send(true).unwrap();
+            } else {
+                b.finish();
+            }
+            settle().await;
+            assert!(b.handle.is_finished(), "shutdown: {shutdown}");
+            assert_eq!(b.state(), first, "shutdown: {shutdown}");
+            assert!(b.script.cancelled(2), "shutdown: {shutdown}");
+        }
     }
 }

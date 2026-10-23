@@ -4,8 +4,21 @@
 use std::io::{self, Write};
 
 use crate::probe::diagnose::DiagnoseState;
+use crate::probe::trace::UnreachableKind;
 use crate::probe::types::{ProbeSnapshot, TcpState};
 use crate::render::format::{diagnosis_summary, fmt_rtt, untested};
+
+/// A destination unreachable as iputils `ping` prints it.
+fn ping_unreachable(kind: UnreachableKind) -> &'static str {
+    match kind {
+        UnreachableKind::Net => "Destination Net Unreachable",
+        UnreachableKind::Host => "Destination Host Unreachable",
+        UnreachableKind::Protocol => "Destination Protocol Unreachable",
+        UnreachableKind::Port => "Destination Port Unreachable",
+        UnreachableKind::AdminProhibited => "Packet filtered",
+        UnreachableKind::Other => "Destination Unreachable",
+    }
+}
 
 /// Classic view state; deduplicates on `seq` so each probe prints once, and
 /// on the diagnosis' state so each change prints once.
@@ -94,11 +107,20 @@ impl ClassicView {
                     )?;
                 }
             },
-            None => match &snap.last_error {
+            None => match (&snap.icmp_unreachable, &snap.last_error) {
+                // Not a timeout either: who said the target is unreachable,
+                // in `ping`'s words.
+                (Some(unreachable), _) => writeln!(
+                    w,
+                    "From {}: seq={} {}",
+                    unreachable.from,
+                    snap.seq,
+                    ping_unreachable(unreachable.kind)
+                )?,
                 // Not a lost reply: the probe itself failed (e.g. the OS
                 // refused to send). Say why instead of calling it a timeout.
-                Some(error) => writeln!(w, "Probe error for seq={}: {error}", snap.seq)?,
-                None => writeln!(w, "Request timeout for seq={}", snap.seq,)?,
+                (None, Some(error)) => writeln!(w, "Probe error for seq={}: {error}", snap.seq)?,
+                (None, None) => writeln!(w, "Request timeout for seq={}", snap.seq,)?,
             },
         }
         w.flush()?;
@@ -122,9 +144,14 @@ impl ClassicView {
             )?;
         } else {
             writeln!(w, "--- {} ping statistics ---", snap.target_host,)?;
+            // Destination unreachables, as iputils counts its errors.
+            let errors = match snap.unreachable {
+                0 => String::new(),
+                n => format!(", +{n} errors"),
+            };
             writeln!(
                 w,
-                "{} packets transmitted, {} received, {:.1}% packet loss",
+                "{} packets transmitted, {} received{errors}, {:.1}% packet loss",
                 snap.sent, snap.received, snap.loss_pct,
             )?;
         }
@@ -166,6 +193,30 @@ mod tests {
     #[test]
     fn lost_reply_is_reported_as_timeout() {
         assert_eq!(drawn(&lost_probe(None)), "Request timeout for seq=1\n");
+    }
+
+    /// Who said the target is unreachable, in `ping`'s words for each kind.
+    #[test]
+    fn unreachable_probe_says_who_and_why() {
+        use crate::probe::types::Unreachable;
+        for (kind, text) in [
+            (UnreachableKind::Net, "Destination Net Unreachable"),
+            (UnreachableKind::Host, "Destination Host Unreachable"),
+            (
+                UnreachableKind::Protocol,
+                "Destination Protocol Unreachable",
+            ),
+            (UnreachableKind::Port, "Destination Port Unreachable"),
+            (UnreachableKind::AdminProhibited, "Packet filtered"),
+            (UnreachableKind::Other, "Destination Unreachable"),
+        ] {
+            let mut snap = lost_probe(None);
+            snap.icmp_unreachable = Some(Unreachable {
+                from: "198.51.100.1".parse().unwrap(),
+                kind,
+            });
+            assert_eq!(drawn(&snap), format!("From 198.51.100.1: seq=1 {text}\n"));
+        }
     }
 
     #[test]
@@ -221,5 +272,33 @@ mod tests {
             "--- diagnosing why 198.51.100.8 does not answer",
         ];
         assert_eq!(String::from_utf8(out).unwrap(), expected.join("\n") + "\n");
+    }
+
+    /// A long outage's renewal is a new state even when it says the same:
+    /// its conclusions print again.
+    #[test]
+    fn a_renewal_prints_its_conclusions() {
+        use crate::diagnostics::evidence::RequestId;
+        use crate::diagnostics::planner::{Concluded, Conclusion, Diagnosis};
+        let done = |id| DiagnoseState::Done {
+            target: "198.51.100.7".parse().unwrap(),
+            diagnosis: std::sync::Arc::new(Diagnosis {
+                conclusions: vec![Concluded {
+                    conclusion: Conclusion::TargetAnswersIcmp { ttl: 3 },
+                    because: vec![RequestId::new(id)],
+                }],
+                gaps: vec![],
+                evidence: vec![],
+            }),
+        };
+        let mut view = ClassicView::new();
+        let mut out = Vec::new();
+        for state in [done(1), done(1), done(2)] {
+            view.diagnosis(&mut out, &state).unwrap();
+        }
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "--- diagnosis: target answers the trace at hop 3\n".repeat(2)
+        );
     }
 }

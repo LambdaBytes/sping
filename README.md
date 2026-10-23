@@ -36,19 +36,26 @@ Context    if eth0 · 192.168.1.100/24 · gw ● · wan ● · public
 Quality    A (100) · excellent
 ```
 
-## What's new in 1.7.1
+## What's new in 1.8.0
 
-- **`--diagnose`** (experimental): when the target stops answering, sping
-  probes further on its own (the other address family, TCP 443 and 80, a
-  bounded traceroute) and says what still answers; see
-  [Diagnose](#diagnose-experimental).
-- **The name's lookups as evidence**: a lookup that fails while the WAN
-  reference answers, or that gives no address of the family probed.
-- **Context changes while monitoring**: `context changed 00:03 ago:
-  interface eth0 → wlan0`, for the interface, source, prefix, default gateway
-  and target class.
-- **Fix**: an IPv6 target routed through an interface without IPv6 reads
-  `no IPv6 source`, not `lo ::1/128`.
+- **Unreachable is not a timeout**: when a router or this host answers the
+  probe with a destination unreachable, sping says who sent it and what it
+  said: `From 192.0.2.1: seq=3 Destination Host Unreachable` in the classic
+  view, `192.0.2.1 reports host unreachable` in Events, `icmp_unreachable`
+  in JSON. On Linux, macOS (IPv4) and Windows.
+- **`sping --ip`**: this host's addresses, every interface, IPv4 and IPv6,
+  with their prefix, kind and IPv6 state, the source each family uses and
+  the default gateway. It sends nothing; with `--external` it also asks a
+  STUN server which address it sees. See
+  [Host addresses](#host-addresses---ip).
+- **`--diagnose` in a long outage**: while the target stays down, the same
+  checks run again 5 minutes after each diagnosis concludes.
+- **`--icmp`**: the ICMP probe, named. It changes nothing today; it keeps
+  that probe for scripts when 2.0 changes what `sping target` does (see
+  [Roadmap](#roadmap)).
+- **Fixes** in `--diagnose`: on Windows, an unreachable answer for the other
+  family's address now means that family fails too, as on Linux; on Linux, a
+  redirect during the traceroute no longer ends its round with `recv failed`.
 
 Every change, version by version: [CHANGELOG.md](CHANGELOG.md).
 
@@ -142,7 +149,7 @@ gh attestation verify sping-vX.Y.Z-linux-x86_64 --repo LambdaBytes/sping
 ### Debian / Ubuntu (.deb)
 
 ```bash
-sudo dpkg -i sping_1.7.1-1_amd64.deb     # or _arm64.deb on aarch64
+sudo dpkg -i sping_1.8.0-1_amd64.deb     # or _arm64.deb on aarch64
 ```
 
 The package installs:
@@ -210,6 +217,9 @@ sping fe80::1%eth0                # IPv6 link-local: the zone is required
 sping example.com --tcp 443
 sping 192.168.1.1 10.0.0.5 --tcp 22   # every target, the same port
 
+# The ICMP probe, what sping runs without an option until 2.0 (see Roadmap)
+sping example.com --icmp
+
 # When the target stops answering, find out why (experimental; one target)
 sping example.com --diagnose
 
@@ -217,8 +227,14 @@ sping example.com --diagnose
 # Windows console (SPING_ASCII=0 forces Unicode); NO_COLOR honored
 sping 8.8.8.8 --ascii
 
-# List interfaces
-sping --list-interfaces
+# This host's addresses: every interface, IPv4 and IPv6, the source each
+# family uses and the gateway; sends nothing (see "Host addresses" below)
+sping --ip
+sping --ip --view json
+# ... and the address a STUN server sees (asks stun.cloudflare.com)
+sping --ip --external
+sping --ip --external stun.example.net:3478
+sping --list-interfaces           # the IPv4 list it has always printed
 
 # Debug mode
 sping --debug 8.8.8.8
@@ -327,6 +343,8 @@ sping 203.0.113.7 --diagnose -c 30 --view json
     already tries);
   - a bounded traceroute: 30 hops, 3 probes each, 20 s at most, stopping
     after 3 silent hops.
+- While the target stays down, it checks again 5 minutes after each
+  diagnosis concludes; the conclusions shown stay until the new ones are in.
 - Events shows `diagnosing…`, then the conclusions:
   `silent after hop 3 (203.0.113.1)`, `hop 5 (198.51.100.9) reports host
   unreachable`, `target answers the trace at hop 7`, `TCP 443 answers`,
@@ -334,7 +352,7 @@ sping 203.0.113.7 --diagnose -c 30 --view json
   - The extended view adds an `Untested` line with what could not be told
     and why (`other family not tried (address given)`, `trace unavailable:
     needs privileges`).
-  - The classic view prints `---` lines.
+  - The classic view prints `---` lines, again with each new check.
   - JSON lines carry `active_diagnosis` (see
     [JSON_CONTRACT.md](JSON_CONTRACT.md)).
 - Traffic is bounded: at most 100 extra probes in any 60 s, three operations
@@ -350,12 +368,65 @@ sping 203.0.113.7 --diagnose -c 30 --view json
   no traceroute yet: `trace unavailable on this system`.
 - Experimental: its texts and JSON codes may still change.
 
+### Host addresses (`--ip`)
+
+From 1.8 on, `sping --ip` shows what the system knows about this host's
+addresses, and exits:
+
+```text
+eth0     192.168.1.100/24            private
+         2001:db8::5b1:c2ff:1/64     global · temporary
+         fe80::1c2:3ff:fe45:6789/64  link-local
+lo       127.0.0.1/8                 loopback
+         ::1/128                     loopback
+
+Source   IPv4 192.168.1.100 (eth0) to 1.1.1.1 · no IPv6 source to 2606:4700:4700::1111
+Gateway  IPv4 192.168.1.1 (eth0)
+```
+
+- Every address of every interface, with its prefix and kind (`loopback`,
+  `link-local`, `private`, `shared (CGNAT)`, `global`). IPv6 addresses also
+  show their state: `temporary`, `deprecated`, `tentative` or `duplicate`.
+  Windows reports no temporary address yet: it is `null` in JSON.
+- The source each family would use towards a global reference address. It
+  is that route's source, so a VPN with routes of its own can make it differ
+  from the default route's.
+- The IPv4 default gateway.
+- Without `--external`, nothing is sent and no privilege is needed: the
+  source comes from a UDP connect, which sends no packet. What the system does not say is said as
+  unknown, never guessed.
+- `--view json` prints one object instead (see [JSON_CONTRACT.md](JSON_CONTRACT.md)).
+  `--list-interfaces` still prints its IPv4 list as before.
+
+With `--external`, `sping --ip` also asks a STUN server (RFC 8489, over UDP)
+which address and port it sees each family's request come from:
+
+```text
+Source    IPv4 192.168.1.100 (eth0) to 1.1.1.1 · no IPv6 source to 2606:4700:4700::1111
+Gateway   IPv4 192.168.1.1 (eth0)
+External  IPv4 203.0.113.5:40312 from 192.168.1.100:51234 · IPv6 unknown (no route to the server) (STUN server stun.cloudflare.com:3478)
+```
+
+- It asks a third party, so only when given: `stun.cloudflare.com:3478` by
+  default, or `--external SERVER[:PORT]` (`[address]:port` for an IPv6
+  address with a port). The system resolver looks the name up once.
+- At most three requests per family (at 0, 0.5 and 1.5 s) and 3 s in all,
+  both families at once. An answer counts only with the request's
+  transaction ID.
+- `from` is this host's socket the request left from. With the address the
+  server saw, it is the translation on the way out (NAT, CGNAT, a VPN, or
+  none); sping does not name it.
+- What the server did not say (no answer, an error, no route) is unknown,
+  with the reason, and the exit code stays 0.
+
 ### ICMP permissions
 
-sping works without admin/sudo on all platforms. On Linux it uses unprivileged
-DGRAM ICMP sockets (the `net.ipv4.ping_group_range` sysctl, which covers all
-users by default on Debian and most distributions), and falls back to a RAW
-socket only when DGRAM is denied.
+sping works without admin/sudo on macOS and Windows. On Linux it uses
+unprivileged DGRAM ICMP sockets (the `net.ipv4.ping_group_range` sysctl), and
+falls back to a RAW socket only when DGRAM is denied. Most distributions open
+DGRAM ICMP to every user by default; Debian does from Debian 13 on (the
+`linux-sysctl-defaults` package, recommended by systemd), not on Debian 12, and
+a system upgraded to 13 may lack that package.
 
 If DGRAM ICMP is restricted, widen the allowed group range:
 
@@ -386,6 +457,8 @@ sudo setcap cap_net_raw+ep /usr/bin/sping
 - **TTL + hop count**: `ttl 116 · hops ~12`; an OS hint only while the TTL
   is still an initial value (`ttl 64 (Unix-like)`, `128 (Windows)`, `255
   (network)`): past a router the TTL no longer says who answered
+- A **destination unreachable** on the probe is told apart from a timeout:
+  who sent it and what it said
 
 **Network context and diagnosis**
 - **Network context** of each target: interface, source address and prefix,
@@ -405,7 +478,11 @@ sudo setcap cap_net_raw+ep /usr/bin/sping
   for 30 s
 - **`--diagnose`** (experimental): when the target stops answering, the
   other address family, TCP 443 and 80 and a bounded traceroute say what
-  still answers
+  still answers, checked again 5 minutes after each conclusion while the
+  target stays down
+- **`sping --ip`**: every address of every interface with its kind and IPv6
+  state, the source of each family and the default gateway; with
+  `--external`, the address a STUN server sees
 - IPv6 link-local targets with their zone (`fe80::1%eth0`)
 
 **Views and modes**
@@ -444,6 +521,8 @@ sudo setcap cap_net_raw+ep /usr/bin/sping
 | TTL / hop limit | recvmsg | IP header (IPv4), recvmsg (IPv6) | API (IPv4 only) |
 | Gateway detection | /proc/net/route | `/sbin/route` | `route print` |
 | Interface detection | /proc/net/route, if_inet6 | `/sbin/ifconfig` | GetAdaptersAddresses |
+| Host addresses (`--ip`) | getifaddrs, if_inet6 | `/sbin/ifconfig` | GetAdaptersAddresses |
+| Destination unreachable | ICMP errors (`IP_RECVERR`) | DGRAM socket, IPv4 only | reply status |
 | `-I` interface | SO_BINDTODEVICE | accepted, no effect | warning, unbound |
 | `-S` source | bind() | bind() | OS routes (TCP: bind()) |
 | TCP connect | socket2 | socket2 | socket2 (Winsock) |
@@ -479,6 +558,10 @@ x86_64/aarch64 (glibc, and static with musl), macOS arm64 and Windows x86_64.
 - `-I`/`--interface` binds only on Linux: macOS accepts the flag but it has
   no effect, Windows prints a warning and probes unbound. `-S`/`--source` is
   ignored by ICMP on Windows, where the OS picks the route; `--tcp` binds it.
+- Each probe waits for its answer, up to `-W`, before the next one goes out,
+  as Windows `ping` does (Linux and macOS `ping` keep sending every `-i`):
+  with `-W` longer than `-i`, a target that does not answer is probed every
+  `-W` (2 s by default), and `-c N` can take up to N × `-W`.
 - The raw-socket fallback and `-I` need `CAP_NET_RAW` (see
   [SECURITY.md](SECURITY.md)); the unprivileged DGRAM path covers the common
   case.
@@ -489,30 +572,40 @@ x86_64/aarch64 (glibc, and static with musl), macOS arm64 and Windows x86_64.
   `/etc/hosts` and the servers in `/etc/resolv.conf`, without the system's
   NSS modules (mDNS `.local` names, for example, do not resolve).
 - IPv6 replies carry a hop limit (`ttl`) on Linux and macOS; on Windows it
-  is not shown (`0` in JSON). Gateway detection and `--list-interfaces` are
-  IPv4 only.
+  is not shown (`0` in JSON). The gateway is detected for IPv4 only, and
+  `--list-interfaces` lists IPv4 addresses only (`--ip` lists them all).
 - With `--tcp`, the gateway and WAN probes stay ICMP: without ICMP permission
   they are disabled with a warning and show `?`.
 - An IPv6 link-local target needs its zone: `fe80::1%eth0`, or the interface
   index (`fe80::1%2`), which is the only form Windows takes.
 - `--diagnose` is experimental and takes one target; on macOS its
   traceroute is IPv4 only.
+- A destination unreachable is told apart from a timeout on Linux, Windows
+  and, for IPv4 targets, macOS; on macOS an IPv6 one is still a timeout. One
+  the system reports only after `-W` is a timeout as well: on Linux and
+  Windows, a LAN address with no host is reported once ARP gives up, about
+  3 s after it starts, so with the default `-W 2` some of its probes show as
+  timeouts; `-W 4` shows them all as unreachable.
 
 ## Roadmap
 
-- Distribution packaging: AUR (`lambdabytes-sping`), Fedora/COPR,
-  Debian/Raspberry Pi OS (work in progress under [`packaging/`](packaging/)).
+- **2.0 will change what `sping target` does:** it will find out on its own
+  why a target does not answer, as `--diagnose` does today. `--icmp` (from
+  1.8) keeps today's probe, for scripts that rely on it; `-4`, `-6` and
+  `--tcp` stay as they are.
+- Distribution packaging, in progress: the AUR and Fedora/COPR (recipes
+  under [`packaging/`](packaging/)), and Debian, through its Rust team.
 - WinGet (`LambdaBytes.Sping`) and nixpkgs: the packages are under review.
 
 ## Performance
 
 | Metric | Value |
 |--------|-------|
-| Binary | 1.8 MiB (stripped + LTO) |
+| Binary | 1.9 MiB (stripped + LTO) |
 | RAM | ~4 MB resident |
 | CPU | < 1% at two probes per second |
-| Code | ~19,300 lines Rust |
-| Tests | 315 (277 unit + 38 E2E) |
+| Code | ~23,400 lines Rust |
+| Tests | 375 (330 unit + 45 E2E) |
 
 ## Around the web
 

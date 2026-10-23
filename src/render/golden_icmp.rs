@@ -10,7 +10,8 @@ use crate::context::NetworkContext;
 use crate::context::classify::TargetClass;
 use crate::diagnostics::health::Reachability;
 use crate::probe::quality::{QualityGrade, Trend};
-use crate::probe::types::{ProbeSnapshot, PulseEntry};
+use crate::probe::trace::UnreachableKind;
+use crate::probe::types::{ProbeSnapshot, PulseEntry, Unreachable};
 use crate::render::{view_classic, view_compact, view_extended, view_table};
 
 fn ms(v: f64) -> Duration {
@@ -64,6 +65,18 @@ pub(crate) fn lost() -> ProbeSnapshot {
     s.rtt_last = None;
     s.ttl = None;
     s.pulse.push(PulseEntry::Loss);
+    s
+}
+
+/// The same target after a destination unreachable from a router: lost, as
+/// a timeout, and said by whom (added in 1.8.0).
+pub(crate) fn unreachable() -> ProbeSnapshot {
+    let mut s = lost();
+    s.unreachable = 1;
+    s.icmp_unreachable = Some(Unreachable {
+        from: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+        kind: UnreachableKind::Host,
+    });
     s
 }
 
@@ -200,6 +213,45 @@ fn lost_json() {
     assert_eq!(
         serde_json::to_string(&lost()).unwrap(),
         "{\"target_host\":\"dns.example\",\"target_ip\":\"192.0.2.10\",\"dns_time\":18.5,\"sent\":11,\"received\":9,\"lost\":2,\"loss_pct\":18.2,\"rtt_last\":null,\"rtt_avg\":13.899999999999999,\"rtt_min\":13.6,\"rtt_max\":14.1,\"jitter\":0.19,\"mdev\":0.15,\"pulse\":[{\"Reply\":13.6},{\"Reply\":14.1},\"Loss\",{\"Reply\":13.799999999999999},\"Loss\"],\"seq\":11,\"quality\":\"A\",\"quality_score\":95,\"trend\":\"stable\",\"ttl\":null,\"net_ctx\":{\"interface\":\"eth0\",\"local_ip\":\"192.168.1.100\",\"prefix_len\":24,\"gateway\":\"192.168.1.1\",\"target_class\":\"PublicNetwork\"}}"
+    );
+}
+
+#[test]
+fn unreachable_classic() {
+    assert_eq!(
+        classic(&unreachable()),
+        "From 198.51.100.1: seq=11 Destination Host Unreachable\n\n--- dns.example ping statistics ---\n11 packets transmitted, 9 received, +1 errors, 18.2% packet loss\nrtt min/avg/max/mdev = 13.6 ms/13.9 ms/14.1 ms/0.15 ms\n"
+    );
+}
+
+#[test]
+fn unreachable_compact() {
+    assert_eq!(
+        compact(&unreachable()),
+        "sping dns.example (192.0.2.10) via eth0  ⠋ probing...\r\n\r\nPulse      ▁█✕▄✕                                   \r\nLatency    now — · avg 13.9 ms · min 13.6 ms · max 14.1 ms · jitter 0.19 ms · dns 18.5 ms\r\nStatus     Reachable · loss 18% · sent 11 · recv 9\r\nContext    if eth0 · 192.168.1.100/24 · gw ? · wan ? · public\r\nQuality    A (95) · excellent\r\nEvents     198.51.100.1 reports host unreachable · intermittent loss\r\n"
+    );
+}
+
+#[test]
+fn unreachable_extended() {
+    assert_eq!(
+        extended(&unreachable()),
+        "sping dns.example (192.0.2.10) via eth0  ⠋ probing...\r\n\r\nPulse      ▁█✕▄✕                                   \r\nLatency    now — · avg 13.9 ms · min 13.6 ms · max 14.1 ms · jitter 0.19 ms · dns 18.5 ms\r\nRTT dist   p50 13.8 · p95 14.1 · p99 14.1 ms · range 0.4\r\nStatus     Reachable · loss 18% · sent 11 · recv 9\r\nContext    if eth0 · 192.168.1.100/24 · gw ? · wan ? · public\r\nQuality    A (95) · excellent\r\nEvents     198.51.100.1 reports host unreachable · intermittent loss\r\nPath       local ───────────────────────────────────────◉ 192.0.2.10\r\n"
+    );
+}
+
+/// The table shows the loss, as for a timeout.
+#[test]
+fn unreachable_table() {
+    assert_eq!(table(&unreachable()), table(&lost()));
+}
+
+/// The v1 line of a loss, then the new field.
+#[test]
+fn unreachable_json() {
+    assert_eq!(
+        serde_json::to_string(&unreachable()).unwrap(),
+        "{\"target_host\":\"dns.example\",\"target_ip\":\"192.0.2.10\",\"dns_time\":18.5,\"sent\":11,\"received\":9,\"lost\":2,\"loss_pct\":18.2,\"rtt_last\":null,\"rtt_avg\":13.899999999999999,\"rtt_min\":13.6,\"rtt_max\":14.1,\"jitter\":0.19,\"mdev\":0.15,\"pulse\":[{\"Reply\":13.6},{\"Reply\":14.1},\"Loss\",{\"Reply\":13.799999999999999},\"Loss\"],\"seq\":11,\"quality\":\"A\",\"quality_score\":95,\"trend\":\"stable\",\"ttl\":null,\"net_ctx\":{\"interface\":\"eth0\",\"local_ip\":\"192.168.1.100\",\"prefix_len\":24,\"gateway\":\"192.168.1.1\",\"target_class\":\"PublicNetwork\"},\"icmp_unreachable\":{\"from\":\"198.51.100.1\",\"kind\":\"host\"}}"
     );
 }
 

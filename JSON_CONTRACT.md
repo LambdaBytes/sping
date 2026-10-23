@@ -51,6 +51,7 @@ These fields are guaranteed present in every JSON line:
 | `wan` | object | Single target only, once the WAN reference probe (`--wan-probe`) has a result: its state (see below; added in 1.6.0) |
 | `diagnosis` | array | Only when sping concludes something: the findings, in priority order (see below; added in 1.6.0) |
 | `active_diagnosis` | object | Only with `--diagnose`, while or after the target is down: what the extra probes found (see below; added in 1.7.0, experimental) |
+| `icmp_unreachable` | object | ICMP only, on the line whose probe got a destination unreachable instead of a reply: who sent it and what it said (see below; added in 1.8.0) |
 
 ## net_ctx Object
 
@@ -78,6 +79,23 @@ An absent object means no evidence: no default gateway was found (`wan` can
 be present without `gateway`), the probe has no result yet or could not start
 (no ICMP permission), or the line comes from batch mode, which runs no
 auxiliary probe. `"unknown"` means a result that has not decided a state yet.
+
+## icmp_unreachable Object (added in 1.8.0)
+
+The line's probe got an ICMP destination unreachable: a router on the way,
+or this host, said the target cannot be reached. The probe is lost, as in
+`ping` (`lost`, `pulse` `Loss`, no `rtt_last`), and is not a timeout. Only the
+line of that probe carries it; a batch line, the target's last probe.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `from` | string | Who sent it: a router, or this host's own address when it has no route or no neighbor for the target |
+| `kind` | string | `"net"`, `"host"`, `"protocol"`, `"port"`, `"admin_prohibited"` or `"other"`, as in `reported_unreachable` |
+
+What was observed, not its cause: a firewall on the way may send one too. On
+Linux (IPv4 and IPv6), macOS (IPv4) and Windows. Elsewhere, and for any other
+ICMP error (a time exceeded with `-t`, for one), the probe ends as before: a
+timeout on Linux and macOS, an error naming the status on Windows.
 
 ## diagnosis Array (added in 1.6.0)
 
@@ -126,6 +144,11 @@ diagnosis did not conclude within its budget or was interrupted: that line
 waits for it (still one line per probe). Without `-c`, a stream that ends
 with `"diagnosing"` did not conclude either.
 
+While the target stays down, sping checks again 5 minutes after each
+diagnosis concludes (added in 1.8.0): `state` stays `"done"`, with the
+conclusions and gaps standing, until the new ones replace them whole. A
+`-c N` run does not wait for such a check.
+
 | `code` | Fields | Meaning |
 |--------|--------|---------|
 | `no_source` | `family` | No route or source address of the target's family for it on this host |
@@ -142,6 +165,49 @@ with `"diagnosing"` did not conclude either.
 `resolve_failed`, `ceiling`, `unavailable` (`detail`: `permission` or
 `platform`), `inconclusive`, `failed`, `unknown`; `detail` carries the
 message where there is one.
+
+## `sping --ip --view json` (added in 1.8.0)
+
+Not a probe line: one object, written once, with the host's addresses. It has
+its own fields; none of the above applies to it.
+
+```json
+{"interfaces":[{"name":"eth0","addresses":[
+   {"ip":"192.168.1.100","prefix_len":24,"kind":"private"},
+   {"ip":"2001:db8::5b1:c2ff:1","prefix_len":64,"kind":"global",
+    "temporary":true,"deprecated":false,"tentative":false,"duplicate":false}]}],
+ "source":{"ipv4":{"to":"1.1.1.1","ip":"192.168.1.100","interface":"eth0"},
+           "ipv6":{"to":"2606:4700:4700::1111","ip":null}},
+ "gateway":{"ipv4":{"ip":"192.168.1.1","interface":"eth0"}}}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `interfaces[].name` | string | Interface name, in the order the system lists them |
+| `interfaces[].addresses[].ip` | string | Address (no zone), IPv4 before IPv6 |
+| `…addresses[].prefix_len` | number \| null | Prefix length; `null` when the system gives none |
+| `…addresses[].kind` | string | `"loopback"`, `"link_local"`, `"private"` (RFC 1918, `fc00::/7`), `"shared"` (`100.64.0.0/10`), `"global"` |
+| `…addresses[].temporary`, `deprecated`, `tentative`, `duplicate` | boolean \| null | IPv6 addresses only: their state; `null` when the system does not report it (`temporary` on Windows) |
+| `source.ipv4`, `source.ipv6` | object | The source the system picks towards `to`, a global reference address: `ip` and `interface` (`null` when no single interface holds it); `ip` `null`: no source of that family; `{"to", "unknown"}`: it could not be told, with the reason |
+| `gateway.ipv4` | object \| null | The IPv4 default gateway, `{"ip", "interface"}` (`interface` `null` when unknown); `null`: no default route; `{"unknown": reason}`: the routes could not be read |
+
+With `--external`, the object has one more member, `external`; without it,
+the object is as above, byte for byte:
+
+```json
+"external":{"server":"stun.cloudflare.com:3478",
+            "ipv4":{"ip":"203.0.113.5","port":40312,"local":"192.168.1.100:51234","asked":"192.0.2.10"},
+            "ipv6":{"asked":"2001:db8::10","unknown":"no route to the server"}}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `external.server` | string | The STUN server asked, `host:port` (`[address]:port` for an IPv6 address) |
+| `external.ipv4`, `external.ipv6` | object \| null | `{"ip", "port", "local", "asked"}`: the address and port the server saw, this host's socket the request left from (`null` when the system did not say) and the server's address that was asked; `{"asked", "unknown"}`: not told, with the reason (`asked` `null` when no address was asked: the name did not resolve); `null`: the server's name gave no address of that family |
+
+Exit code: `0` when the addresses were read, whatever the source, the
+gateway or the external addresses; `2` when they could not be read or
+`--external` names no server (the reason on stderr).
 
 ## Semantics
 

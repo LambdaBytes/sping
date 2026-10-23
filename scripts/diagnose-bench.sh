@@ -21,6 +21,9 @@
 #   stop            SIGTERM while diagnosing, with and without -c
 #   context         the default route's source, then its gateway, change
 #                   during a run: context_changed, never with -S or -I
+#   renew           a long outage: R2 drops the target, then refuses it; the
+#                   diagnosis, renewed 5 min after it concluded, says so
+#                   (DGRAM only: it takes 6 min)
 #
 # Stops at the first failure; exits 2 when the host cannot run it (no user
 # namespaces).
@@ -66,6 +69,17 @@ setup() {
     silent-tail | stop)
         ip -n r2 route "$2" blackhole 10.0.3.2/32
         ip -n r2 -6 route "$2" blackhole fd00:3::2/128
+        ;;
+    renew)
+        # The test replaces the blackhole with a prohibit route; `del`
+        # removes either.
+        if [[ $2 == add ]]; then
+            ip -n r2 route add blackhole 10.0.3.2/32
+            ip -n r2 -6 route add blackhole fd00:3::2/128
+        else
+            ip -n r2 route del 10.0.3.2/32
+            ip -n r2 -6 route del fd00:3::2/128
+        fi
         ;;
     prohibited)
         ip -n r2 route "$2" prohibit 10.0.3.2/32
@@ -117,7 +131,12 @@ for socket in raw dgram; do
     if [[ $socket == dgram ]]; then
         printf '0 0' > /proc/sys/net/ipv4/ping_group_range
     fi
-    for case in silent-tail prohibited icmp-ignored v4-broken v6-only-host explicit coexist stop context; do
+    cases=(silent-tail prohibited icmp-ignored v4-broken v6-only-host explicit coexist stop context)
+    # What `renew` shows does not depend on the socket, and it waits 5 min.
+    if [[ $socket == dgram ]]; then
+        cases+=(renew)
+    fi
+    for case in "${cases[@]}"; do
         setup "$case" add
         echo "== $socket $case"
         if out=$(SPING_DIAG_CASE=$case "$bin" --ignored --exact diagnose_bench --nocapture 2>&1) \

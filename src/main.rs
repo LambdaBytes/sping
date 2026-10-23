@@ -44,6 +44,10 @@ async fn real_main() -> i32 {
         return app::EXIT_OK;
     }
 
+    if args.ip {
+        return app::show_host_addresses(args.view == "json", args.external.as_deref()).await;
+    }
+
     let debug = args.debug
         || std::env::var("SPING_LOG")
             .map(|v| v == "debug")

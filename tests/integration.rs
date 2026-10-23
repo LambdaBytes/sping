@@ -141,6 +141,141 @@ fn test_list_interfaces() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.is_empty());
+    // As before 1.8 (`--ip` is the full view): `name ip/prefix`, IPv4, no
+    // loopback.
+    for line in stdout.lines().filter(|l| *l != "No interfaces detected.") {
+        let (_name, address) = line.rsplit_once(' ').expect("name and address");
+        let (ip, prefix) = address.split_once('/').expect("ip/prefix");
+        let ip: std::net::Ipv4Addr = ip.parse().unwrap_or_else(|_| panic!("{line}"));
+        assert!(!ip.is_loopback(), "{line}");
+        assert!(prefix.parse::<u8>().is_ok(), "{line}");
+    }
+}
+
+/// `--ip`: every address, the loopback's among them (whatever the system
+/// calls that interface), then the sources and the gateway.
+#[test]
+fn test_ip_lists_the_host_addresses() {
+    let output = sping_timed(10)
+        .args(["--ip"])
+        .output()
+        .expect("failed to run");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.contains("127.0.0.1/8") && l.ends_with("loopback")),
+        "{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.starts_with("Source ") && l.contains("to 1.1.1.1")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|l| l.starts_with("Gateway ")),
+        "{stdout}"
+    );
+}
+
+/// `--ip --view json`: one object, the loopback among the addresses and
+/// each family's source named by its reference.
+#[test]
+fn test_ip_json() {
+    let output = sping_timed(10)
+        .args(["--ip", "--view", "json"])
+        .output()
+        .expect("failed to run");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON object");
+    let addresses: Vec<&serde_json::Value> = value["interfaces"]
+        .as_array()
+        .expect("interfaces")
+        .iter()
+        .flat_map(|i| i["addresses"].as_array().expect("addresses"))
+        .collect();
+    assert!(
+        addresses
+            .iter()
+            .any(|a| a["ip"] == "127.0.0.1" && a["kind"] == "loopback" && a["prefix_len"] == 8),
+        "{value}"
+    );
+    assert_eq!(value["source"]["ipv4"]["to"], "1.1.1.1");
+    assert_eq!(value["source"]["ipv6"]["to"], "2606:4700:4700::1111");
+    assert!(value["gateway"].get("ipv4").is_some(), "{value}");
+    // Only `--external` asks a STUN server.
+    assert!(value.get("external").is_none(), "{value}");
+}
+
+/// `--ip` is about this host: a target is a usage error, not ignored.
+#[test]
+fn test_ip_takes_no_target() {
+    let output = sping_cmd()
+        .args(["--ip", "127.0.0.1"])
+        .output()
+        .expect("failed to run");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot be used with") && stderr.contains("--ip"),
+        "{stderr}"
+    );
+}
+
+/// `--external` asks a third party: only with `--ip`, and only a server
+/// that can be one.
+#[test]
+fn test_external_needs_ip_and_a_server() {
+    let output = sping_cmd()
+        .args(["--external"])
+        .output()
+        .expect("failed to run");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--ip"), "{stderr}");
+    for (server, says) in [
+        ("stun.example.com:0", "not a port"),
+        (":::1", "not an IPv6 address"),
+        ("[::g]:3478", "not an IPv6 address"),
+    ] {
+        let output = sping_cmd()
+            .args(["--ip", "--external", server])
+            .output()
+            .expect("failed to run");
+        assert_eq!(output.status.code(), Some(2), "{server}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(says), "{server}: {stderr}");
+    }
+}
+
+/// `--ip --external` to a server that is not there: the host's addresses
+/// all the same (exit 0) and the external IPv4 address unknown, within the
+/// query's budget; an IPv4 server is not asked for IPv6.
+#[test]
+fn test_external_without_a_server() {
+    let start = Instant::now();
+    let output = sping_timed(10)
+        .args(["--ip", "--external", "127.0.0.1:9", "--view", "json"])
+        .output()
+        .expect("failed to run");
+    assert!(
+        start.elapsed() < Duration::from_secs(6),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("one JSON object");
+    let external = &value["external"];
+    assert_eq!(external["server"], "127.0.0.1:9", "{value}");
+    assert_eq!(external["ipv4"]["asked"], "127.0.0.1", "{value}");
+    assert!(external["ipv4"]["unknown"].is_string(), "{value}");
+    assert!(external["ipv4"].get("ip").is_none(), "{value}");
+    assert_eq!(external["ipv6"], serde_json::Value::Null, "{value}");
+    assert!(value["interfaces"].as_array().is_some(), "{value}");
 }
 
 // === Input validation ===
@@ -409,6 +544,7 @@ fn test_help_shows_ping_parity_flags() {
         "--ttl",
         "--quiet",
         "--ascii",
+        "--icmp",
     ] {
         assert!(stdout.contains(flag), "missing {flag} in --help");
     }
@@ -977,6 +1113,63 @@ fn test_tcp_port_and_size_rejected() {
     }
 }
 
+/// `--icmp` and `--tcp` name two probes: a usage error that names both
+/// (not an unknown option, which exits 2 as well).
+#[test]
+fn test_icmp_and_tcp_are_refused_together() {
+    let output = sping_cmd()
+        .args(["127.0.0.1", "--icmp", "--tcp", "443", "-c", "1"])
+        .output()
+        .expect("failed to run");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot be used with")
+            && stderr.contains("--icmp")
+            && stderr.contains("--tcp"),
+        "{stderr}"
+    );
+}
+
+/// `--icmp` is the probe sping runs without it: the same lines, the same
+/// fields, the same exit code. The auxiliary probes' fields (`gateway`,
+/// `wan` and the `diagnosis` drawn from them) appear once those probes have
+/// a result (JSON_CONTRACT.md), on whichever line that is: not compared.
+#[test]
+fn test_icmp_is_the_default_probe() {
+    // Windows needs no permission for ICMP (`IcmpSendEcho`).
+    #[cfg(unix)]
+    if icmp_denied() {
+        return;
+    }
+    let keys = |args: &[&str]| {
+        let (code, lines, stderr) = json_lines(args, 20);
+        assert_eq!(code, Some(0), "{args:?}: {stderr}");
+        assert_eq!(lines.len(), 2, "{args:?}: {lines:?}");
+        lines
+            .iter()
+            .map(|l| {
+                let mut keys: Vec<String> = l
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .filter(|k| !["gateway", "wan", "diagnosis"].contains(&k.as_str()))
+                    .cloned()
+                    .collect();
+                keys.sort();
+                keys
+            })
+            .collect::<Vec<_>>()
+    };
+    let plain = keys(&["127.0.0.1", "-c", "2", "-i", "200"]);
+    let icmp = keys(&["127.0.0.1", "-c", "2", "-i", "200", "--icmp"]);
+    assert_eq!(icmp, plain);
+    assert!(
+        icmp.iter().all(|k| !k.iter().any(|k| k == "probe")),
+        "{icmp:?}"
+    );
+}
+
 #[test]
 fn test_tcp_unusable_source_is_an_error() {
     let (_listener, port) = tcp_listener();
@@ -1382,7 +1575,115 @@ fn diagnose_bench() {
             assert!(out.trim_end().ends_with("diagnosis incomplete"), "{out}");
         }
         "context" => context_bench(),
+        "renew" => renew_bench(),
         other => panic!("unknown case {other}"),
+    }
+}
+
+/// The `renew` case of `diagnose_bench`: a long outage
+/// (`scripts/diagnose-bench.sh` makes R2 drop the target). A minute in, the
+/// first diagnosis long concluded, R2 refuses the target instead: the lines
+/// keep the first diagnosis until it is renewed, 5 min after it concluded,
+/// and then say what R2 reports, with no context change. Both families at
+/// once, one probe a second; the WAN reference is R1, which answers: R2 has
+/// no route to the default one, and its errors would spend the client's
+/// tokens that R2's refusals need.
+#[cfg(target_os = "linux")]
+fn renew_bench() {
+    use serde_json::{Value, json};
+
+    // `planner::RENEW`, in lines.
+    const RENEW_S: usize = 300;
+    let run = |target: &'static str| {
+        std::thread::spawn(move || {
+            let args = [
+                target,
+                "--diagnose",
+                "-c",
+                "360",
+                "-i",
+                "1000",
+                "-W",
+                "1",
+                "--wan-probe",
+                "10.0.1.1",
+            ];
+            let (code, lines, stderr) = json_lines(&args, 420);
+            assert_eq!(code, Some(1), "{target}: {stderr}");
+            (target, lines)
+        })
+    };
+    let runs = [run("10.0.3.2"), run("fd00:3::2")];
+    std::thread::sleep(Duration::from_secs(60));
+    for args in [
+        ["-4", "route", "replace", "prohibit", "10.0.3.2/32"],
+        ["-6", "route", "replace", "prohibit", "fd00:3::2/128"],
+    ] {
+        let status = Command::new("ip")
+            .args(["-n", "r2"])
+            .args(args)
+            .status()
+            .expect("cannot run ip");
+        assert!(status.success(), "ip -n r2 {args:?}");
+    }
+
+    for ((target, lines), (r1, r2)) in runs
+        .map(|r| r.join().unwrap())
+        .into_iter()
+        .zip([("10.0.1.1", "10.0.2.2"), ("fd00:1::1", "fd00:2::2")])
+    {
+        assert_eq!(lines.len(), 360, "{target}: {lines:?}");
+        assert!(
+            lines.iter().all(|l| l["received"] == 0),
+            "{target}: {lines:?}"
+        );
+        assert!(
+            lines.iter().all(|l| {
+                l["diagnosis"]
+                    .as_array()
+                    .is_none_or(|findings| findings.iter().all(|f| f["code"] != "context_changed"))
+            }),
+            "{target}: {lines:?}"
+        );
+        let conclusions = |line: &Value| line["active_diagnosis"]["conclusions"].clone();
+        let first = lines
+            .iter()
+            .position(|l| l["active_diagnosis"]["state"] == "done")
+            .unwrap_or_else(|| panic!("{target}: never concluded: {lines:?}"));
+        assert!(first < 50, "{target}: concluded at line {first}");
+        assert_eq!(
+            conclusions(&lines[first]),
+            json!([{"code": "silent_after", "last_hop": {"ttl": 1, "from": [r1]}, "silent": 3}]),
+            "{target}"
+        );
+        // From the first conclusion on, always one: the renewal shows the
+        // diagnosis standing until it concludes.
+        assert!(
+            lines[first..]
+                .iter()
+                .all(|l| l["active_diagnosis"]["state"] == "done"),
+            "{target}: {lines:?}"
+        );
+        let renewed = first
+            + lines[first..]
+                .iter()
+                .position(|l| conclusions(l) != conclusions(&lines[first]))
+                .unwrap_or_else(|| panic!("{target}: never renewed: {lines:?}"));
+        println!(
+            "{target}: concluded at line {first}, renewed {} lines later",
+            renewed - first
+        );
+        assert!(
+            (RENEW_S - 2..=RENEW_S + 25).contains(&(renewed - first)),
+            "{target}: renewed {} lines after it concluded",
+            renewed - first
+        );
+        let refused = json!([{"code": "reported_unreachable", "ttl": 2, "from": r2, "kind": "admin_prohibited"}]);
+        assert!(
+            lines[renewed..].iter().all(|l| conclusions(l) == refused),
+            "{target}: {:?}",
+            &lines[renewed..]
+        );
     }
 }
 
@@ -1492,4 +1793,469 @@ fn context_bench() {
         json!([{"what": "gateway", "from": "10.0.1.1", "to": "10.0.1.254"}]),
         ("gateway", "10.0.1.254"),
     );
+}
+
+/// The main probe's destination unreachables (step 1 of 1.8): one case per
+/// run of `scripts/unreachable-bench.sh` inside its namespaces (client -> R1
+/// -> R2 -> target, with RAW sockets and then DGRAM), named by
+/// `SPING_UNREACH_CASE`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "run by scripts/unreachable-bench.sh inside its network namespaces"]
+fn unreachable_bench() {
+    use serde_json::{Value, json};
+
+    let case = std::env::var("SPING_UNREACH_CASE").expect("SPING_UNREACH_CASE is not set");
+    // R2 rate-limits its IPv4 route errors to a host: 5 at once, one more a
+    // second (`error_burst`, `error_cost`, which only the initial namespace
+    // has). So one probe a second, and R2 itself as the WAN reference: the
+    // default one, beyond R2, would spend them.
+    const PACE: [&str; 4] = ["-i", "1000", "--wan-probe", "10.0.2.2"];
+    let probes = |args: &[&str]| -> Vec<Value> {
+        let mut all = args.to_vec();
+        all.extend(["-c", "3"]);
+        all.extend(PACE);
+        let (code, lines, stderr) = json_lines(&all, 30);
+        assert_eq!(lines.len(), 3, "{all:?}: {lines:?} {stderr}");
+        assert!(
+            lines.iter().all(|l| l["received"] == 0),
+            "{all:?}: {lines:?}"
+        );
+        assert_eq!(code, Some(1), "{all:?}: {stderr}");
+        lines
+    };
+    // Every line says who reported the target unreachable, and how.
+    let reported = |args: &[&str], from: &str, kind: &str| {
+        for line in probes(args) {
+            assert_eq!(
+                line["icmp_unreachable"],
+                json!({"from": from, "kind": kind}),
+                "{args:?}: {line}"
+            );
+        }
+    };
+    // Classic: each probe's line and the summary, nothing else.
+    let classic = |args: &[&str], secs: u64| -> String {
+        let mut timed = sping_timed(secs);
+        timed.cmd.args(args).args(PACE).args(["--view", "classic"]);
+        let output = timed.output().expect("failed to run");
+        assert!(!output.timed_out, "sping {args:?} did not finish");
+        let out = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {out}");
+        assert!(!out.contains("Probe error"), "{args:?}: {out}");
+        out
+    };
+    let silent = |args: &[&str]| {
+        for line in probes(args) {
+            assert!(line.get("icmp_unreachable").is_none(), "{args:?}: {line}");
+        }
+    };
+
+    match case.as_str() {
+        // R2's `unreachable` route: host unreachable over IPv4, no route
+        // (net) over IPv6.
+        "unreachable" => {
+            reported(&["10.0.3.2", "-W", "2"], "10.0.2.2", "host");
+            reported(&["fd00:3::2", "-W", "2"], "fd00:2::2", "net");
+            let out = classic(&["10.0.3.2", "-c", "2", "-W", "2"], 20);
+            assert_eq!(
+                out.lines().take(2).collect::<Vec<_>>(),
+                [
+                    "From 10.0.2.2: seq=1 Destination Host Unreachable",
+                    "From 10.0.2.2: seq=2 Destination Host Unreachable",
+                ],
+                "{out}"
+            );
+            assert!(
+                out.contains("2 packets transmitted, 0 received, +2 errors, 100.0% packet loss"),
+                "{out}"
+            );
+        }
+        "prohibited" => {
+            reported(&["10.0.3.2", "-W", "2"], "10.0.2.2", "admin_prohibited");
+            reported(&["fd00:3::2", "-W", "2"], "fd00:2::2", "admin_prohibited");
+            let out = classic(&["fd00:3::2", "-c", "1", "-W", "2"], 20);
+            assert!(
+                out.starts_with("From fd00:2::2: seq=1 Packet filtered\n"),
+                "{out}"
+            );
+        }
+        // Silence stays a timeout, word for word.
+        "blackhole" => {
+            silent(&["10.0.3.2", "-W", "1"]);
+            silent(&["fd00:3::2", "-W", "1"]);
+            let out = classic(&["10.0.3.2", "-c", "2", "-W", "1"], 20);
+            assert!(
+                out.starts_with("Request timeout for seq=1\nRequest timeout for seq=2\n"),
+                "{out}"
+            );
+            assert!(
+                out.contains("2 packets transmitted, 0 received, 100.0% packet loss"),
+                "{out}"
+            );
+        }
+        // No neighbor answers on the client's own link: the client says so
+        // itself (the bench shortens address resolution to 0.3 s).
+        "neighbor" => {
+            reported(&["10.0.1.99", "-W", "3"], "10.0.1.2", "host");
+            reported(&["fd00:1::99", "-W", "3"], "fd00:1::2", "host");
+        }
+        // Address resolution takes 3 s, the wait 1 s: every probe's error
+        // comes after its wait, some in bursts while later probes are sent.
+        // None of them may fail a send or a receive.
+        "late" => {
+            // A probe sent just before a resolution fails may still get its
+            // own error in time: from the client itself.
+            for (target, client) in [("10.0.1.98", "10.0.1.2"), ("fd00:1::98", "fd00:1::2")] {
+                let out = classic(&[target, "-c", "8", "-W", "1"], 40);
+                let lines: Vec<&str> = out.lines().take(8).collect();
+                assert!(
+                    lines.iter().enumerate().all(|(i, l)| {
+                        *l == format!("Request timeout for seq={}", i + 1)
+                            || *l
+                                == format!(
+                                    "From {client}: seq={} Destination Host Unreachable",
+                                    i + 1
+                                )
+                    }),
+                    "{out}"
+                );
+            }
+        }
+        // R1 sends the client a redirect for every probe (a route back out
+        // of the interface the probe came in by): a ping socket gets
+        // `EREMOTEIO`. The probes go nowhere: timeouts, never an error.
+        "redirect" => {
+            silent(&["10.0.3.2", "-W", "1"]);
+            let out = classic(&["10.0.3.2", "-c", "3", "-W", "1"], 20);
+            assert!(
+                out.starts_with(
+                    "Request timeout for seq=1\nRequest timeout for seq=2\nRequest timeout for seq=3\n"
+                ),
+                "{out}"
+            );
+        }
+        // Three processes at once (on RAW sockets every one gets every ICMP
+        // error of the host): one probing the unreachable target, one R2,
+        // which answers, one diagnosing the target with its traces.
+        "crosstalk" => {
+            for (target, router, kind) in [
+                ("10.0.3.2", "10.0.2.2", "host"),
+                ("fd00:3::2", "fd00:2::2", "net"),
+            ] {
+                let run = |args: &[&str]| {
+                    let mut all: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+                    all.extend(
+                        ["-i", "200", "-W", "1", "--wan-probe", "10.0.2.2"].map(String::from),
+                    );
+                    std::thread::spawn(move || {
+                        let args: Vec<&str> = all.iter().map(String::as_str).collect();
+                        json_lines(&args, 60)
+                    })
+                };
+                let down = run(&[target, "-c", "8"]);
+                let up = run(&[router, "-c", "8"]);
+                let diagnosed = run(&[target, "--diagnose", "-c", "4"]);
+                let expected = json!({"from": router, "kind": kind});
+                // Over IPv4, R2's rate limit lets only some errors through
+                // at this pace: those that came must be right. Over IPv6,
+                // every one comes.
+                let check = |lines: &[Value]| {
+                    let got: Vec<&Value> = lines
+                        .iter()
+                        .filter_map(|l| l.get("icmp_unreachable"))
+                        .collect();
+                    assert!(got.iter().all(|u| **u == expected), "{lines:?}");
+                    if target.contains(':') {
+                        assert_eq!(got.len(), lines.len(), "{lines:?}");
+                    } else {
+                        assert!(!got.is_empty(), "{lines:?}");
+                    }
+                };
+                let (code, lines, _) = down.join().unwrap();
+                assert_eq!((code, lines.len()), (Some(1), 8), "{lines:?}");
+                check(&lines);
+                let (code, lines, _) = diagnosed.join().unwrap();
+                assert_eq!((code, lines.len()), (Some(1), 4), "{lines:?}");
+                check(&lines);
+                let (code, lines, _) = up.join().unwrap();
+                assert_eq!(code, Some(0));
+                assert_eq!(lines.len(), 8);
+                assert_eq!(lines[7]["received"], 8, "{lines:?}");
+                assert!(
+                    lines.iter().all(|l| l.get("icmp_unreachable").is_none()),
+                    "{lines:?}"
+                );
+            }
+        }
+        // A time exceeded (`-t 1`: R1) is not an unreachable: the probe
+        // waits for its timeout, as before.
+        "ttl1" => {
+            silent(&["10.0.3.2", "-t", "1", "-W", "1"]);
+            silent(&["fd00:3::2", "-t", "1", "-W", "1"]);
+        }
+        other => panic!("unknown case {other}"),
+    }
+}
+
+/// `sping --ip` against a real namespace (step 3 of 1.8): one case per run of
+/// `scripts/ip-bench.sh`, which sets up the client of `scripts/bench-net.sh`
+/// (`c0`: 10.0.1.2/24, fd00:1::2/64, default routes via R1) and names the
+/// case in `SPING_IP_CASE`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "run by scripts/ip-bench.sh inside its network namespaces"]
+fn ip_bench() {
+    use serde_json::Value;
+
+    let case = std::env::var("SPING_IP_CASE").expect("SPING_IP_CASE is not set");
+    let view = || -> Value {
+        let output = sping_timed(10)
+            .args(["--ip", "--view", "json"])
+            .output()
+            .expect("failed to run");
+        assert_eq!(output.status.code(), Some(0));
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).expect("JSON")
+    };
+    let on = |view: &Value, name: &str| -> Vec<Value> {
+        view["interfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["name"] == name)
+            .flat_map(|i| i["addresses"].as_array().unwrap().clone())
+            .collect()
+    };
+    let address = |view: &Value, ip: &str| -> Value {
+        on(view, "c0")
+            .into_iter()
+            .find(|a| a["ip"] == ip)
+            .unwrap_or_else(|| panic!("no {ip} on c0: {view}"))
+    };
+    // Packets sent by every interface of this network namespace:
+    // `/proc/net/dev` is the reading process's namespace (`/sys/class/net`
+    // is the one sysfs was mounted in, the host's).
+    let sent = || -> Vec<(String, u64)> {
+        let text = std::fs::read_to_string("/proc/net/dev").unwrap();
+        let mut all: Vec<(String, u64)> = text
+            .lines()
+            .skip(2)
+            .map(|line| {
+                let (name, counters) = line.split_once(':').unwrap();
+                // Receive: bytes packets errs drop fifo frame compressed
+                // multicast; then transmit: bytes packets...
+                let tx_packets = counters.split_whitespace().nth(9).unwrap().parse().unwrap();
+                (name.trim().to_string(), tx_packets)
+            })
+            .collect();
+        all.sort();
+        all
+    };
+
+    match case.as_str() {
+        // A secondary IPv4 address, one with no route, a deprecated IPv6
+        // one: all listed, with their prefixes; the sources and the gateway
+        // of the default routes; and nothing sent while reading them.
+        "addresses" => {
+            let before = sent();
+            let v = view();
+            let _ = sping_timed(10)
+                .args(["--ip"])
+                .output()
+                .expect("failed to run");
+            assert_eq!(sent(), before, "--ip sent packets");
+            // The control: a real probe to R1 shows on the same counters.
+            let _ = sping_timed(10)
+                .args(["10.0.1.1", "-c", "1", "--view", "classic"])
+                .output()
+                .expect("failed to run");
+            let after = sent();
+            let c0 = |list: &[(String, u64)]| list.iter().find(|(n, _)| n == "c0").unwrap().1;
+            assert!(
+                c0(&after) > c0(&before),
+                "a probe did not show: {before:?} {after:?}"
+            );
+            for ip in ["10.0.1.2", "10.0.1.9", "10.9.9.9"] {
+                let a = address(&v, ip);
+                assert_eq!(
+                    (a["prefix_len"].as_u64(), a["kind"].as_str()),
+                    (Some(24), Some("private")),
+                    "{a}"
+                );
+            }
+            let deprecated = address(&v, "fd00:1::d");
+            assert_eq!(deprecated["deprecated"], true, "{deprecated}");
+            assert_eq!(deprecated["kind"], "private");
+            assert_eq!(address(&v, "fd00:1::2")["deprecated"], false);
+            assert!(on(&v, "lo").iter().any(|a| a["ip"] == "127.0.0.1"), "{v}");
+            assert_eq!(
+                v["source"]["ipv4"],
+                serde_json::json!({"to": "1.1.1.1", "ip": "10.0.1.2", "interface": "c0"})
+            );
+            assert_eq!(v["source"]["ipv6"]["ip"], "fd00:1::2", "{v}");
+            assert_eq!(
+                v["gateway"]["ipv4"],
+                serde_json::json!({"ip": "10.0.1.1", "interface": "c0"})
+            );
+        }
+        // Duplicate address detection still running (20 probes).
+        "tentative" => {
+            let a = address(&view(), "fd00:1::77");
+            assert_eq!(
+                (a["tentative"].as_bool(), a["duplicate"].as_bool()),
+                (Some(true), Some(false)),
+                "{a}"
+            );
+        }
+        // R1 holds fd00:1::1: detection found it.
+        "duplicate" => {
+            let a = address(&view(), "fd00:1::1");
+            assert_eq!(a["duplicate"], true, "{a}");
+        }
+        // The kernel's temporary address for a `mngtmpaddr` prefix.
+        "temporary" => {
+            let v = view();
+            let temporary: Vec<Value> = on(&v, "c0")
+                .into_iter()
+                .filter(|a| a["temporary"] == true)
+                .collect();
+            assert_eq!(temporary.len(), 1, "{v}");
+            assert!(
+                temporary[0]["ip"].as_str().unwrap().starts_with("fd00:5:"),
+                "{v}"
+            );
+            assert_eq!(address(&v, "fd00:5::5")["temporary"], false);
+        }
+        // No default routes: no source of either family, no gateway.
+        "no-default" => {
+            let v = view();
+            assert_eq!(
+                v["source"]["ipv4"],
+                serde_json::json!({"to": "1.1.1.1", "ip": null}),
+                "{v}"
+            );
+            assert_eq!(
+                v["source"]["ipv6"],
+                serde_json::json!({"to": "2606:4700:4700::1111", "ip": null}),
+                "{v}"
+            );
+            assert_eq!(v["gateway"]["ipv4"], Value::Null, "{v}");
+            let text = sping_timed(10)
+                .args(["--ip"])
+                .output()
+                .expect("failed to run");
+            let text = String::from_utf8_lossy(&text.stdout);
+            assert!(text.contains("no IPv4 source to 1.1.1.1"), "{text}");
+            assert!(
+                text.contains("no IPv6 source to 2606:4700:4700::1111"),
+                "{text}"
+            );
+            assert!(text.contains("no IPv4 default gateway"), "{text}");
+        }
+        // The bench's STUN server (scripts/stun-bench-server.py, in the
+        // target's namespace) answers with addresses of its own after a
+        // response of another transaction: the answer is what is said, with
+        // the socket each request left from as the server saw it, after one
+        // request per family.
+        "external" => {
+            let (v, elapsed, requests) = external(&["--view", "json"]);
+            assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+            let e = &v["external"];
+            assert_eq!(e["server"], "dual.test:3478", "{v}");
+            for (family, key, mapped, port, asked, client) in [
+                ("v4", "ipv4", "198.51.100.77", 40312, "10.0.3.2", "10.0.1.2"),
+                (
+                    "v6",
+                    "ipv6",
+                    "2001:db8:77::5",
+                    51022,
+                    "fd00:3::2",
+                    "fd00:1::2",
+                ),
+            ] {
+                let of_family: Vec<_> = requests.iter().filter(|r| r.0 == family).collect();
+                assert_eq!(of_family.len(), 1, "{family}: {requests:?}");
+                let (_, source, source_port) = of_family[0];
+                assert_eq!(source, client, "{requests:?}");
+                let local = std::net::SocketAddr::new(client.parse().unwrap(), *source_port);
+                assert_eq!(
+                    e[key],
+                    serde_json::json!({
+                        "ip": mapped, "port": port, "local": local.to_string(), "asked": asked
+                    }),
+                    "{v}"
+                );
+            }
+            let (text, _, _) = external(&[]);
+            let text = text.as_str().unwrap();
+            let line = text
+                .lines()
+                .find(|l| l.starts_with("External "))
+                .unwrap_or_else(|| panic!("{text}"));
+            assert!(
+                line.contains("IPv4 198.51.100.77:40312 from 10.0.1.2:")
+                    && line.contains("IPv6 [2001:db8:77::5]:51022 from [fd00:1::2]:")
+                    && line.ends_with("(STUN server dual.test:3478)"),
+                "{line}"
+            );
+            assert!(
+                !text.contains("203.0.113.9") && !text.contains("2001:db8:99::9"),
+                "{text}"
+            );
+        }
+        // Only responses of another transaction (ten a request), or none:
+        // unknown at the end of the budget, after three requests per family.
+        "external-foreign" | "external-silent" => {
+            let (v, elapsed, requests) = external(&["--view", "json"]);
+            assert!(
+                elapsed >= Duration::from_millis(2900) && elapsed < Duration::from_millis(4500),
+                "{elapsed:?}"
+            );
+            for (family, key, asked) in [("v4", "ipv4", "10.0.3.2"), ("v6", "ipv6", "fd00:3::2")] {
+                assert_eq!(
+                    v["external"][key],
+                    serde_json::json!({"asked": asked, "unknown": "no answer within 3 s"}),
+                    "{v}"
+                );
+                let sent = requests.iter().filter(|r| r.0 == family).count();
+                assert_eq!(sent, 3, "{family}: {requests:?}");
+            }
+        }
+        other => panic!("unknown case {other}"),
+    }
+}
+
+/// One `sping --ip --external dual.test` run with `args`, against the
+/// bench's STUN server: the output (JSON, or the text as a string), how
+/// long it took, and the requests the server logged (family, source
+/// address, source port) during it.
+#[cfg(target_os = "linux")]
+fn external(args: &[&str]) -> (serde_json::Value, Duration, Vec<(String, String, u16)>) {
+    const LOG: &str = "/run/stun-log";
+    std::fs::write(LOG, "").expect("empty the STUN server's log");
+    let mut cmd = sping_cmd();
+    cmd.args(["--ip", "--external", "dual.test"]).args(args);
+    let start = Instant::now();
+    let output = cmd.output().expect("failed to run");
+    let elapsed = start.elapsed();
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let out = if args.contains(&"json") {
+        serde_json::from_str(stdout.trim()).expect("JSON")
+    } else {
+        serde_json::Value::String(stdout)
+    };
+    let requests = std::fs::read_to_string(LOG)
+        .expect("the STUN server's log")
+        .lines()
+        .map(|line| {
+            let fields: Vec<&str> = line.split(' ').collect();
+            (
+                fields[0].to_string(),
+                fields[1].to_string(),
+                fields[2].parse().unwrap(),
+            )
+        })
+        .collect();
+    (out, elapsed, requests)
 }

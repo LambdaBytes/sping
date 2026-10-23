@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use crate::context::{ContextChange, NetworkContext};
 use crate::probe::quality::{QualityGrade, Trend};
+use crate::probe::trace::UnreachableKind;
 
 /// Result of a single probe.
 #[derive(Debug, Clone)]
@@ -33,10 +34,27 @@ pub enum ProbeResult {
     Timeout {
         seq: u64,
     },
+    /// ICMP: a destination unreachable about this probe, from a router on
+    /// the way or from this host. Not a reply and not a timeout: the probe
+    /// is lost, and `from` said why.
+    Unreachable {
+        seq: u64,
+        from: IpAddr,
+        kind: UnreachableKind,
+    },
     Error {
         seq: u64,
         message: String,
     },
+}
+
+/// The destination unreachable the latest probe got (`icmp_unreachable` in
+/// JSON, added in 1.8.0): who sent it and what it said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Unreachable {
+    #[serde(serialize_with = "ser_ip")]
+    pub from: IpAddr,
+    pub kind: UnreachableKind,
 }
 
 /// Options passed to the probe backend (ICMP or TCP) for each probe.
@@ -219,6 +237,10 @@ pub struct ProbeSnapshot {
     /// error is not mistaken for a lost reply; not serialized.
     #[serde(skip)]
     pub last_error: Option<String>,
+    /// Destination unreachables among the lost probes so far (ICMP; the
+    /// classic summary's `+N errors`). Not serialized.
+    #[serde(skip)]
+    pub unreachable: u64,
     /// The last re-resolution of the target's name, while it is current
     /// (none yet, a literal target, or cleared by a context change: `None`).
     /// Internal correlator input; not serialized.
@@ -241,6 +263,10 @@ pub struct ProbeSnapshot {
     /// TCP mode only: outcome of the latest connect; absent before the first.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tcp_state: Option<TcpState>,
+    /// ICMP only: the destination unreachable the latest probe got, if it
+    /// got one (added in 1.8.0; absent otherwise).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icmp_unreachable: Option<Unreachable>,
 }
 
 impl ProbeSnapshot {
@@ -281,12 +307,14 @@ impl ProbeSnapshot {
             recent_loss_pct: 0.0,
             high_jitter: false,
             last_error: None,
+            unreachable: 0,
             name: None,
             context_change: None,
             probe: None,
             port: None,
             refused: None,
             tcp_state: None,
+            icmp_unreachable: None,
         }
     }
 

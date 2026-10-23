@@ -28,6 +28,52 @@ pub const EXIT_NO_REPLY: i32 = 1;
 /// Usage or runtime error.
 pub const EXIT_ERROR: i32 = 2;
 
+/// `sping --ip`: the host's addresses, as text or one JSON object, and with
+/// `external` (`--external SERVER[:PORT]`) what that STUN server saw. Exit 0
+/// once they are read (a missing source or gateway, or an external address
+/// not told, is said in the view), 2 when they cannot be read or the server
+/// is not one.
+pub async fn show_host_addresses(json: bool, external: Option<&str>) -> i32 {
+    let server = match external.map(context::stun::parse_server).transpose() {
+        Ok(server) => server,
+        Err(e) => {
+            eprintln!("error: --external {e}");
+            return EXIT_ERROR;
+        }
+    };
+    let view = match context::addresses::read() {
+        Ok(view) => view,
+        Err(e) => {
+            eprintln!("error: cannot read the host's addresses: {e}");
+            return EXIT_ERROR;
+        }
+    };
+    let external = match server {
+        Some((host, port)) => Some(context::stun::external(&host, port).await),
+        None => None,
+    };
+    let out = if json {
+        match crate::render::view_ip::json(&view, external.as_ref()) {
+            Ok(line) => line + "\n",
+            Err(e) => {
+                eprintln!("error: cannot serialize the host's addresses: {e}");
+                return EXIT_ERROR;
+            }
+        }
+    } else {
+        crate::render::view_ip::text(&view, external.as_ref(), icons::sep())
+    };
+    match std::io::stdout().lock().write_all(out.as_bytes()) {
+        // A closed pipe (`sping --ip | head -1`) is not an error.
+        Ok(()) => EXIT_OK,
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => EXIT_OK,
+        Err(e) => {
+            eprintln!("error: cannot write the host's addresses: {e}");
+            EXIT_ERROR
+        }
+    }
+}
+
 /// Listen for Ctrl+C (and SIGTERM on Unix) and trigger shutdown.
 /// In raw-mode TUI views Ctrl+C arrives via the key listener instead,
 /// but SIGTERM (systemd, kill) still lands here.

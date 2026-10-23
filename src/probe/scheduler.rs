@@ -1,6 +1,8 @@
-//! Primary probe loop: fires one probe (ICMP echo or TCP connect) per tick at
-//! a fixed cadence and publishes a `ProbeSnapshot` after every probe. Ticks
-//! are anchored to probe start, so RTT and timeouts never stretch the period.
+//! Primary probe loop: one probe (ICMP echo or TCP connect) per tick of the
+//! interval, each awaited until its answer or its timeout, and a
+//! `ProbeSnapshot` published after every probe. A probe that lasts longer
+//! than the interval (a loss, with `-W` above `-i`) delays the next one, which
+//! goes out as soon as it ends: while nothing answers, the period is `-W`.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -19,7 +21,7 @@ use crate::diagnostics::spikes::SpikeDetector;
 use crate::probe::quality::QualityScorer;
 use crate::probe::stats::ProbeStats;
 use crate::probe::types::{
-    NameState, ProbeOptions, ProbeResult, ProbeSnapshot, RecentChange, TcpState,
+    NameState, ProbeOptions, ProbeResult, ProbeSnapshot, RecentChange, TcpState, Unreachable,
 };
 
 /// How long a change of the network context is shown (`context_changed`):
@@ -183,6 +185,7 @@ pub async fn run(
         if matches!(result, ProbeResult::Refused { .. }) {
             refused += 1;
         }
+        let icmp_unreachable = unreachable_of(&result);
 
         let recovery_duration = outage.take_recovery();
 
@@ -218,12 +221,14 @@ pub async fn run(
                 ProbeResult::Error { message, .. } => Some(message),
                 _ => None,
             },
+            unreachable: stats.unreachable,
             name: name.state(),
             context_change: context.recent(Instant::now()),
             probe: None,
             port: None,
             refused: None,
             tcp_state: None,
+            icmp_unreachable,
         }
         .with_tcp(tcp_port);
         let snapshot = ProbeSnapshot {
@@ -429,6 +434,14 @@ pub(crate) fn create_backend(opts: &ProbeOptions) -> std::io::Result<ProbeBacken
     Ok(ProbeBackend::Icmp(backend))
 }
 
+/// The destination unreachable a probe got, for the snapshot.
+pub(crate) fn unreachable_of(result: &ProbeResult) -> Option<Unreachable> {
+    match *result {
+        ProbeResult::Unreachable { from, kind, .. } => Some(Unreachable { from, kind }),
+        _ => None,
+    }
+}
+
 /// What one probe result leaves for the snapshot.
 pub(crate) struct Recorded {
     /// TTL of an ICMP reply; `None` for anything else.
@@ -439,7 +452,8 @@ pub(crate) struct Recorded {
 
 /// Feed one probe result to a target's trackers. A TCP connect, established
 /// or refused, is an answer like an ICMP reply (`refused` is a subset of
-/// `received`); it carries no TTL.
+/// `received`); it carries no TTL. A destination unreachable is a loss, as
+/// in `ping`, counted apart (`unreachable`).
 pub(crate) fn record_result(
     result: &ProbeResult,
     stats: &mut ProbeStats,
@@ -455,6 +469,11 @@ pub(crate) fn record_result(
         ProbeResult::Timeout { .. } => {
             stats.record_timeout();
             (None, None, Some(TcpState::Timeout))
+        }
+        // ICMP only: no TCP outcome.
+        ProbeResult::Unreachable { .. } => {
+            stats.record_unreachable();
+            (None, None, None)
         }
         ProbeResult::Error { .. } => {
             stats.record_error();
@@ -484,6 +503,58 @@ mod tests {
 
     fn addr(s: &str) -> ResolvedAddr {
         ResolvedAddr::unscoped(s.parse().unwrap())
+    }
+
+    /// A destination unreachable is a loss for every tracker, as a timeout
+    /// is, counted apart, and its sender kept for the snapshot.
+    #[test]
+    fn an_unreachable_is_a_loss_counted_apart() {
+        use crate::diagnostics::health::Reachability;
+        use crate::probe::trace::UnreachableKind;
+        let mut stats = ProbeStats::new();
+        let mut quality = QualityScorer::new();
+        let mut spikes = SpikeDetector::new();
+        let mut outage = OutageTracker::new();
+        let mut health = HealthTracker::new(3, 2);
+        let unreachable = ProbeResult::Unreachable {
+            seq: 1,
+            from: "192.0.2.1".parse().unwrap(),
+            kind: UnreachableKind::Net,
+        };
+        for _ in 0..3 {
+            let recorded = record_result(
+                &unreachable,
+                &mut stats,
+                &mut quality,
+                &mut spikes,
+                &mut outage,
+                &mut health,
+            );
+            assert_eq!((recorded.ttl, recorded.tcp_state), (None, None));
+        }
+        assert_eq!(
+            (stats.sent, stats.received, stats.lost, stats.unreachable),
+            (3, 0, 3, 3)
+        );
+        assert_eq!(health.state(), Reachability::Offline);
+        assert_eq!(quality.window_loss_pct(), 100.0);
+        assert_eq!(
+            unreachable_of(&unreachable),
+            Some(Unreachable {
+                from: "192.0.2.1".parse().unwrap(),
+                kind: UnreachableKind::Net,
+            })
+        );
+        assert_eq!(unreachable_of(&ProbeResult::Timeout { seq: 2 }), None);
+        record_result(
+            &ProbeResult::Timeout { seq: 2 },
+            &mut stats,
+            &mut quality,
+            &mut spikes,
+            &mut outage,
+            &mut health,
+        );
+        assert_eq!((stats.lost, stats.unreachable), (4, 3));
     }
 
     /// A failover moves the probe and answered; anything else leaves the

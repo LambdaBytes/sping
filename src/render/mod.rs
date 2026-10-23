@@ -7,6 +7,7 @@ pub mod terminal;
 pub mod view_classic;
 pub mod view_compact;
 pub mod view_extended;
+pub mod view_ip;
 pub mod view_json;
 pub mod view_table;
 

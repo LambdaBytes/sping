@@ -12,7 +12,7 @@ use crate::diagnostics::health::HealthTracker;
 use crate::diagnostics::outage::OutageTracker;
 use crate::diagnostics::spikes::SpikeDetector;
 use crate::probe::quality::QualityScorer;
-use crate::probe::scheduler::{create_backend, record_result};
+use crate::probe::scheduler::{create_backend, record_result, unreachable_of};
 use crate::probe::stats::ProbeStats;
 use crate::probe::types::{ProbeOptions, ProbeResult, ProbeSnapshot};
 
@@ -49,10 +49,12 @@ pub async fn probe_target(
     let mut health = HealthTracker::new(3, 2);
     let mut last_ttl: Option<u8> = None;
     let mut last_error: Option<String> = None;
+    let mut last_unreachable = None;
     let mut last_tcp_state = None;
     let mut refused: u64 = 0;
 
-    // Fixed cadence, same policy as the scheduler.
+    // One probe per tick, each awaited, as in the scheduler: a probe longer
+    // than the interval delays the next.
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -81,6 +83,7 @@ pub async fn probe_target(
         if matches!(result, ProbeResult::Refused { .. }) {
             refused += 1;
         }
+        last_unreachable = unreachable_of(&result);
         last_error = match result {
             ProbeResult::Error { message, .. } => Some(message),
             _ => None,
@@ -118,6 +121,7 @@ pub async fn probe_target(
         recent_loss_pct: quality.window_loss_pct(),
         high_jitter: quality.high_jitter(),
         last_error,
+        unreachable: stats.unreachable,
         // Batch probes a fixed address: no re-resolution, no context watcher.
         name: None,
         context_change: None,
@@ -125,6 +129,7 @@ pub async fn probe_target(
         port: None,
         refused: None,
         tcp_state: None,
+        icmp_unreachable: last_unreachable,
     }
     .with_tcp(opts.tcp_port);
     ProbeSnapshot {

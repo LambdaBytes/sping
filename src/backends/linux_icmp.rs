@@ -16,6 +16,13 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use crate::probe::types::{ProbeOptions, ProbeResult};
 
+/// The first bytes of every echo request's payload (`build_echo_request_*`:
+/// byte `i` is `i & 0xff`): what an ICMP error quoting the probe shows of it.
+const PAYLOAD_START: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+
+/// Most retries of a send that failed on an errno the error queue explains.
+const SEND_RETRIES: usize = 3;
+
 /// Internet checksum (RFC 1071): one's-complement sum of 16-bit big-endian
 /// words, with an odd trailing byte padded on the right.
 pub(super) fn checksum(data: &[u8]) -> u16 {
@@ -449,6 +456,76 @@ pub struct LinuxIcmpBackend {
     is_raw: bool,
 }
 
+/// Ask for the ICMP errors about the probes on the socket's error queue
+/// (`IP_RECVERR` / `IPV6_RECVERR`, Linux only): a destination unreachable is
+/// then told from a silence. Such an error also leaves its errno pending on
+/// the socket (`ping_err`, `raw_err`), which fails the next send (DGRAM) or
+/// receive (RAW) until the queue is read: `ping` reads it before sending and
+/// whenever an operation fails. Best-effort: without it a destination
+/// unreachable is a timeout, as before 1.8.
+#[cfg(target_os = "linux")]
+fn enable_recv_errors(socket: &Socket, is_v6: bool) {
+    let (level, name) = if is_v6 {
+        (libc::IPPROTO_IPV6, libc::IPV6_RECVERR)
+    } else {
+        (libc::IPPROTO_IP, libc::IP_RECVERR)
+    };
+    // SAFETY: passes a pointer to a live c_int and its exact size to
+    // setsockopt on a valid fd.
+    unsafe {
+        let val: libc::c_int = 1;
+        let _ = libc::setsockopt(
+            socket.as_raw_fd(),
+            level,
+            name,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
+/// macOS hands ICMP errors over on the normal queue (`trace_unix`).
+#[cfg(not(target_os = "linux"))]
+fn enable_recv_errors(_socket: &Socket, _is_v6: bool) {}
+
+/// Send a probe on a socket that queues ICMP errors (Linux). The error queue
+/// is read first: what it holds is about earlier probes, whose errors came
+/// after their wait, and their pending errno would fail this send. Another
+/// one can still arrive between that read and the send: a send that fails
+/// is tried again when reading the queue found something, at most
+/// `SEND_RETRIES` times and while `may_retry` says the probe's time is not
+/// over, asked after that read, which takes time too. A failure the queue
+/// does not explain is the send's own.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn send_draining(
+    mut send: impl FnMut() -> io::Result<()>,
+    mut drain: impl FnMut() -> usize,
+    mut may_retry: impl FnMut() -> bool,
+) -> io::Result<()> {
+    drain();
+    let mut retries = 0;
+    loop {
+        let Err(e) = send() else {
+            return Ok(());
+        };
+        if retries == SEND_RETRIES || drain() == 0 || !may_retry() {
+            return Err(e);
+        }
+        retries += 1;
+    }
+}
+
+/// What the error queue held when a receive failed (Linux).
+#[cfg(target_os = "linux")]
+enum Queued {
+    /// A destination unreachable about the probe being waited for.
+    Unreachable(IpAddr, crate::probe::trace::UnreachableKind),
+    /// Errors about something else: their errno is what failed the receive.
+    Other,
+    /// Nothing: the failure is not an ICMP error's.
+    Empty,
+}
+
 /// Enable SO_TIMESTAMPNS kernel receive timestamps (Linux only, best-effort).
 #[cfg(target_os = "linux")]
 fn enable_rx_timestamps(socket: &Socket) {
@@ -512,6 +589,7 @@ impl LinuxIcmpBackend {
             );
         }
         enable_rx_timestamps(&socket);
+        enable_recv_errors(&socket, false);
         let identifier = next_identifier();
         Ok(Self {
             socket,
@@ -548,6 +626,7 @@ impl LinuxIcmpBackend {
             );
         }
         enable_rx_timestamps(&socket);
+        enable_recv_errors(&socket, true);
         let identifier = next_identifier();
         Ok(Self {
             socket,
@@ -637,20 +716,51 @@ impl LinuxIcmpBackend {
         } else {
             build_echo_request_v4(wire_seq, self.identifier, opts.payload_size)
         };
+        let expected_id = self.expected_id();
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+        let probe = super::trace_unix::MainProbe {
+            target: opts.target,
+            scope_id: opts.scope_id,
+            expected_id,
+            seq: wire_seq,
+            payload: &PAYLOAD_START,
+            payload_size: opts.payload_size,
+        };
+
         // `start` first: the plausibility guard in `refine_rtt` compares the
         // kernel-stamped RTT against `start.elapsed()`, so the wall stamp must
-        // not predate the monotonic one.
-        let start = Instant::now();
-        let tx_ns = realtime_nanos();
-
-        if let Err(e) = self.socket.send_to(&packet, &dest) {
+        // not predate the monotonic one. Both are taken again before a send
+        // tried once more: the RTT counts from the send that went out.
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut start = Instant::now();
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut tx_ns = realtime_nanos();
+        // The probe's `-W` runs from its first send: retries spend it, and
+        // the wait gets what is left.
+        let first = start;
+        #[cfg(target_os = "linux")]
+        let sent = send_draining(
+            || {
+                start = Instant::now();
+                tx_ns = realtime_nanos();
+                self.socket.send_to(&packet, &dest).map(drop)
+            },
+            || self.read_errors(None).0,
+            || first.elapsed() < opts.timeout,
+        );
+        #[cfg(not(target_os = "linux"))]
+        let sent = self.socket.send_to(&packet, &dest).map(drop);
+        if let Err(e) = sent {
             return ProbeResult::Error {
                 seq: seq as u64,
                 message: format!("send failed: {e}"),
             };
         }
-
-        let expected_id = self.expected_id();
+        // The read timeout was the whole `-W`, set before the first send.
+        #[cfg(target_os = "linux")]
+        if self.rearm_timeout(first, opts.timeout).is_none() {
+            return ProbeResult::Timeout { seq: seq as u64 };
+        }
         // Full reply size: payload + 8-byte ICMP header + up to 60 bytes of
         // IPv4 header on RAW. Truncation would fail the RAW checksum check and
         // turn every large-payload probe into a timeout.
@@ -664,6 +774,35 @@ impl LinuxIcmpBackend {
             } else {
                 Err(io::ErrorKind::Unsupported.into())
             };
+            // A receive failed by a queued ICMP error's errno: the queue says
+            // whether it is this probe's unreachable. Whatever the errno: a
+            // redirect leaves `EREMOTEIO`.
+            #[cfg(target_os = "linux")]
+            if let Err(e) = &result
+                && !matches!(
+                    e.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                )
+            {
+                match self.explain(&probe) {
+                    Queued::Unreachable(from, kind) => {
+                        return ProbeResult::Unreachable {
+                            seq: seq as u64,
+                            from,
+                            kind,
+                        };
+                    }
+                    Queued::Other => {
+                        if self.rearm_timeout(first, opts.timeout).is_none() {
+                            return ProbeResult::Timeout { seq: seq as u64 };
+                        }
+                        continue;
+                    }
+                    Queued::Empty => {}
+                }
+            }
             match result {
                 Ok((n, ttl, rx_ns, source)) => {
                     let rtt = refine_rtt(tx_ns, rx_ns, start.elapsed());
@@ -685,12 +824,12 @@ impl LinuxIcmpBackend {
                             ttl: final_ttl,
                         };
                     }
-                    if self.rearm_timeout(start, opts.timeout).is_none() {
+                    if self.rearm_timeout(first, opts.timeout).is_none() {
                         return ProbeResult::Timeout { seq: seq as u64 };
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                    if self.rearm_timeout(start, opts.timeout).is_none() {
+                    if self.rearm_timeout(first, opts.timeout).is_none() {
                         return ProbeResult::Timeout { seq: seq as u64 };
                     }
                 }
@@ -739,12 +878,35 @@ impl LinuxIcmpBackend {
                                     ttl: ip_ttl,
                                 };
                             }
-                            if self.rearm_timeout(start, opts.timeout).is_none() {
+                            // macOS IPv4: ICMP errors come on this queue,
+                            // with the IP header in front (`trace_unix`).
+                            #[cfg(target_os = "macos")]
+                            if let IpAddr::V4(target) = opts.target
+                                && let Some((
+                                    got,
+                                    from,
+                                    crate::probe::trace::ReplyKind::Unreachable(kind),
+                                )) = super::trace_unix::macos_answer(
+                                    data,
+                                    target,
+                                    self.identifier,
+                                    &PAYLOAD_START,
+                                    opts.payload_size,
+                                )
+                                && got == wire_seq
+                            {
+                                return ProbeResult::Unreachable {
+                                    seq: seq as u64,
+                                    from,
+                                    kind,
+                                };
+                            }
+                            if self.rearm_timeout(first, opts.timeout).is_none() {
                                 return ProbeResult::Timeout { seq: seq as u64 };
                             }
                         }
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                            if self.rearm_timeout(start, opts.timeout).is_none() {
+                            if self.rearm_timeout(first, opts.timeout).is_none() {
                                 return ProbeResult::Timeout { seq: seq as u64 };
                             }
                         }
@@ -755,6 +917,25 @@ impl LinuxIcmpBackend {
                             return ProbeResult::Timeout { seq: seq as u64 };
                         }
                         Err(e) => {
+                            // As above: an ICMP error may have come in the
+                            // meantime.
+                            #[cfg(target_os = "linux")]
+                            match self.explain(&probe) {
+                                Queued::Unreachable(from, kind) => {
+                                    return ProbeResult::Unreachable {
+                                        seq: seq as u64,
+                                        from,
+                                        kind,
+                                    };
+                                }
+                                Queued::Other => {
+                                    if self.rearm_timeout(first, opts.timeout).is_none() {
+                                        return ProbeResult::Timeout { seq: seq as u64 };
+                                    }
+                                    continue;
+                                }
+                                Queued::Empty => {}
+                            }
                             return ProbeResult::Error {
                                 seq: seq as u64,
                                 message: format!("recv failed: {e}"),
@@ -763,6 +944,52 @@ impl LinuxIcmpBackend {
                     }
                 }
             }
+        }
+    }
+
+    /// Read the socket's error queue, up to `DRAIN_BATCH` entries (Linux):
+    /// how many it held and, when `probe` is given, the destination
+    /// unreachable about it among them. Reading the queue clears the errno
+    /// its errors left pending.
+    #[cfg(target_os = "linux")]
+    fn read_errors(
+        &self,
+        probe: Option<&super::trace_unix::MainProbe>,
+    ) -> (
+        usize,
+        Option<(IpAddr, crate::probe::trace::UnreachableKind)>,
+    ) {
+        use super::trace_unix::{DRAIN_BATCH, probe_unreachable, recv_queued_error};
+        // The ICMP header and the start of the payload are what is read of
+        // the quoted probe; a longer entry is cut short (MSG_TRUNC).
+        let mut buf = [0u8; 512];
+        let mut entries = 0;
+        let mut found = None;
+        while entries < DRAIN_BATCH {
+            match recv_queued_error(self.as_raw_fd(), &mut buf) {
+                Ok(Some(entry)) => {
+                    entries += 1;
+                    if found.is_none()
+                        && let (Some(probe), Some(err)) = (probe, &entry.error)
+                    {
+                        found = probe_unreachable(&buf[..entry.len], err, entry.destination, probe);
+                    }
+                }
+                Ok(None) => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        (entries, found)
+    }
+
+    /// What the error queue says about a failed receive (Linux).
+    #[cfg(target_os = "linux")]
+    fn explain(&self, probe: &super::trace_unix::MainProbe) -> Queued {
+        match self.read_errors(Some(probe)) {
+            (_, Some((from, kind))) => Queued::Unreachable(from, kind),
+            (0, None) => Queued::Empty,
+            (_, None) => Queued::Other,
         }
     }
 
@@ -787,6 +1014,69 @@ impl LinuxIcmpBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `send_draining` with scripted outcomes: whether each send fails, what
+    /// each read of the error queue finds (the first one, before any send,
+    /// included), and how often the probe's time allows one more. Returns
+    /// whether it sent, and the calls in order: `s` send, `r` read, `t` the
+    /// time asked.
+    fn scripted(sends: &[bool], reads: &[usize], allowed: usize) -> (bool, String) {
+        let calls = std::cell::RefCell::new(String::new());
+        let (sent, read, asked) = (
+            std::cell::Cell::new(0),
+            std::cell::Cell::new(0),
+            std::cell::Cell::new(0),
+        );
+        let result = send_draining(
+            || {
+                calls.borrow_mut().push('s');
+                sent.set(sent.get() + 1);
+                if sends[sent.get() - 1] {
+                    Ok(())
+                } else {
+                    Err(io::Error::from_raw_os_error(libc::EHOSTUNREACH))
+                }
+            },
+            || {
+                calls.borrow_mut().push('r');
+                read.set(read.get() + 1);
+                reads[read.get() - 1]
+            },
+            || {
+                calls.borrow_mut().push('t');
+                asked.set(asked.get() + 1);
+                asked.get() <= allowed
+            },
+        );
+        (result.is_ok(), calls.into_inner())
+    }
+
+    /// A send fails on the errno of an error that came after its probe's
+    /// wait: read the queue and send again, as long as the queue explains
+    /// the failure, retries remain and the probe's time is not over, asked
+    /// after the read (which takes time too).
+    #[test]
+    fn a_send_is_retried_only_when_the_error_queue_explains_its_failure() {
+        // Stale errors before the send are read first; then it goes out.
+        assert_eq!(scripted(&[true], &[2], 9), (true, "rs".into()));
+        // One late error between the read and the send.
+        assert_eq!(scripted(&[false, true], &[0, 1], 9), (true, "rsrts".into()));
+        // Two in a row.
+        assert_eq!(
+            scripted(&[false, false, true], &[0, 1, 1], 9),
+            (true, "rsrtsrts".into())
+        );
+        // A failure the queue does not explain is the send's own.
+        assert_eq!(scripted(&[false], &[0, 0], 9), (false, "rsr".into()));
+        // Out of retries.
+        assert_eq!(
+            scripted(&[false; 4], &[0, 1, 1, 1], 9),
+            (false, "rsrtsrtsrts".into())
+        );
+        assert_eq!(SEND_RETRIES, 3);
+        // Out of time, found once the queue was read.
+        assert_eq!(scripted(&[false, true], &[0, 1], 0), (false, "rsrt".into()));
+    }
 
     /// Synthetic RAW-style echo reply: 20-byte IP header + ICMP (8 hdr + 4 payload).
     fn echo_reply_raw(seq: u16, id: u16, src: [u8; 4], first_byte: u8) -> Vec<u8> {

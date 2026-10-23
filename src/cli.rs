@@ -38,6 +38,10 @@ pub struct Args {
     #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..), conflicts_with = "payload_size")]
     pub tcp: Option<u16>,
 
+    /// Probe with an ICMP echo, what sping does without it until 2.0 changes the default: keeps this probe for scripts (--diagnose keeps its extra probes)
+    #[arg(long, conflicts_with = "tcp")]
+    pub icmp: bool,
+
     /// IP TTL / IPv6 hop limit for outgoing probes
     #[arg(short = 't', long)]
     pub ttl: Option<u8>,
@@ -82,9 +86,23 @@ pub struct Args {
     #[arg(long)]
     pub ascii: bool,
 
-    /// List available network interfaces and exit
+    /// List available network interfaces and exit (IPv4; see --ip for every address)
     #[arg(long)]
     pub list_interfaces: bool,
+
+    /// Show this host's addresses (every interface, IPv4 and IPv6, with prefix, kind and state), the source each family uses and the IPv4 gateway, then exit; --view json for scripts. Sends nothing unless --external
+    #[arg(long, conflicts_with_all = ["targets", "batch", "diagnose", "tcp", "list_interfaces"])]
+    pub ip: bool,
+
+    /// With --ip: ask a STUN server over UDP (default stun.cloudflare.com:3478) which address and port it sees each family come from; at most 3 requests per family within 3 s. It contacts that third party, so only when given
+    #[arg(
+        long,
+        value_name = "SERVER[:PORT]",
+        requires = "ip",
+        num_args = 0..=1,
+        default_missing_value = "stun.cloudflare.com:3478"
+    )]
+    pub external: Option<String>,
 
     /// Enable debug logging
     #[arg(long)]

@@ -1,5 +1,60 @@
 # Changelog
 
+## v1.8.0
+
+### Added
+- A destination unreachable on the ICMP probe is told apart from a timeout:
+  who sent it, a router or this host, and what it said. Classic prints
+  `From 192.0.2.1: seq=3 Destination Host Unreachable` and counts them as
+  `+N errors` in its summary, as `ping` does. Compact and extended put
+  `192.0.2.1 reports host unreachable` first in Events. JSON adds
+  `icmp_unreachable` (`{"from", "kind"}`) to that probe's line (see
+  JSON_CONTRACT.md). It is still a lost probe, and nothing changes when none
+  comes. On Linux (IPv4 and IPv6), macOS (IPv4) and Windows. A time
+  exceeded (`-t`) and other ICMP errors are reported as before: a timeout on
+  Linux and macOS, an error with the status on Windows.
+- `--icmp`: the ICMP probe, what sping runs without an option until 2.0.
+  It changes nothing today; scripts that rely on it keep it when 2.0 changes
+  the default. It cannot be combined with `--tcp`; with `--diagnose`, the
+  diagnosis keeps its extra probes, TCP included.
+- `sping --ip`: this host's addresses, every interface, IPv4 and IPv6,
+  each with its prefix, its kind (`loopback`, `link-local`, `private`,
+  `shared (CGNAT)`, `global`) and, for IPv6, its state (`temporary`,
+  `deprecated`, `tentative`, `duplicate`). It also shows the source each
+  family uses towards a reference address and the IPv4 default gateway.
+  `--view json` prints one object (JSON_CONTRACT.md). It sends nothing and
+  needs no privilege. `--list-interfaces` prints what it always printed.
+- `sping --ip --external [SERVER[:PORT]]`: also the address and port a STUN
+  server (RFC 8489, over UDP) sees each family's request come from, and the
+  local socket it left from: an `External` line, and an `external` object
+  in JSON. It asks a third party, so only when given; by default,
+  `stun.cloudflare.com:3478`. At most three requests per family within 3 s.
+  What the server does not say is unknown, and the exit code stays 0.
+
+### Upcoming in 2.0
+- `sping target` will find out on its own why a target does not answer, as
+  `--diagnose` does today. `--icmp` keeps the classic probe; `-4`, `-6` and
+  `--tcp` stay as they are.
+
+### Changed
+- `--diagnose`: a long outage is diagnosed again. While the target stays
+  down, sping runs the same checks 5 minutes after each diagnosis
+  concludes, and the new conclusions replace the old ones once they are in.
+  The classic view prints them each time; in JSON, `state` stays `"done"`
+  meanwhile.
+- `--diagnose` on Windows: when the other family's address is reported
+  unreachable, the diagnosis now says that family fails too, as on Linux.
+  It used to leave the other family untested, with
+  `ICMP error status 1100x`.
+
+### Fixes
+- `--diagnose` on Linux: a redirect arriving during a traceroute round
+  could end that round with `recv failed`.
+
+### Packaging
+- Builds with crossterm 0.29 and clap_mangen 0.3, the versions Debian sid
+  ships. The output, the man page and the shell completions are unchanged.
+
 ## v1.7.1
 
 The first release of 1.7 on GitHub, crates.io and the package channels.

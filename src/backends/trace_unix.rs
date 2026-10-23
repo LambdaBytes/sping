@@ -28,6 +28,11 @@
 //! another process's trace to the same target can pass only with our
 //! identifier and sequence number, quoted by a router that cites 8 bytes of
 //! ICMP (no nonce): improbable, not ruled out.
+//!
+//! The main probe (`linux_icmp`) reads its destination unreachables with the
+//! same parsers: the error queue on Linux (`probe_unreachable`), the normal
+//! queue on macOS (`macos_answer`), its payload's pattern in place of the
+//! nonce.
 
 // Each platform leaves the other's parsers unused (the error queue's on
 // macOS, `macos_answer` on Linux, where the tests use it); `is_raw` is for
@@ -59,7 +64,7 @@ const CANCEL_CHECK: Duration = Duration::from_millis(100);
 /// ICMP message of the host, so a busy host could keep a queue from ever
 /// emptying: the wait loop looks at the cancel flag and the deadline between
 /// batches.
-const DRAIN_BATCH: usize = 64;
+pub(super) const DRAIN_BATCH: usize = 64;
 
 /// The trace prober of Linux and macOS.
 pub struct UnixHopProber {
@@ -325,10 +330,12 @@ impl UnixHopProber {
         let mut count = 0;
         while count < DRAIN_BATCH {
             match recv_queued_error(self.fd(), &mut buf) {
-                Ok(Some((n, err))) => {
+                // The trace's nonce tells its probes apart: the destination
+                // is not needed.
+                Ok(Some(entry)) => {
                     count += 1;
-                    if let Some(err) = err {
-                        self.take_error(state, &buf[..n], err, Instant::now());
+                    if let Some(err) = entry.error {
+                        self.take_error(state, &buf[..entry.len], err, Instant::now());
                     }
                 }
                 Ok(None) => break,
@@ -443,7 +450,8 @@ impl UnixHopProber {
 }
 
 /// Whether `e` is an errno an ICMP error can leave pending on the socket
-/// (`icmp_err_convert`, `icmpv6_err_convert`).
+/// (`icmp_err_convert`, `icmpv6_err_convert`; `EREMOTEIO`, which a ping
+/// socket's `ping_err` gives a redirect and a source quench).
 #[cfg(target_os = "linux")]
 fn is_icmp_errno(e: &io::Error) -> bool {
     matches!(
@@ -459,16 +467,30 @@ fn is_icmp_errno(e: &io::Error) -> bool {
                 | libc::EOPNOTSUPP
                 | libc::EHOSTDOWN
                 | libc::ENONET
+                | libc::EREMOTEIO
         )
     )
 }
 
-/// One entry of the error queue: `None` when it carried no extended error.
+/// One entry of the error queue (`recv_queued_error`).
 #[cfg(target_os = "linux")]
-fn recv_queued_error(
+pub(super) struct QueuedEntry {
+    /// Bytes of the quoted packet read into the buffer.
+    pub len: usize,
+    /// The extended error; `None` when the entry carried none.
+    pub error: Option<QueuedError>,
+    /// The destination of the packet the entry is about (`msg_name`:
+    /// `ip_recv_error`/`ipv6_recv_error` fill it with the quoted packet's
+    /// destination, and its zone for a link-local one).
+    pub destination: Option<SocketAddr>,
+}
+
+/// One entry of the error queue; `None` when the queue is empty.
+#[cfg(target_os = "linux")]
+pub(super) fn recv_queued_error(
     fd: libc::c_int,
     buf: &mut [u8],
-) -> io::Result<Option<(usize, Option<QueuedError>)>> {
+) -> io::Result<Option<QueuedEntry>> {
     let mut iov = libc::iovec {
         iov_base: buf.as_mut_ptr() as *mut libc::c_void,
         iov_len: buf.len(),
@@ -484,18 +506,29 @@ fn recv_queued_error(
     msg.msg_control = cmsg_buf.0.as_mut_ptr() as *mut libc::c_void;
     msg.msg_controllen = cmsg_buf.0.len() as _;
 
-    // SAFETY: `msg` points to a live iovec and control buffer that outlive
-    // the call; the kernel writes at most `iov_len` and `msg_controllen`
-    // bytes into them.
-    let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_ERRQUEUE | libc::MSG_DONTWAIT) };
-    if n < 0 {
-        let e = io::Error::last_os_error();
-        return if e.kind() == io::ErrorKind::WouldBlock {
-            Ok(None)
-        } else {
-            Err(e)
-        };
-    }
+    // SAFETY: `msg` points to a live iovec, control buffer and (inside
+    // `try_init`) a zeroed `sockaddr_storage` of `*len` bytes that all
+    // outlive the call; the kernel writes at most `iov_len`,
+    // `msg_controllen` and `msg_namelen` bytes into them and stores the
+    // address's real length back in `msg_namelen`, which is what `try_init`
+    // requires of `len`.
+    let received = unsafe {
+        SockAddr::try_init(|storage, len| {
+            msg.msg_name = storage.cast();
+            msg.msg_namelen = *len;
+            let n = libc::recvmsg(fd, &mut msg, libc::MSG_ERRQUEUE | libc::MSG_DONTWAIT);
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            *len = msg.msg_namelen;
+            Ok(n)
+        })
+    };
+    let (n, destination) = match received {
+        Ok(received) => received,
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+        Err(e) => return Err(e),
+    };
 
     let mut err = None;
     // SAFETY: CMSG_FIRSTHDR/CMSG_NXTHDR walk the kernel-written control
@@ -516,7 +549,11 @@ fn recv_queued_error(
         }
         cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
     }
-    Ok(Some((n as usize, err)))
+    Ok(Some(QueuedEntry {
+        len: n as usize,
+        error: err,
+        destination: destination.as_socket(),
+    }))
 }
 
 /// The echo request of a trace probe: our identifier and `seq`, and the
@@ -545,7 +582,7 @@ fn echo_request(
 
 /// A `sock_extended_err` from the error queue, with its offender address.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct QueuedError {
+pub(super) struct QueuedError {
     errno: u32,
     origin: u8,
     icmp_type: u8,
@@ -588,27 +625,28 @@ fn parse_extended_err(data: &[u8]) -> Option<QueuedError> {
 
 /// The sequence number of the probe an ICMP error quotes back, if the probe
 /// is ours: an echo request with our identifier (where it can be checked)
-/// and, in whatever part of the payload was quoted, the trace's nonce.
+/// and, in whatever part of the payload was quoted, the start of ours
+/// (`payload`: the trace's nonce, or the main probe's pattern).
 fn quoted_probe(
     quoted: &[u8],
     is_v6: bool,
     expected_id: Option<u16>,
-    nonce: &[u8; 8],
+    payload: &[u8],
     payload_size: usize,
 ) -> Option<u16> {
     let request = if is_v6 { 128 } else { 8 };
     if quoted.len() < 8 || quoted[0] != request || quoted[1] != 0 {
         return None;
     }
-    probe_of(quoted, expected_id, nonce, payload_size)
+    probe_of(quoted, expected_id, payload, payload_size)
 }
 
-/// Identifier, nonce and sequence number of an echo request or reply
-/// (`icmp` starts at the ICMP header).
+/// Identifier, start of the payload and sequence number of an echo request
+/// or reply (`icmp` starts at the ICMP header).
 fn probe_of(
     icmp: &[u8],
     expected_id: Option<u16>,
-    nonce: &[u8; 8],
+    payload: &[u8],
     payload_size: usize,
 ) -> Option<u16> {
     if let Some(id) = expected_id
@@ -620,11 +658,66 @@ fn probe_of(
         .len()
         .saturating_sub(8)
         .min(payload_size)
-        .min(nonce.len());
-    if icmp[8..8 + present] != nonce[..present] {
+        .min(payload.len());
+    if icmp[8..8 + present] != payload[..present] {
         return None;
     }
     Some(u16::from_be_bytes([icmp[6], icmp[7]]))
+}
+
+/// The main probe (`linux_icmp`) an ICMP error may be about: its target (and
+/// zone), the identifier where the socket keeps it (RAW), its sequence
+/// number on the wire, and the start of its payload.
+pub(super) struct MainProbe<'a> {
+    pub target: IpAddr,
+    pub scope_id: u32,
+    pub expected_id: Option<u16>,
+    pub seq: u16,
+    pub payload: &'a [u8],
+    pub payload_size: usize,
+}
+
+/// Who reported the main probe unreachable, and how, when this entry of the
+/// error queue says so (Linux): a destination unreachable from the network
+/// (`SO_EE_ORIGIN_ICMP`/`ICMP6`, with its sender) quoting the probe itself,
+/// sent to its target. A RAW socket gets every ICMP error of the host, so
+/// another process's echo with the same identifier, sequence number and
+/// payload, sent elsewhere, is told apart by its destination. Anything else
+/// (another probe, a time exceeded, a redirect, a local error) is not.
+pub(super) fn probe_unreachable(
+    quoted: &[u8],
+    err: &QueuedError,
+    destination: Option<SocketAddr>,
+    probe: &MainProbe,
+) -> Option<(IpAddr, UnreachableKind)> {
+    let is_v6 = probe.target.is_ipv6();
+    if !matches!(err.origin, SO_EE_ORIGIN_ICMP | SO_EE_ORIGIN_ICMP6) {
+        return None;
+    }
+    let ReplyKind::Unreachable(kind) = reply_kind(is_v6, err.icmp_type, err.code) else {
+        return None;
+    };
+    let from = err.offender?;
+    if quoted_probe(
+        quoted,
+        is_v6,
+        probe.expected_id,
+        probe.payload,
+        probe.payload_size,
+    )? != probe.seq
+    {
+        return None;
+    }
+    let destination = destination?;
+    let scope = match destination {
+        SocketAddr::V6(v6) => v6.scope_id(),
+        SocketAddr::V4(_) => 0,
+    };
+    // As for replies (`linux_icmp::v6_source_ok`): a zone on both sides must
+    // agree.
+    let to_target = destination.ip() == probe.target
+        && (probe.scope_id == 0 || scope == 0 || scope == probe.scope_id);
+    to_target.then_some((from, kind))
 }
 
 /// Our echo reply over IPv4: with the IP header (RAW, macOS), from `target`.
@@ -670,21 +763,22 @@ fn echo_reply_seq_v6(
 /// about our probes: the sequence number, who answered and how. The socket
 /// gets every ICMP message of the host, so the datagram is ours only as an
 /// echo reply from `target`, or as an error (time exceeded, unreachable)
-/// quoting ICMP to `target`, each carrying our probe (`identifier`, nonce).
-/// Whether `seq` belongs to the round in progress is the caller's check. No
-/// IP length is read: BSD rewrites them (module docs).
-fn macos_answer(
+/// quoting ICMP to `target`, each carrying our probe (`identifier`, and
+/// `payload`: the trace's nonce, or the main probe's pattern). Whether `seq`
+/// is the one expected is the caller's check. No IP length is read: BSD
+/// rewrites them (module docs).
+pub(super) fn macos_answer(
     data: &[u8],
     target: Ipv4Addr,
     identifier: u16,
-    nonce: &[u8; 8],
+    payload: &[u8],
     payload_size: usize,
 ) -> Option<(u16, IpAddr, ReplyKind)> {
     let (header, icmp) = ipv4_icmp(data)?;
     let from = Ipv4Addr::new(header[12], header[13], header[14], header[15]);
     let (seq, kind) = match (icmp[0], icmp[1]) {
         (0, 0) if from == target => (
-            probe_of(icmp, Some(identifier), nonce, payload_size)?,
+            probe_of(icmp, Some(identifier), payload, payload_size)?,
             ReplyKind::EchoReply,
         ),
         (3 | 11, code) => {
@@ -693,7 +787,7 @@ fn macos_answer(
                 return None;
             }
             (
-                quoted_probe(quoted, false, Some(identifier), nonce, payload_size)?,
+                quoted_probe(quoted, false, Some(identifier), payload, payload_size)?,
                 reply_kind(false, icmp[0], code),
             )
         }
@@ -971,6 +1065,238 @@ mod tests {
         assert_eq!(quoted_probe(&bare, false, None, &NONCE, 0), Some(4));
     }
 
+    /// The start of the main probe's payload (`linux_icmp`: byte `i` is
+    /// `i & 0xff`).
+    const PATTERN: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+
+    /// The main probe's echo request as a router quotes it.
+    fn main_request(is_v6: bool, id: u16, seq: u16, payload_size: usize) -> Vec<u8> {
+        let mut q = vec![if is_v6 { 128 } else { 8 }, 0, 0x4e, 0x21];
+        q.extend_from_slice(&id.to_be_bytes());
+        q.extend_from_slice(&seq.to_be_bytes());
+        q.extend((0..payload_size).map(|i| i as u8));
+        q
+    }
+
+    fn queued(origin: u8, icmp_type: u8, code: u8, offender: Option<&str>) -> QueuedError {
+        QueuedError {
+            errno: 113,
+            origin,
+            icmp_type,
+            code,
+            offender: offender.map(|a| a.parse().unwrap()),
+        }
+    }
+
+    /// The main probe's destination unreachable: from the network, quoting
+    /// that probe, to its target. Nothing else ends the probe: another
+    /// probe of it, another kind of error, the trace's probe, another
+    /// identifier where it counts, or the same echo sent elsewhere.
+    #[test]
+    fn the_main_probes_unreachable_is_told_from_any_other_error() {
+        let target: IpAddr = "10.0.3.2".parse().unwrap();
+        let to = |a: &str| Some(SocketAddr::new(a.parse().unwrap(), 0));
+        let dgram = MainProbe {
+            target,
+            scope_id: 0,
+            expected_id: None,
+            seq: 7,
+            payload: &PATTERN,
+            payload_size: 44,
+        };
+        let raw = MainProbe {
+            expected_id: Some(0x5150),
+            ..dgram
+        };
+        let host = queued(2, 3, 1, Some("10.0.2.2"));
+        let quote = main_request(false, 0x048f, 7, 44);
+        let router = "10.0.2.2".parse().unwrap();
+
+        assert_eq!(
+            probe_unreachable(&quote, &host, to("10.0.3.2"), &dgram),
+            Some((router, UnreachableKind::Host))
+        );
+        // `prohibit` (13), net (0), as `reply_kind` reads them; a quote of
+        // the ICMP header alone.
+        assert_eq!(
+            probe_unreachable(
+                &quote,
+                &queued(2, 3, 13, Some("10.0.2.2")),
+                to("10.0.3.2"),
+                &dgram
+            ),
+            Some((router, UnreachableKind::AdminProhibited))
+        );
+        assert_eq!(
+            probe_unreachable(
+                &quote[..8],
+                &queued(2, 3, 0, Some("10.0.2.2")),
+                to("10.0.3.2"),
+                &dgram
+            ),
+            Some((router, UnreachableKind::Net))
+        );
+        // This host found no neighbor: it says so itself.
+        assert_eq!(
+            probe_unreachable(
+                &quote,
+                &queued(2, 3, 1, Some("10.0.1.2")),
+                to("10.0.3.2"),
+                &dgram
+            ),
+            Some(("10.0.1.2".parse().unwrap(), UnreachableKind::Host))
+        );
+
+        for (what, quote, err, destination, probe) in [
+            (
+                "another probe",
+                main_request(false, 0x048f, 8, 44),
+                host,
+                to("10.0.3.2"),
+                &dgram,
+            ),
+            (
+                "time exceeded",
+                quote.clone(),
+                queued(2, 11, 0, Some("10.0.1.1")),
+                to("10.0.3.2"),
+                &dgram,
+            ),
+            (
+                "fragmentation needed",
+                quote.clone(),
+                queued(2, 3, 4, Some("10.0.2.2")),
+                to("10.0.3.2"),
+                &dgram,
+            ),
+            (
+                "redirect",
+                quote.clone(),
+                queued(2, 5, 1, Some("10.0.1.1")),
+                to("10.0.3.2"),
+                &dgram,
+            ),
+            (
+                "a local error",
+                quote.clone(),
+                queued(1, 0, 0, None),
+                to("10.0.3.2"),
+                &dgram,
+            ),
+            (
+                "no sender",
+                quote.clone(),
+                queued(2, 3, 1, None),
+                to("10.0.3.2"),
+                &dgram,
+            ),
+            (
+                "the trace's probe",
+                echo_request(false, 0x048f, 7, &NONCE, 44),
+                host,
+                to("10.0.3.2"),
+                &dgram,
+            ),
+            (
+                "another identifier (RAW)",
+                main_request(false, 0x5151, 7, 44),
+                host,
+                to("10.0.3.2"),
+                &raw,
+            ),
+            (
+                "the same echo to another destination",
+                main_request(false, 0x5150, 7, 44),
+                host,
+                to("10.0.3.9"),
+                &raw,
+            ),
+            (
+                "no destination",
+                main_request(false, 0x5150, 7, 44),
+                host,
+                None,
+                &raw,
+            ),
+        ] {
+            assert_eq!(
+                probe_unreachable(&quote, &err, destination, probe),
+                None,
+                "{what}"
+            );
+        }
+        assert_eq!(
+            probe_unreachable(
+                &main_request(false, 0x5150, 7, 44),
+                &host,
+                to("10.0.3.2"),
+                &raw
+            ),
+            Some((router, UnreachableKind::Host))
+        );
+    }
+
+    /// IPv6: address unreachable (3) is the host's, no route (0) the
+    /// network's; a link-local target's zone must agree when both say one.
+    #[test]
+    fn the_main_probes_unreachable_over_ipv6() {
+        let probe = |target: &str, scope_id| MainProbe {
+            target: target.parse().unwrap(),
+            scope_id,
+            expected_id: None,
+            seq: 3,
+            payload: &PATTERN,
+            payload_size: 16,
+        };
+        let quote = main_request(true, 9, 3, 16);
+        let to = |a: &str, scope| {
+            Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                a.parse().unwrap(),
+                0,
+                0,
+                scope,
+            )))
+        };
+        let router = "fd00:2::2";
+        let global = probe("fd00:3::2", 0);
+        for (code, kind) in [
+            (3, UnreachableKind::Host),
+            (0, UnreachableKind::Net),
+            (1, UnreachableKind::AdminProhibited),
+            (4, UnreachableKind::Port),
+        ] {
+            assert_eq!(
+                probe_unreachable(
+                    &quote,
+                    &queued(3, 1, code, Some(router)),
+                    to("fd00:3::2", 0),
+                    &global
+                ),
+                Some((router.parse().unwrap(), kind)),
+                "code {code}"
+            );
+        }
+        // An IPv4 echo quoted to an IPv6 target is not ours.
+        assert_eq!(
+            probe_unreachable(
+                &main_request(false, 9, 3, 16),
+                &queued(3, 1, 3, Some(router)),
+                to("fd00:3::2", 0),
+                &global
+            ),
+            None
+        );
+
+        let linked = probe("fe80::1", 3);
+        let host = queued(3, 1, 3, Some("fe80::2"));
+        assert!(probe_unreachable(&quote, &host, to("fe80::1", 3), &linked).is_some());
+        assert!(probe_unreachable(&quote, &host, to("fe80::1", 0), &linked).is_some());
+        assert_eq!(
+            probe_unreachable(&quote, &host, to("fe80::1", 4), &linked),
+            None
+        );
+    }
+
     fn reply_v4(id: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
         let mut icmp = vec![0, 0, 0, 0];
         icmp.extend_from_slice(&id.to_be_bytes());
@@ -1228,6 +1554,28 @@ mod tests {
         assert_eq!(
             macos::answer(&data),
             Some((2, from, ReplyKind::TimeExceeded))
+        );
+    }
+
+    /// The main probe reads its unreachables on macOS the same way, by its
+    /// payload's pattern: E2's bytes with a destination unreachable and the
+    /// pattern where the trace's nonce was. The trace and the main probe do
+    /// not take each other's.
+    #[test]
+    fn macos_main_probe_unreachable_by_its_pattern() {
+        let (mut data, from) = macos::time_exceeded(0);
+        data[20..22].copy_from_slice(&[3, 1]);
+        data[56..64].copy_from_slice(&PATTERN);
+        assert_eq!(
+            macos_answer(&data, macos::TARGET, macos::ID, &PATTERN, 56),
+            Some((1, from, ReplyKind::Unreachable(UnreachableKind::Host)))
+        );
+        assert_eq!(macos::answer(&data), None, "not the trace's");
+        let (trace, _) = macos::time_exceeded(0);
+        assert_eq!(
+            macos_answer(&trace, macos::TARGET, macos::ID, &PATTERN, 56),
+            None,
+            "not the main probe's"
         );
     }
 

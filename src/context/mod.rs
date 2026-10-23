@@ -3,11 +3,13 @@
 
 #[cfg(any(target_os = "windows", test))]
 mod adapters_windows;
+pub mod addresses;
 pub mod classify;
 pub mod dns;
 pub mod gateway;
 pub mod iface;
 pub mod route;
+pub mod stun;
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};

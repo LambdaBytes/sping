@@ -13,8 +13,10 @@ const PULSE_WIDTH: usize = 40;
 pub struct ProbeStats {
     pub sent: u64,
     pub received: u64,
-    /// Probes lost (timeouts and errors).
+    /// Probes lost (timeouts, destination unreachables and errors).
     pub lost: u64,
+    /// The lost probes that got a destination unreachable.
+    pub unreachable: u64,
     rtt_last: Option<Duration>,
     rtt_sum: Duration,
     rtt_sum_ms: f64,
@@ -33,6 +35,7 @@ impl ProbeStats {
             sent: 0,
             received: 0,
             lost: 0,
+            unreachable: 0,
             rtt_last: None,
             rtt_sum: Duration::ZERO,
             rtt_sum_ms: 0.0,
@@ -75,6 +78,13 @@ impl ProbeStats {
         self.lost += 1;
         self.rtt_last = None;
         self.push_pulse(PulseEntry::Loss);
+    }
+
+    /// Record a destination unreachable: lost, as in `ping`, and counted
+    /// apart.
+    pub fn record_unreachable(&mut self) {
+        self.record_timeout();
+        self.unreachable += 1;
     }
 
     /// Record a send/receive error: counted as lost, same as a timeout.

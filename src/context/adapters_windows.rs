@@ -110,17 +110,48 @@ unsafe extern "system" {
     ) -> u32;
 }
 
+/// One unicast address of an adapter, as `GetAdaptersAddresses` lists it.
+#[derive(Debug, Clone)]
+pub struct AdapterAddress {
+    /// `IfIndex` for IPv4, `Ipv6IfIndex` — the zone index — for IPv6.
+    pub index: u32,
+    /// The adapter's friendly name.
+    pub name: String,
+    pub ip: IpAddr,
+    /// `None` when the system does not give one (255 marks "unknown").
+    pub prefix_len: Option<u8>,
+    /// `NL_DAD_STATE` (nldef.h): 0 invalid, 1 tentative, 2 duplicate,
+    /// 3 deprecated, 4 preferred.
+    pub dad_state: i32,
+}
+
 /// Every unicast address of every adapter (only adapters that are up when
 /// `only_up`), each with its interface index: `IfIndex` for IPv4,
 /// `Ipv6IfIndex` — the zone index — for IPv6. `None` when the system call
 /// fails, so the caller can fall back to another source.
 #[cfg(target_os = "windows")]
 pub fn adapters(only_up: bool) -> Option<Vec<(u32, InterfaceInfo)>> {
+    query(only_up)
+        .ok()
+        .map(|list| list.into_iter().map(legacy).collect())
+}
+
+/// Every unicast address of every adapter, up or not, for `sping --ip`; the
+/// reason when the system call fails.
+#[cfg(target_os = "windows")]
+pub fn addresses() -> Result<Vec<AdapterAddress>, String> {
+    query(false)
+}
+
+/// `GetAdaptersAddresses`, with the buffer it asks for.
+#[cfg(target_os = "windows")]
+fn query(only_up: bool) -> Result<Vec<AdapterAddress>, String> {
     const AF_UNSPEC: u32 = 0;
     // GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER
     const FLAGS: u32 = 0x2 | 0x4 | 0x8;
     const ERROR_SUCCESS: u32 = 0;
     const ERROR_BUFFER_OVERFLOW: u32 = 111;
+    const ERROR_NO_DATA: u32 = 232;
     /// More than any real adapter list; refuses a nonsensical size request.
     const MAX_BUFFER: u32 = 16 * 1024 * 1024;
 
@@ -128,7 +159,7 @@ pub fn adapters(only_up: bool) -> Option<Vec<(u32, InterfaceInfo)>> {
     let mut size: u32 = 16 * 1024;
     for _ in 0..3 {
         if size > MAX_BUFFER {
-            return None;
+            return Err(format!("GetAdaptersAddresses asks for {size} bytes"));
         }
         // u64 words: the records need 8-byte alignment, which `Vec<u8>`
         // does not promise.
@@ -151,15 +182,28 @@ pub fn adapters(only_up: bool) -> Option<Vec<(u32, InterfaceInfo)>> {
             ERROR_SUCCESS => {
                 // SAFETY: on success the list starts at `buf` and every
                 // pointer in it points into `buf`, which is alive and not
-                // written to until `collect` returns.
-                return Some(unsafe { collect(buf.as_ptr().cast(), only_up) });
+                // written to until `collect_addresses` returns.
+                return Ok(unsafe { collect_addresses(buf.as_ptr().cast(), only_up) });
             }
             ERROR_BUFFER_OVERFLOW => size = len,
-            // ERROR_NO_DATA and real failures alike: nothing to report.
-            _ => return None,
+            // No adapter with an address.
+            ERROR_NO_DATA => return Ok(Vec::new()),
+            code => return Err(format!("GetAdaptersAddresses failed (error {code})")),
         }
     }
-    None
+    Err("GetAdaptersAddresses kept asking for a larger buffer".into())
+}
+
+/// An address as the context detection takes it: an unknown prefix is 0.
+fn legacy(address: AdapterAddress) -> (u32, InterfaceInfo) {
+    (
+        address.index,
+        InterfaceInfo {
+            name: address.name,
+            ip: address.ip,
+            prefix_len: address.prefix_len.unwrap_or(0),
+        },
+    )
 }
 
 /// Walk an adapter list.
@@ -171,7 +215,25 @@ pub fn adapters(only_up: bool) -> Option<Vec<(u32, InterfaceInfo)>> {
 /// `Next`, name and socket-address pointers are null or point to memory that
 /// is valid — for `sockaddr_length` bytes, or up to a NUL for names — and
 /// not written to during the call.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 unsafe fn collect(first: *const IpAdapterAddresses, only_up: bool) -> Vec<(u32, InterfaceInfo)> {
+    // SAFETY: the same contract.
+    unsafe { collect_addresses(first, only_up) }
+        .into_iter()
+        .map(legacy)
+        .collect()
+}
+
+/// Walk an adapter list, every unicast address with its prefix (if known)
+/// and DAD state.
+///
+/// # Safety
+///
+/// As [`collect`].
+unsafe fn collect_addresses(
+    first: *const IpAdapterAddresses,
+    only_up: bool,
+) -> Vec<AdapterAddress> {
     let mut result = Vec::new();
     let mut adapter_ptr = first;
     for _ in 0..MAX_ADAPTERS {
@@ -223,17 +285,16 @@ unsafe fn collect(first: *const IpAdapterAddresses, only_up: bool) -> Vec<(u32, 
             };
             // Out of range (255 marks "unknown") reads as no prefix.
             let prefix_len = match unicast.on_link_prefix_length {
-                p if p <= max_prefix => p,
-                _ => 0,
+                p if p <= max_prefix => Some(p),
+                _ => None,
             };
-            result.push((
+            result.push(AdapterAddress {
                 index,
-                InterfaceInfo {
-                    name: name.clone(),
-                    ip,
-                    prefix_len,
-                },
-            ));
+                name: name.clone(),
+                ip,
+                prefix_len,
+                dad_state: unicast.dad_state,
+            });
         }
     }
     result
@@ -367,6 +428,37 @@ mod tests {
         list.iter()
             .map(|(idx, i)| (*idx, i.name.as_str(), i.ip.to_string(), i.prefix_len))
             .collect()
+    }
+
+    /// `sping --ip`'s walk: each address's DAD state as the system wrote it,
+    /// and an unknown prefix (255) as none, where the legacy walk says 0.
+    #[test]
+    fn addresses_carry_their_dad_state_and_unknown_prefix() {
+        let name = wide("Ethernet");
+        let (v6, v4) = (sockaddr_in6("2001:db8::7"), sockaddr_in([192, 0, 2, 7]));
+        let mut first = unicast(&v6, 64);
+        first.dad_state = 3;
+        let mut second = unicast(&v4, 255);
+        second.dad_state = 4;
+        first.next = &*second;
+        let eth = adapter(&name, &*first, IF_OPER_STATUS_UP);
+        // SAFETY: the records above are alive and unchanged during the walk.
+        let list = unsafe { collect_addresses(&*eth, false) };
+        let got: Vec<(String, Option<u8>, i32)> = list
+            .iter()
+            .map(|a| (a.ip.to_string(), a.prefix_len, a.dad_state))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("2001:db8::7".to_string(), Some(64), 3),
+                ("192.0.2.7".to_string(), None, 4),
+            ]
+        );
+        assert_eq!(list[0].index, 7, "Ipv6IfIndex");
+        // SAFETY: as above.
+        let legacy = unsafe { collect(&*eth, false) };
+        assert_eq!(legacy[1].1.prefix_len, 0);
     }
 
     #[test]
