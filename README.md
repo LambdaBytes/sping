@@ -16,7 +16,7 @@
 
 A modern ping for humans. Terminal-native, real-time connectivity monitor that doesn't just measure packets — **it interprets network context**.
 
-![sping 1.7.0: --diagnose on a host that stops answering ping and on a dead path, a cable to Wi-Fi change while monitoring, and the classic view](docs/sping-1.7.0.gif)
+![sping 1.8.0: the live view, several targets at once, --diagnose on a host that stops answering ping, a destination unreachable told apart from a timeout, and --ip --external](docs/sping-1.8.0.gif)
 
 **Status:** functional and in active use, with a frozen JSON contract.
 Linux, macOS and Windows; x86_64, aarch64 and armv7 (Raspberry Pi).
@@ -445,8 +445,9 @@ sudo setcap cap_net_raw+ep /usr/bin/sping
 
 **Measurement**
 - ICMP echo over IPv4 and IPv6 with its own implementation on each platform,
-  no admin rights needed, and a **TCP connect probe** (`--tcp PORT`) where
-  ICMP is filtered
+  no admin rights needed (on Linux, where unprivileged ICMP is allowed: see
+  [ICMP permissions](#icmp-permissions)), and a **TCP connect probe**
+  (`--tcp PORT`) where ICMP is filtered
 - **Quality score** A–D (excellent, good, fair, poor; 0–100) over the last
   20 probes, with a **trend** (stable/improving/degrading) that counts lost
   probes
@@ -527,7 +528,7 @@ sudo setcap cap_net_raw+ep /usr/bin/sping
 | `-S` source | bind() | bind() | OS routes (TCP: bind()) |
 | TCP connect | socket2 | socket2 | socket2 (Winsock) |
 | Traceroute (`--diagnose`) | ICMP errors (`IP_RECVERR`) | DGRAM socket, IPv4 only | IcmpSendEcho with TTL |
-| Admin required | No | No | No |
+| Admin required | No, where unprivileged ICMP is allowed ([ICMP permissions](#icmp-permissions)) | No | No |
 | All views | full | full | full |
 
 ## Architecture
