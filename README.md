@@ -81,7 +81,7 @@ prints only each target's summary at the end (`-c N` stops it). Batch mode
 
 | Method | Command | Platforms | Man page and completions |
 |--------|---------|-----------|--------------------------|
-| Homebrew | `brew install LambdaBytes/tap/sping` | macOS | yes |
+| Homebrew | `brew install sping` | macOS | yes |
 | Scoop | `scoop install lambdabytes/sping`, once the bucket is added (see below) | Windows x86_64 | no |
 | crates.io | `cargo install sping` | Linux, macOS, Windows, with Rust 1.88+ | no |
 | Pre-built binary | from the [Releases page](https://github.com/LambdaBytes/sping/releases) | Linux, macOS, Windows | no |
@@ -94,7 +94,7 @@ From v1.6.0 on. Builds from source and installs the binary, the man page and
 the shell completions:
 
 ```bash
-brew install LambdaBytes/tap/sping
+brew install sping
 ```
 
 ### Scoop
