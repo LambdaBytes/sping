@@ -1,6 +1,7 @@
-//! Local interface discovery: Linux via the routing table and the kernel's
-//! IPv6 address table, macOS via `ifconfig`, Windows via the adapter API
-//! (`ipconfig` text as a fallback). Best-effort.
+//! Local interface discovery: Linux via the system's addresses (`getifaddrs`
+//! for IPv4, the kernel's IPv6 address table) and the routing table, macOS
+//! via `ifconfig`, Windows via the adapter API (`ipconfig` text as a
+//! fallback). Best-effort.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
@@ -93,20 +94,13 @@ pub fn interface_for_ip(local_ip: IpAddr, scope_id: u32) -> Option<InterfaceInfo
         });
     }
 
-    // Routing table is empty off Linux, so this loop is a no-op there.
-    let routes = read_routes();
-    for r in &routes {
-        let mask_bits = u32::from_be_bytes(r.mask.octets());
-        let dest_bits = u32::from_be_bytes(r.destination.octets());
-        let ip_bits = u32::from_be_bytes(_v4.octets());
-
-        if (ip_bits & mask_bits) == dest_bits && mask_bits != 0 {
-            return Some(InterfaceInfo {
-                name: r.iface.clone(),
-                ip: local_ip,
-                prefix_len: mask_to_prefix(r.mask),
-            });
-        }
+    // Both lists are empty off Linux, where the fallbacks below answer.
+    #[cfg(target_os = "linux")]
+    let addresses = crate::context::addresses::getifaddrs_list().unwrap_or_default();
+    #[cfg(not(target_os = "linux"))]
+    let addresses = Vec::new();
+    if let Some(info) = ipv4_interface(&addresses, &read_routes(), _v4) {
+        return Some(info);
     }
 
     // Fallback: use default gateway for interface name, platform tool for
@@ -139,6 +133,46 @@ pub fn interface_for_ip(local_ip: IpAddr, scope_id: u32) -> Option<InterfaceInfo
         return Some(info);
     }
 
+    None
+}
+
+/// The interface of the IPv4 source `ip` and its prefix there: the one that
+/// holds the address among `addresses` (interface, address, prefix of its
+/// netmask), when exactly one does. The routing table says where packets
+/// go, not whose an address is: a route through a gateway may cover it by
+/// another interface. Only for an address no interface, or more than one,
+/// is known to hold, the first route that covers it.
+fn ipv4_interface(
+    addresses: &[(String, IpAddr, Option<u8>)],
+    routes: &[route::RouteEntry],
+    ip: Ipv4Addr,
+) -> Option<InterfaceInfo> {
+    let mut holders = addresses
+        .iter()
+        .filter(|(_, held, _)| *held == IpAddr::V4(ip));
+    if let (Some((name, _, prefix_len)), None) = (holders.next(), holders.next()) {
+        // `getifaddrs` names an address by its label (`eth0:0`) when it has
+        // one: the interface is what precedes the colon.
+        let name = name.split_once(':').map_or(name.as_str(), |(dev, _)| dev);
+        return Some(InterfaceInfo {
+            name: name.to_string(),
+            ip: IpAddr::V4(ip),
+            prefix_len: prefix_len.unwrap_or(0),
+        });
+    }
+    for r in routes {
+        let mask_bits = u32::from_be_bytes(r.mask.octets());
+        let dest_bits = u32::from_be_bytes(r.destination.octets());
+        let ip_bits = u32::from_be_bytes(ip.octets());
+
+        if (ip_bits & mask_bits) == dest_bits && mask_bits != 0 {
+            return Some(InterfaceInfo {
+                name: r.iface.clone(),
+                ip: IpAddr::V4(ip),
+                prefix_len: mask_to_prefix(r.mask),
+            });
+        }
+    }
     None
 }
 
@@ -303,8 +337,15 @@ fn interface_from_ifconfig(local_ip: IpAddr) -> Option<InterfaceInfo> {
 }
 
 /// Interface index of `name` (`if_nametoindex`); 0 when there is none.
-#[cfg(target_os = "macos")]
-fn interface_index(name: &str) -> u32 {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn interface_index(name: &str) -> u32 {
+    // No interface has a name this long, nor one with a colon: musl would
+    // cut the first to the length a name may have, and the kernel reads the
+    // second as the label of an address (`eth0:0`). Both would answer for
+    // the interface of another name.
+    if name.len() >= libc::IFNAMSIZ || name.contains(':') {
+        return 0;
+    }
     let Ok(name) = std::ffi::CString::new(name) else {
         return 0;
     };
@@ -348,11 +389,9 @@ fn parse_ifconfig(text: &str) -> Vec<InterfaceInfo> {
             if parts.len() >= 4
                 && let Ok(ip) = parts[1].parse::<Ipv4Addr>()
             {
-                let prefix = if parts[2] == "netmask" {
-                    parse_hex_netmask(parts[3])
-                } else {
-                    0
-                };
+                // By keyword: a point-to-point line has the peer first
+                // ("inet 10.8.0.6 --> 10.8.0.5 netmask 0xffffff00").
+                let prefix = word_after(&parts, "netmask").map_or(0, parse_hex_netmask);
                 result.push(InterfaceInfo {
                     name: current_iface.clone(),
                     ip: IpAddr::V4(ip),
@@ -365,13 +404,13 @@ fn parse_ifconfig(text: &str) -> Vec<InterfaceInfo> {
         if trimmed.starts_with("inet6 ") {
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
             if parts.len() >= 4
-                && parts[2] == "prefixlen"
+                && let Some(prefix) = word_after(&parts, "prefixlen")
                 && let Ok(ip) = parts[1]
                     .split('%')
                     .next()
                     .unwrap_or("")
                     .parse::<std::net::Ipv6Addr>()
-                && let Ok(prefix) = parts[3].parse::<u8>()
+                && let Ok(prefix) = prefix.parse::<u8>()
             {
                 result.push(InterfaceInfo {
                     name: current_iface.clone(),
@@ -382,6 +421,13 @@ fn parse_ifconfig(text: &str) -> Vec<InterfaceInfo> {
         }
     }
     result
+}
+
+/// The word after `key` in a line of `ifconfig`.
+#[cfg(any(target_os = "macos", test))]
+fn word_after<'a>(words: &[&'a str], key: &str) -> Option<&'a str> {
+    let at = words.iter().position(|word| *word == key)?;
+    words.get(at + 1).copied()
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -412,13 +458,29 @@ fn windows_entries(only_up: bool) -> Vec<(u32, InterfaceInfo)> {
     }
 }
 
+/// Whether one of this host's adapters that has an address, up or not, of
+/// either family, the loopback one included, is called `name`: what `-I`
+/// takes on Windows, where [`list_interfaces`] keeps IPv4 and no loopback.
+/// The adapter API lists addresses: an adapter with none is not found
+/// (`-I` binds nothing on Windows; only its refusal is at stake).
+#[cfg(target_os = "windows")]
+pub(crate) fn has_adapter(name: &str) -> bool {
+    windows_entries(false)
+        .iter()
+        .any(|(_, info)| info.name == name)
+}
+
 #[cfg(target_os = "windows")]
 fn list_interfaces_ipconfig() -> Vec<InterfaceInfo> {
     // `ipconfig` outputs blocks like:
     //   Ethernet adapter Ethernet:
     //      IPv4 Address. . . . . . . . . . . : 192.168.1.100
     //      Subnet Mask . . . . . . . . . . . : 255.255.255.0
-    let output = std::process::Command::new("ipconfig").output().ok();
+    // By its full path, as route (`route::system_program`).
+    let Some(ipconfig) = crate::context::route::system_program("ipconfig.exe") else {
+        return Vec::new();
+    };
+    let output = std::process::Command::new(ipconfig).output().ok();
     let Some(output) = output else {
         return Vec::new();
     };
@@ -598,6 +660,62 @@ garbage line
         assert!(pick_in_zone(known_only, ip, 9).is_none());
     }
 
+    /// An IPv4 source is on the interface that holds the address, with the
+    /// prefix it has there: a route through a gateway that covers it by
+    /// another interface (10.0.0.0/8, listed before the on-link /24) is not
+    /// its network, and an address with a /32 is in no route. An address
+    /// with a label is on the label's interface. The routes answer only for
+    /// an address no interface, or more than one, is known to hold.
+    #[test]
+    fn ipv4_source_is_on_the_interface_that_holds_it() {
+        let route = |iface: &str, destination: [u8; 4], gateway: [u8; 4], mask: [u8; 4]| {
+            route::RouteEntry {
+                iface: iface.into(),
+                destination: destination.into(),
+                gateway: gateway.into(),
+                mask: mask.into(),
+                metric: 0,
+            }
+        };
+        let routes = [
+            route("d1", [10, 0, 0, 0], [172, 30, 0, 1], [255, 0, 0, 0]),
+            route("d0", [10, 1, 2, 0], [0, 0, 0, 0], [255, 255, 255, 0]),
+            route("d1", [172, 30, 0, 0], [0, 0, 0, 0], [255, 255, 255, 0]),
+        ];
+        let addresses: Vec<(String, IpAddr, Option<u8>)> = [
+            ("lo", "127.0.0.1", Some(8)),
+            ("d1", "172.30.0.2", Some(24)),
+            ("d0", "10.1.2.5", Some(24)),
+            ("d0", "fe80::5", Some(64)),
+            ("d32", "10.9.9.1", Some(32)),
+            ("tun0", "10.7.0.2", None),
+            ("d0:web", "192.168.5.5", Some(24)),
+            ("d0", "10.44.0.1", Some(24)),
+            ("d1", "10.44.0.1", Some(16)),
+        ]
+        .map(|(name, ip, prefix)| (name.into(), ip.parse().unwrap(), prefix))
+        .into();
+        let on = |addresses: &[_], ip: &str| {
+            ipv4_interface(addresses, &routes, ip.parse().unwrap())
+                .map(|i| (i.name, i.ip.to_string(), i.prefix_len))
+        };
+        let is = |name: &str, ip: &str, prefix| Some((name.to_string(), ip.to_string(), prefix));
+
+        assert_eq!(on(&addresses, "10.1.2.5"), is("d0", "10.1.2.5", 24));
+        assert_eq!(on(&addresses, "10.9.9.1"), is("d32", "10.9.9.1", 32));
+        assert_eq!(on(&addresses, "172.30.0.2"), is("d1", "172.30.0.2", 24));
+        // No netmask: the prefix is not known.
+        assert_eq!(on(&addresses, "10.7.0.2"), is("tun0", "10.7.0.2", 0));
+        assert_eq!(on(&addresses, "192.168.5.5"), is("d0", "192.168.5.5", 24));
+        // On two interfaces: whose it is is not known, the routes answer.
+        assert_eq!(on(&addresses, "10.44.0.1"), is("d1", "10.44.0.1", 8));
+        // The addresses could not be read, or no longer hold it: the routes.
+        assert_eq!(on(&[], "10.1.2.5"), is("d1", "10.1.2.5", 8));
+        assert_eq!(on(&[], "172.30.0.2"), is("d1", "172.30.0.2", 24));
+        assert_eq!(on(&addresses, "192.0.2.5"), None);
+        assert_eq!(on(&[], "192.0.2.5"), None);
+    }
+
     /// A 127.0.0.1 source is on the loopback interface with its /8, never
     /// on the default route's interface (which Windows named by its
     /// address). Exact on Linux; on macOS and Windows it comes from the
@@ -636,6 +754,23 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
         // Loopback too: a 127.0.0.1 source is looked up here.
         let e = entry(&list, "127.0.0.1");
         assert_eq!((e.name.as_str(), e.prefix_len), ("lo0", 8));
+    }
+
+    /// A point-to-point line has the peer before the netmask or the prefix
+    /// (`-->`): both are read by keyword.
+    #[test]
+    fn ifconfig_point_to_point_lines() {
+        let text = "\
+utun3: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380
+\tinet 10.8.0.6 --> 10.8.0.5 netmask 0xffffff00
+\tinet6 fd00:8::6 --> fd00:8::5 prefixlen 128
+";
+        let list = parse_ifconfig(text);
+        assert_eq!(list.len(), 2, "{list:?}");
+        let e = entry(&list, "10.8.0.6");
+        assert_eq!((e.name.as_str(), e.prefix_len), ("utun3", 24));
+        let e = entry(&list, "fd00:8::6");
+        assert_eq!((e.name.as_str(), e.prefix_len), ("utun3", 128));
     }
 
     #[test]

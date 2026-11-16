@@ -6,7 +6,8 @@ use std::net::Ipv4Addr;
 
 /// Entry from the kernel routing table.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+// Off Linux only a test builds a route and nothing reads `gateway` or `metric`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct RouteEntry {
     pub iface: String,
     pub destination: Ipv4Addr,
@@ -69,7 +70,9 @@ fn default_gateway_windows() -> Result<Option<(Ipv4Addr, String)>, String> {
     // `route print 0.0.0.0` outputs lines like:
     //   0.0.0.0          0.0.0.0      192.168.1.1    192.168.1.100     25
     // Fields: Network, Netmask, Gateway, Interface, Metric
-    let output = std::process::Command::new("route")
+    let route = system_program("route.exe")
+        .ok_or_else(|| "cannot run route: the system directory is unknown".to_string())?;
+    let output = std::process::Command::new(route)
         .args(["print", "0.0.0.0"])
         .output()
         .map_err(|e| format!("cannot run route: {e}"))?;
@@ -79,9 +82,35 @@ fn default_gateway_windows() -> Result<Option<(Ipv4Addr, String)>, String> {
     )
 }
 
+/// A program of Windows' own by its full path, in the system directory
+/// (`C:\Windows\System32`). By its bare name `Command` looks first in the
+/// directory sping.exe was started from, so a `route.exe` saved beside it (a
+/// downloads folder) would run instead: seen with v1.9.0-rc1 on the Windows
+/// runner (2026-11-13). `None` when the system does not say where that
+/// directory is.
+#[cfg(target_os = "windows")]
+pub(crate) fn system_program(name: &str) -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
+    }
+    // MAX_PATH: the system directory is a short path.
+    let mut buffer = [0u16; 260];
+    // SAFETY: `buffer` is a live array of `buffer.len()` u16s, which the call
+    // writes at most (its NUL included). It returns the length written
+    // without the NUL, the size it would need (more than the buffer) or 0.
+    let len = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    if len == 0 || len >= buffer.len() {
+        return None;
+    }
+    let dir = std::path::PathBuf::from(std::ffi::OsString::from_wide(&buffer[..len]));
+    Some(dir.join(name))
+}
+
 /// The default gateway in `route print 0.0.0.0`'s output: the first
-/// default route's, `None` when there is none or its gateway is not an
-/// address ("On-link"). Without one, a failed `route` could not tell.
+/// active default route's, `None` when there is none or its gateway is not
+/// an address ("On-link"). Without one, a failed `route` could not tell.
 #[cfg(any(target_os = "windows", test))]
 fn windows_gateway(succeeded: bool, stdout: &str) -> Result<Option<(Ipv4Addr, String)>, String> {
     for line in stdout.lines() {
@@ -90,6 +119,12 @@ fn windows_gateway(succeeded: bool, stdout: &str) -> Result<Option<(Ipv4Addr, St
             let Ok(gw) = parts[2].parse::<Ipv4Addr>() else {
                 return Ok(None);
             };
+            // A persistent route ("Network Address  Netmask  Gateway
+            // Address  Metric") has its metric where an active one has the
+            // address of its interface, and may not be in use.
+            if parts[3].parse::<Ipv4Addr>().is_err() {
+                continue;
+            }
             let iface_ip = parts[3].to_string();
             return Ok(Some((gw, iface_ip)));
         }
@@ -140,13 +175,15 @@ fn parse_routes(content: &str) -> Vec<RouteEntry> {
 
 /// The default route's gateway and interface among `routes`. Multiple
 /// default routes (WiFi + Ethernet, VPN): the lowest metric, which is what
-/// the kernel actually uses.
+/// the kernel actually uses. `None` as well when that route has no gateway
+/// (`default dev ppp0`): its 0.0.0.0 is no address.
 #[cfg(target_os = "linux")]
 fn default_route(routes: Vec<RouteEntry>) -> Option<(Ipv4Addr, String)> {
     routes
         .into_iter()
         .filter(|r| r.destination == Ipv4Addr::UNSPECIFIED && r.mask == Ipv4Addr::UNSPECIFIED)
         .min_by_key(|r| r.metric)
+        .filter(|r| !r.gateway.is_unspecified())
         .map(|r| (r.gateway, r.iface))
 }
 
@@ -225,11 +262,22 @@ pub fn mask_to_prefix(mask: Ipv4Addr) -> u8 {
 mod tests {
     use super::*;
 
+    /// An address as `/proc/net/route` prints it: the kernel's `__be32` in
+    /// `%08X`, that is, the address's bytes read as a host-order `u32`.
+    #[cfg(target_os = "linux")]
+    fn route_hex(ip: Ipv4Addr) -> String {
+        format!("{:08X}", u32::from_ne_bytes(ip.octets()))
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn test_parse_hex_ip() {
-        let ip = parse_hex_ip("0100007F").unwrap();
-        assert_eq!(ip, Ipv4Addr::new(127, 0, 0, 1));
+        let hex = route_hex(Ipv4Addr::new(127, 0, 0, 1));
+        #[cfg(target_endian = "little")]
+        assert_eq!(hex, "0100007F");
+        #[cfg(target_endian = "big")]
+        assert_eq!(hex, "7F000001");
+        assert_eq!(parse_hex_ip(&hex), Some(Ipv4Addr::new(127, 0, 0, 1)));
     }
 
     /// The default route of `/proc/net/route`'s text: the lowest metric of
@@ -239,20 +287,52 @@ mod tests {
     fn default_route_of_the_table() {
         let header =
             "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n";
+        let any = route_hex(Ipv4Addr::UNSPECIFIED);
+        let wifi_gw = route_hex(Ipv4Addr::new(192, 168, 1, 1));
+        let eth_gw = route_hex(Ipv4Addr::new(10, 0, 0, 1));
+        let net = route_hex(Ipv4Addr::new(10, 0, 0, 0));
+        let mask = route_hex(Ipv4Addr::new(255, 255, 255, 0));
         let table = format!(
             "{header}\
-wlan0\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n\
-eth0\t00000000\t0100000A\t0003\t0\t0\t100\t00000000\t0\t0\t0\n\
-eth0\t0000000A\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n"
+wlan0\t{any}\t{wifi_gw}\t0003\t0\t0\t600\t{any}\t0\t0\t0\n\
+eth0\t{any}\t{eth_gw}\t0003\t0\t0\t100\t{any}\t0\t0\t0\n\
+eth0\t{net}\t{any}\t0001\t0\t0\t100\t{mask}\t0\t0\t0\n"
         );
         assert_eq!(
             default_route(parse_routes(&table)),
             Some((Ipv4Addr::new(10, 0, 0, 1), "eth0".into()))
         );
-        let no_default =
-            format!("{header}eth0\t0000000A\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n");
+        let no_default = format!("{header}eth0\t{net}\t{any}\t0001\t0\t0\t100\t{mask}\t0\t0\t0\n");
         assert_eq!(default_route(parse_routes(&no_default)), None);
         assert_eq!(default_route(parse_routes(header)), None);
+    }
+
+    /// A default route with no gateway (`default dev ppp0`: a point-to-point
+    /// link, a VPN) is no default gateway, as on macOS and Windows: its
+    /// gateway column is 0.0.0.0, no address to show or to probe. With the
+    /// lowest metric it is the route the kernel uses, whatever gateway a
+    /// default route of a higher metric has.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_route_with_no_gateway() {
+        let header =
+            "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n";
+        let any = route_hex(Ipv4Addr::UNSPECIFIED);
+        let eth_gw = route_hex(Ipv4Addr::new(192, 168, 50, 1));
+        let on_link =
+            |metric: u32| format!("ppp0\t{any}\t{any}\t0001\t0\t0\t{metric}\t{any}\t0\t0\t0\n");
+        let through =
+            |metric: u32| format!("eth0\t{any}\t{eth_gw}\t0003\t0\t0\t{metric}\t{any}\t0\t0\t0\n");
+
+        let alone = format!("{header}{}", on_link(0));
+        assert_eq!(default_route(parse_routes(&alone)), None);
+        let preferred = format!("{header}{}{}", on_link(50), through(600));
+        assert_eq!(default_route(parse_routes(&preferred)), None);
+        let backup = format!("{header}{}{}", on_link(600), through(100));
+        assert_eq!(
+            default_route(parse_routes(&backup)),
+            Some((Ipv4Addr::new(192, 168, 50, 1), "eth0".into()))
+        );
     }
 
     /// macOS: a gateway when `route` gives one; "not in table" is no
@@ -309,6 +389,57 @@ eth0\t0000000A\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n"
             Ok(None)
         );
         assert_eq!(windows_gateway(false, ""), Err("route print failed".into()));
+    }
+
+    /// Windows: `route` and `ipconfig` are the system's, by their full path
+    /// in the system directory, never a program of that name found first
+    /// beside sping.exe.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_programs_come_from_the_system_directory() {
+        for name in ["route.exe", "ipconfig.exe"] {
+            let path = system_program(name).expect("the system directory");
+            assert!(path.is_absolute(), "{}", path.display());
+            assert!(path.is_file(), "{}", path.display());
+            let dir = path
+                .parent()
+                .and_then(|d| d.file_name())
+                .expect("a directory");
+            assert!(dir.eq_ignore_ascii_case("System32"), "{}", path.display());
+        }
+    }
+
+    /// Windows: a persistent route is not a route in use. Its line has the
+    /// metric where an active route's has the address of its interface.
+    #[test]
+    fn windows_persistent_routes_are_not_the_gateway() {
+        let persistent = "\
+===========================================================================
+Persistent Routes:
+  Network Address          Netmask  Gateway Address  Metric
+          0.0.0.0          0.0.0.0         10.0.0.1  Default
+          0.0.0.0          0.0.0.0      192.168.0.1       1
+===========================================================================
+";
+        let none = format!("Active Routes:\n  None\n{persistent}");
+        assert_eq!(windows_gateway(true, &none), Ok(None));
+        assert_eq!(
+            windows_gateway(false, &none),
+            Err("route print failed".into())
+        );
+
+        let active = "\
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+          0.0.0.0          0.0.0.0      192.168.1.1    192.168.1.100     25
+";
+        assert_eq!(
+            windows_gateway(true, &format!("{active}{persistent}")),
+            Ok(Some((
+                Ipv4Addr::new(192, 168, 1, 1),
+                "192.168.1.100".into()
+            )))
+        );
     }
 
     #[test]

@@ -21,10 +21,13 @@ by default (Debian from Debian 13 on, through its `linux-sysctl-defaults`
 package; not Debian 12). Only if that is denied does it fall back to a raw socket
 (`SOCK_RAW`), which requires `CAP_NET_RAW` or root.
 
-Two things always need `CAP_NET_RAW`:
+Two things need `CAP_NET_RAW`:
 
-- the raw-socket fallback itself, and
-- binding to an interface with `-I`/`--interface` (`SO_BINDTODEVICE`, Linux).
+- the raw-socket fallback itself, always, and
+- binding to an interface with `-I`/`--interface` (`SO_BINDTODEVICE`, Linux),
+  on kernels older than 5.7, and on any kernel when the socket is already
+  bound to a device, as under `ip vrf exec`: from Linux 5.7 on, a socket not
+  bound to a device yet may be bound without it.
 
 The traceroute of `--diagnose` opens its own ICMP socket the same way,
 datagram first and raw only if that is denied, and reads the routers' ICMP
@@ -39,7 +42,8 @@ sudo setcap cap_net_raw+ep /usr/bin/sping
 
 Packagers should **not** ship sping setuid-root or set the capability in a
 maintainer script by default — datagram ICMP is enough for the common case, and
-the user can opt in with `setcap` if they need the raw path or `-I`.
+the user can opt in with `setcap` if they need the raw path, or `-I` where
+it needs the capability.
 
 ### Windows
 
@@ -63,7 +67,7 @@ backends, the socket and clock calls on Linux/macOS (`recvmsg`, `setsockopt`,
 `iphlpapi` calls on Windows; in the TCP backend on Windows, the call that
 keeps the SYN from being retransmitted (`WSAIoctl`); in the network context,
 the Linux address list (`getifaddrs`), the Windows adapter list
-(`GetAdaptersAddresses`) and the interface index of an IPv6 zone
-(`if_nametoindex`). Each `unsafe` block carries a `// SAFETY:` justification. The build is checked with
+(`GetAdaptersAddresses`) and the index of an interface by its name, for an
+IPv6 zone and for `-I` (`if_nametoindex`). Each `unsafe` block carries a `// SAFETY:` justification. The build is checked with
 `cargo clippy --all-targets -- -D warnings` on Linux, macOS and Windows targets,
 and dependencies are scanned with `cargo audit` and `cargo deny`.

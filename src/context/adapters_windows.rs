@@ -505,7 +505,8 @@ mod tests {
     fn skips_what_it_cannot_read() {
         let name = wide("Ethernet");
         let loopback = sockaddr_in([127, 0, 0, 1]);
-        let short = vec![2u8, 0, 0, 0]; // AF_INET, but only 4 bytes
+        let mut short = vec![0u8; 4]; // AF_INET, but only 4 bytes
+        short[..2].copy_from_slice(&AF_INET.to_ne_bytes());
         let other_family = vec![0u8; 28]; // family 0
         let good = sockaddr_in6("::1");
 

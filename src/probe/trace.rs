@@ -9,10 +9,6 @@
 //! send and receive; `run` decides when to stop, so its rules are tested with
 //! a scripted prober.
 
-// One platform's prober builds only some of these variants and options
-// (Windows binds neither `-S` nor `-I`; macOS waits for E1).
-#![allow(dead_code)]
-
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::time::{Duration, Instant};
@@ -37,6 +33,7 @@ pub struct TraceOptions {
     /// Source address (`-S`), where the platform binds one.
     pub source: Option<IpAddr>,
     /// Interface (`-I`), where the platform binds one.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub interface: Option<String>,
 }
 
@@ -94,6 +91,7 @@ pub enum TraceStatus {
 /// Why a trace cannot run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 pub enum Unavailable {
     /// It needs privileges this process lacks.
     Permission,
@@ -125,6 +123,7 @@ pub enum HopProbe {
     /// Sent; no answer within its timeout.
     Silent,
     /// Sending failed locally: the probe did not leave.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     NotSent(String),
     /// The call failed without telling whether the probe left.
     Failed(String),
@@ -158,7 +157,9 @@ pub enum UnreachableKind {
 /// An answer the trace does not classify further.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OtherReply {
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     Icmp { icmp_type: u8, code: u8 },
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     WindowsStatus(u32),
 }
 
@@ -197,6 +198,7 @@ pub trait HopProber {
 /// Why a prober could not be opened.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OpenError {
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     Unavailable(Unavailable),
     Local(String),
 }

@@ -12,6 +12,7 @@ use crate::diagnostics::health::Reachability;
 use crate::probe::quality::{QualityGrade, Trend};
 use crate::probe::trace::UnreachableKind;
 use crate::probe::types::{ProbeSnapshot, PulseEntry, Unreachable};
+use crate::render::format::Placement;
 use crate::render::{view_classic, view_compact, view_extended, view_table};
 
 fn ms(v: f64) -> Duration {
@@ -120,20 +121,43 @@ pub(crate) fn classic(snap: &ProbeSnapshot) -> String {
 
 pub(crate) fn compact(snap: &ProbeSnapshot) -> String {
     let mut out = Vec::new();
-    view_compact::draw_inline(&mut out, snap, None, None, None, 0, 0).unwrap();
+    view_compact::draw_inline(&mut out, snap, None, None, None, 0, Placement::default()).unwrap();
     visible(&out)
 }
 
 pub(crate) fn extended(snap: &ProbeSnapshot) -> String {
     let mut out = Vec::new();
-    view_extended::draw_inline(&mut out, snap, None, None, None, 0, 0).unwrap();
+    view_extended::draw_inline(&mut out, snap, None, None, None, 0, Placement::default()).unwrap();
     visible(&out)
 }
 
 pub(crate) fn table(snap: &ProbeSnapshot) -> String {
     let mut out = Vec::new();
-    view_table::draw_table(&mut out, &[Some(snap.clone())], 0, 0).unwrap();
+    view_table::draw_table(&mut out, &[Some(snap.clone())], 0, Placement::default()).unwrap();
     visible(&out)
+}
+
+/// A view draws at the width it is handed, never at the width of the terminal
+/// the tests happen to run in: `cargo test` leaves stdout on it, and every
+/// frame above would be cut to it.
+#[test]
+fn a_view_draws_at_the_width_it_is_handed() {
+    let narrow = Placement {
+        width: Some(40),
+        ..Placement::default()
+    };
+    let snap = replying();
+    let mut frames = [Vec::new(), Vec::new(), Vec::new()];
+    view_compact::draw_inline(&mut frames[0], &snap, None, None, None, 0, narrow).unwrap();
+    view_extended::draw_inline(&mut frames[1], &snap, None, None, None, 0, narrow).unwrap();
+    view_table::draw_table(&mut frames[2], &[Some(snap.clone())], 0, narrow).unwrap();
+    for frame in &frames {
+        let frame = visible(frame);
+        assert!(frame.lines().count() >= 5, "{frame}");
+        for line in frame.lines() {
+            assert!(line.chars().count() < 40, "{line}");
+        }
+    }
 }
 
 #[test]
@@ -320,6 +344,45 @@ fn initial_ttl_gives_a_hint() {
     );
     s.ttl = Some(128);
     assert!(line(&extended(&s), "Status").ends_with("· ttl 128 (Windows)"));
+}
+
+/// A target that answered and has stopped answering is not `Reachable`: the
+/// word follows the health tracker's `Offline` (from three losses in a row
+/// until two replies in a row), as the "target unreachable" of Events does.
+/// Before and after it, the words do not change.
+#[test]
+fn the_status_word_follows_an_outage() {
+    let mut s = lost();
+    s.sent = 13;
+    s.lost = 4;
+    s.seq = 13;
+    s.loss_pct = 30.8;
+    s.reachability = Reachability::Offline;
+    s.outage_duration = Some(Duration::from_secs(3));
+    let status = "Status     Unreachable · loss 31% · sent 13 · recv 9 · outage 00:03";
+    assert_eq!(line(&compact(&s), "Status"), status);
+    assert_eq!(line(&extended(&s), "Status"), status);
+
+    // One loss, or two: not an outage yet.
+    s.reachability = Reachability::Online;
+    assert!(line(&compact(&s), "Status").starts_with("Status     Reachable · "));
+    assert!(line(&extended(&s), "Status").starts_with("Status     Reachable · "));
+    s.reachability = Reachability::Unknown;
+    assert!(line(&compact(&s), "Status").starts_with("Status     Reachable · "));
+    assert!(line(&extended(&s), "Status").starts_with("Status     Reachable · "));
+
+    // The first reply after the outage: `Offline` until the second one, so
+    // that replies and losses in turn do not change the word at every probe.
+    s.reachability = Reachability::Offline;
+    s.outage_duration = None;
+    assert!(line(&compact(&s), "Status").starts_with("Status     Unreachable · "));
+    assert!(line(&extended(&s), "Status").starts_with("Status     Unreachable · "));
+
+    // It never answered: the word it always had.
+    s.received = 0;
+    s.outage_duration = Some(Duration::from_secs(3));
+    assert!(line(&compact(&s), "Status").starts_with("Status     No replies · "));
+    assert!(line(&extended(&s), "Status").starts_with("Status     No replies · "));
 }
 
 /// A loopback target is `loopback` on screen, its source on the loopback

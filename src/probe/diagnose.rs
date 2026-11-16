@@ -103,9 +103,12 @@ impl Extra {
         }
     }
 
-    /// The longest a whole diagnosis takes: the lookup's timeout, level 2
-    /// (three echoes one after another, the connects alongside) and the
-    /// trace's budget.
+    /// The longest a whole diagnosis takes when nothing holds it back: the
+    /// lookup's timeout, level 2 (three echoes one after another, the
+    /// connects alongside) and the trace's budget. The planner's traffic
+    /// bounds are not in it: while the probes of an earlier diagnosis still
+    /// count (`planner::WINDOW`), the trace waits for them, and the `-c N`
+    /// wait may end first (`incomplete`).
     pub fn budget(&self) -> Duration {
         dns::DNS_TIMEOUT + 3 * self.timeout + self.trace_options().budget
     }

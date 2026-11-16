@@ -1,5 +1,218 @@
 # Changelog
 
+## v1.9.0
+
+### Fixed
+- Resizing the terminal while a live view runs (compact, extended, the
+  table) no longer leaves copies of the frame's first rows above it, as
+  1.7.1 and 1.8.0 did in terminals that reflow what they show on resize
+  (seen on macOS, in Windows Terminal, conhost and tmux). After a change of
+  width the frame is drawn again at the top of a cleared screen, and what
+  was on the screen above the view leaves the screen with it.
+- A live view with more lines than the terminal has rows no longer scrolls
+  the screen on every redraw, filling the scrollback with copies of itself
+  (the table with 20 targets in 24 rows; compact in 8 rows or fewer). The
+  frame is cut to the rows there are, and the table shows the targets that
+  fit and says how many it does not: `… 14 more (terminal too short)`
+  (from six rows up: under that not even its heading fits, and the count
+  is cut with it). Every target still gets its summary at the end.
+- The extended view no longer shows its `Path` row twice during a long
+  outage: when the `RTT dist` line goes (fewer than three replies among the
+  last 40 probes) the frame gets one line shorter, and the last row of the
+  longer frame stayed on the screen below it. The live views (compact,
+  extended, the table) now erase what is below the frame they draw, where
+  the terminal takes escape sequences (the legacy Windows console is left
+  as it was).
+- A live view (compact, extended, the table) no longer stops with a panic
+  on its first frame when a name it shows has an ESC followed by a
+  non-ASCII character, as the name of a Linux interface may (`ESC` `é`):
+  measuring the line cut that character in two.
+- The compact and extended views no longer say `Status     Reachable` all
+  through an outage of a target that had answered: from the third loss in
+  a row the word is `Unreachable`, until two replies in a row, as Events
+  already said (`target unreachable`). A target that never answered keeps
+  `No replies`.
+- `sping host 2>file` on a terminal no longer leaves the escape sequences
+  of the bold target in the file: the `Init:` line goes to stderr, and its
+  bold is now decided by stderr being a terminal, not stdout. With stdout
+  redirected and stderr on the terminal (`sping host --view json >file`)
+  the target is bold, as with both on the terminal.
+- Linux: `-I` takes every interface the system has. `sping 127.0.0.1 -I lo`
+  ended with `interface 'lo' not found`, as did an interface with only a
+  /32 address, only IPv6 addresses or no address: the name was looked up
+  among the interfaces of the IPv4 routes. The kernel is now asked for it
+  (`if_nametoindex`).
+- Linux: the interface and the prefix of the context (`Init:`, the views,
+  JSON `net_ctx`) are those of the interface that holds the source address.
+  They came from the first IPv4 route that covered it: with `10.0.0.0/8`
+  through a gateway on one interface and `10.1.2.5/24` on another, sping
+  said `if` the first one and `10.1.2.5/8`; an address with a /32, or one
+  with a peer (a point-to-point link), has no route of its own and showed
+  the interface and the prefix of whatever route covered it, the default
+  route's with `/0`, or `if unknown`. The routes are still asked for an
+  address that no interface, or more than one, is known to hold.
+- Linux: a default route with no gateway (`default dev ppp0`: a
+  point-to-point link, a VPN) is no gateway, as on macOS and Windows. sping
+  showed `gw 0.0.0.0` (`Init:`, the views, `--ip`, JSON `net_ctx.gateway`)
+  and sent its gateway probe to 0.0.0.0, which is this host: it answered
+  whatever the link did, or never, and the diagnosis of an outage blamed or
+  cleared a gateway that does not exist. Now `gw —` and `no IPv4 default
+  gateway`, also when a default route of a higher metric has a gateway:
+  the kernel uses the one with the lowest. The gateway of the start is
+  still probed after it goes.
+- A default gateway this host gets while sping runs is probed from then on:
+  the `gw` indicator, JSON `gateway` and the diagnosis of an outage have
+  it. sping decided its gateway probe when it started, so a run that began
+  with no default route (or, on Linux, with one that has no gateway) showed
+  the gateway that came later (`gw 192.168.1.1`, `context changed`) and
+  never probed it.
+- An outage is no longer blamed on the network beyond a gateway this host
+  no longer has. When the default route goes while sping runs, the gateway
+  probe keeps the last gateway; its address still answers on the local
+  network, and those replies counted as "gateway up": `upstream outage
+  likely · local gateway OK` (JSON `upstream_outage`) while the way out was
+  missing on this host. Now a gateway that answers counts only while it is
+  the one the context has (`net_ctx.gateway`): otherwise the outage is `WAN
+  unreachable · gateway state unknown` (`wan_unreachable`, no cause
+  claimed) and `WAN degraded` is not said. The context is re-detected every
+  15 s: a gateway that has gone counts until a re-detection sees it gone,
+  and one that comes back, or changes, counts again once the context and
+  the probe both have it. A gateway that is down is `gateway unreachable`,
+  as before.
+- Several targets with `-c N` (`sping a b -c 1 > file`) no longer stay,
+  once in a great while, without ending and with nothing written until a
+  signal: when every target had sent its probes before the table or the
+  summaries started (answers at once, a busy machine), the notice to end
+  was lost.
+- With several targets or `--batch`, a name that does not resolve is a
+  target with no replies, and the exit code is `1`. It was skipped with a
+  warning and the exit code told only of the others: `sping 127.0.0.1
+  nope.invalid -c 1` ended with `0`. The warning stays, the batch output
+  still has no line for that name, and no name resolving at all is still
+  an error (`2`).
+- `sping --list-interfaces | head -1` no longer ends with a panic (`failed
+  printing to stdout: Broken pipe`, exit code 101) when the reader goes
+  before the list is written: it ends quietly with `0`, as `--ip` and the
+  views do. A stdout that cannot be written for another reason (a full
+  disk) is an error, `2`, and was the same panic.
+- `--view json` and `--view classic` on a stdout that cannot be written (a
+  full disk under `sping host --view json > file`) end with exit code `2`.
+  sping said `error: cannot write to stdout` and ended with the exit code
+  of the replies, `0` if there had been one; classic with `-q`, which
+  writes only the summary, said nothing at all. A reader that goes away
+  (`sping host | head -1`) is still not an error.
+- A task of sping that stops in a panic, the renderer or the probe of one
+  batch target, ends sping with an error: exit code `2` and a line that
+  says which. The exit code was that of the replies, and a batch left that
+  target out of its output without a word.
+- Several targets with stdout not a terminal (`sping a b > file`), where
+  only each target's summary is written: a stdout that cannot be written is
+  an error, exit code `2`, as in the classic and JSON views. Nothing was
+  said, and the exit code was that of the replies.
+- `-W` takes from a millisecond up (`-W 0.001`); a smaller one is refused,
+  exit code `2`. Below a microsecond (`-W 0.0000005`) every probe was a
+  `Request timeout` on Linux, whatever answered.
+- `--batch FILE` with a target on the command line, or with
+  `--view extended`, `classic` or `table`, is refused, exit code `2`: the
+  target and the view were ignored, without a word. Batch prints each
+  target's summary, or JSON with `--view json`.
+- A `--batch` file with control characters in a target (an escape
+  sequence, a tab between two words) is refused, exit code `2`, with the
+  number of the line: the line was written to the terminal as it was
+  (`Resolving …`, `warning: skipping …`), escape sequences and all, and
+  the other targets were probed.
+- A `--batch` file that starts with a UTF-8 byte order mark is read as the
+  same file without it. The mark stayed in front of the first line: a
+  `# comment` there was taken for a target (a name that does not resolve,
+  so exit code `1` although every host answered), and so was a host, under
+  a name that does not resolve.
+- An IPv4-mapped IPv6 target (`sping ::ffff:192.0.2.1`) is probed as the
+  IPv4 address it stands for, the one `target_ip` gives in JSON: as
+  IPv6, every ICMP probe failed with `send failed: Invalid argument` and
+  the context said `if unknown · public`. `-4` takes such a target and
+  `-6` refuses it. `-S` with such an address is that IPv4 source, and
+  such a server of `--ip --external` is asked, and answers, as IPv4.
+- `--wan-probe` with an IPv4-mapped IPv6 address
+  (`--wan-probe ::ffff:192.0.2.1`) is the IPv4 address it stands for. As
+  IPv6 the WAN reference was reported `offline` although the address
+  answered.
+- `--wan-probe` with an IPv6 address (`--wan-probe 2606:4700:4700::1111`)
+  is probed with ICMPv6. Its echoes were given to the IPv4 socket, which
+  cannot send them: the WAN reference never answered and was reported
+  `offline` although the address answered, and with a gateway that
+  answered the diagnosis said `wan_degraded`, or `upstream_outage` when
+  the target was lost. A reference that needs a zone still cannot be
+  given (`--wan-probe fe80::1%eth0` is refused, as before).
+- The average RTT is divided by the whole count of replies. Past 2^32 of
+  them (6.8 years at the shortest interval) the count was cut to 32 bits:
+  a wrong average and, at 2^32 itself, a panic.
+- A live view (compact, extended, the table) that was stopped for a while
+  (`kill -STOP`, a frozen container) no longer draws, when it goes on, a
+  frame for every one it missed, back to back: a hundred of them after ten
+  seconds. It draws the one that was due and goes on at its ten a second.
+- macOS: a source address on a point-to-point interface (a VPN's `utun`)
+  has its prefix in the context, and an IPv6 one its interface. On those
+  lines `ifconfig` writes the peer before the netmask (`inet 10.8.0.6 -->
+  10.8.0.5 netmask 0xffffff00`), and they were read by position: the IPv4
+  address came out with no prefix (`10.8.0.6/0` in `--list-interfaces`)
+  and the IPv6 one was not found (`if unknown`).
+- Windows: a persistent default route (`route print`'s `Persistent
+  Routes`) is not taken for the gateway when no default route is active:
+  sping showed its gateway (`Init:`, the views, `--ip`, JSON
+  `net_ctx.gateway`) and sent it the gateway probe with no route through
+  it in use.
+- Windows: `route` and `ipconfig` are run from the system directory
+  (`C:\Windows\System32`). Run by name, a `route.exe` saved in the folder
+  of sping.exe (a downloads folder) was run instead, and gave sping its
+  gateway.
+- macOS: `-I` takes every interface the system has, as on Linux, and
+  Windows every adapter that has an address: the loopback one (`sping
+  127.0.0.1 -I lo0`; on Windows the adapter `Init:` names for 127.0.0.1)
+  and one with only IPv6 addresses ended with `interface '…' not found`,
+  since the name was looked up among the IPv4 interfaces. macOS asks the
+  kernel for it (`if_nametoindex`), Windows its adapters. There `-I` binds
+  nothing, as before: a warning says so.
+- Windows: an echo the system could not send for a reason of its own (an
+  `IP_STATUS` such as 11050, `IP_GENERAL_FAILURE`, when the firewall
+  blocks it) is shown as `ICMP call failed: IP status 11050`. It read `OS
+  Error 11050 (FormatMessageW() returned error 317)`, since Windows has no
+  message for those codes. It was and is counted as a loss.
+- An ICMP probe that cannot be prepared, such as `-S` with an address
+  that is not this host's, is a local error before probing: exit 2 with
+  the reason (`cannot prepare the ICMP probe of …`), as with `--tcp`,
+  instead of exit 1 with the hint about ICMP permissions. With several
+  targets or `--batch`, one that cannot be prepared (`-S` of the other
+  address family) stops them all before probing, as with `--tcp`; it used
+  to be left unprobed while the others ran, and the run exited 1. The
+  warnings that `-I` cannot be bound and that `-S` is ignored (Windows)
+  are printed once.
+- sping builds on 32-bit Linux with a 64-bit `time_t` (glibc, as Debian's
+  armhf), where 1.8.0 did not compile.
+
+### Packaging
+- `tokio` 1.54.1 (RUSTSEC-2026-0386, about `AsyncFd`, which sping does not
+  use).
+- The tests of the `/proc/net/route` parser pass on big-endian Linux
+  (Debian's s390x): they wrote its addresses in little-endian order; the
+  parser was right.
+- The tests pass with stdout on a terminal of any width: run from a
+  terminal narrower than about 100 columns, `cargo test` failed the tests
+  that pin the live views' output (21 at 80 columns), which were cut to the
+  width of that terminal. Piped, as in CI and on the build daemons, they
+  always passed.
+- The tests no longer fail, rarely and on Linux only, with
+  `Address already in use`: two of them listened on 127.0.0.2 on a port
+  they had found free on 127.0.0.1 only, and a connection another test had
+  just closed could still hold it there (TIME_WAIT). They take a port free
+  on both.
+- Homebrew: sping is in homebrew-core since 1.8.0, and the README installs
+  it with `brew install sping` (macOS and Linux) instead of the tap. From a
+  pull request by Chris Finazzo
+  ([#3](https://github.com/LambdaBytes/sping/pull/3)).
+- `thiserror` is no longer a dependency: nothing used it. One build
+  dependency fewer for packagers (`librust-thiserror-2-dev` in Debian's
+  `Build-Depends`).
+
 ## v1.8.0
 
 ### Added

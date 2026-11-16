@@ -24,6 +24,9 @@ mod imp {
     /// IP_REQ_TIMED_OUT — a plain timeout; any other non-zero status
     /// (unreachable, TTL expired, ...) is a distinct error condition.
     const IP_REQ_TIMED_OUT: u32 = 11010;
+    /// The `IP_STATUS` values of `ipexport.h`: `IP_STATUS_BASE` (11000) + 1
+    /// up to `MAX_IP_STATUS`, `IP_GENERAL_FAILURE` (11050).
+    const IP_STATUSES: std::ops::RangeInclusive<i32> = 11001..=11050;
 
     /// `IO_STATUS_BLOCK` (a pointer-sized status union plus a `ULONG_PTR`):
     /// `Icmp6SendEcho2` needs room for one after the reply in its buffer.
@@ -179,9 +182,13 @@ mod imp {
         }
 
         /// Source binding is unavailable through `IcmpSendEcho`; warns on
-        /// stderr instead of silently ignoring `-S`.
+        /// stderr, once per process (each target's backend is built twice:
+        /// precheck and scheduler), instead of silently ignoring `-S`.
         pub fn bind_source(&self, _addr: IpAddr, _scope_id: u32) -> io::Result<()> {
-            eprintln!("warning: -S/--source is ignored on Windows (OS picks the route)");
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!("warning: -S/--source is ignored on Windows (OS picks the route)");
+            });
             Ok(())
         }
 
@@ -213,7 +220,7 @@ mod imp {
             } else {
                 ProbeResult::Error {
                     seq: seq as u64,
-                    message: format!("ICMP call failed: {err}"),
+                    message: call_failed(&err),
                 }
             }
         }
@@ -502,7 +509,7 @@ mod imp {
                     Err(err) if err.raw_os_error() == Some(IP_REQ_TIMED_OUT as i32) => {
                         HopProbe::Silent
                     }
-                    Err(err) => HopProbe::Failed(format!("ICMP call failed: {err}")),
+                    Err(err) => HopProbe::Failed(call_failed(&err)),
                 };
                 // A wait the budget cut short says nothing about the path.
                 if wait < probe_timeout && outcome == HopProbe::Silent {
@@ -553,6 +560,51 @@ mod imp {
             unsafe {
                 IcmpCloseHandle(self.handle);
             }
+        }
+    }
+
+    /// The text of an `IcmpSendEcho`/`Icmp6SendEcho2` call that failed. Its
+    /// GetLastError may be an `IP_STATUS` (an echo the firewall blocks leaves
+    /// `IP_GENERAL_FAILURE`, 11050), for which the system's message table
+    /// has no text: std's says only that `FormatMessageW` failed, so the
+    /// status is named by its number, as a reply's is (`echo_result`).
+    fn call_failed(err: &io::Error) -> String {
+        match err.raw_os_error() {
+            Some(code) if IP_STATUSES.contains(&code) => {
+                format!("ICMP call failed: IP status {code}")
+            }
+            _ => format!("ICMP call failed: {err}"),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A failed call whose GetLastError is an `IP_STATUS` names it by its
+        /// number: 11050 read `OS Error 11050 (FormatMessageW() returned error
+        /// 317)` (v1.9.0-rc1, an echo blocked by the Windows Firewall).
+        /// IP_REQ_TIMED_OUT stays a timeout; other errors keep the system's
+        /// text.
+        #[test]
+        fn a_failed_call_names_its_ip_status() {
+            let summary =
+                |code| match WindowsIcmpBackend::api_failure(io::Error::from_raw_os_error(code), 7)
+                {
+                    ProbeResult::Timeout { seq } => format!("timeout {seq}"),
+                    ProbeResult::Error { seq, message } => format!("error {seq} {message}"),
+                    other => format!("{other:?}"),
+                };
+            assert_eq!(summary(11050), "error 7 ICMP call failed: IP status 11050");
+            assert_eq!(summary(11001), "error 7 ICMP call failed: IP status 11001");
+            assert_eq!(summary(11010), "timeout 7");
+            let other = summary(1231);
+            assert!(
+                other.starts_with("error 7 ICMP call failed: ")
+                    && other.ends_with("(os error 1231)"),
+                "{other}"
+            );
+            assert!(!other.contains("IP status"), "{other}");
         }
     }
 }

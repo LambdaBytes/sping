@@ -16,7 +16,7 @@
 
 A modern ping for humans. Terminal-native, real-time connectivity monitor that doesn't just measure packets — **it interprets network context**.
 
-![sping 1.8.0: the live view, several targets at once, --diagnose on a host that stops answering ping, a destination unreachable told apart from a timeout, and --ip --external](docs/sping-1.8.0.gif)
+![sping 1.9.0: the live view, a device on the LAN that stops answering while the internet still works, exit codes for scripts, the table cut to a short terminal, and the install commands](docs/sping-1.9.0.gif)
 
 **Status:** functional and in active use, with a frozen JSON contract.
 Linux, macOS and Windows; x86_64, aarch64 and armv7 (Raspberry Pi).
@@ -36,26 +36,48 @@ Context    if eth0 · 192.168.1.100/24 · gw ● · wan ● · public
 Quality    A (100) · excellent
 ```
 
-## What's new in 1.8.0
+## What's new in 1.9.0
 
-- **Unreachable is not a timeout**: when a router or this host answers the
-  probe with a destination unreachable, sping says who sent it and what it
-  said: `From 192.0.2.1: seq=3 Destination Host Unreachable` in the classic
-  view, `192.0.2.1 reports host unreachable` in Events, `icmp_unreachable`
-  in JSON. On Linux, macOS (IPv4) and Windows.
-- **`sping --ip`**: this host's addresses, every interface, IPv4 and IPv6,
-  with their prefix, kind and IPv6 state, the source each family uses and
-  the default gateway. It sends nothing; with `--external` it also asks a
-  STUN server which address it sees. See
-  [Host addresses](#host-addresses---ip).
-- **`--diagnose` in a long outage**: while the target stays down, the same
-  checks run again 5 minutes after each diagnosis concludes.
-- **`--icmp`**: the ICMP probe, named. It changes nothing today; it keeps
-  that probe for scripts when 2.0 changes what `sping target` does (see
-  [Roadmap](#roadmap)).
-- **Fixes** in `--diagnose`: on Windows, an unreachable answer for the other
-  family's address now means that family fails too, as on Linux; on Linux, a
-  redirect during the traceroute no longer ends its round with `recv failed`.
+A release of fixes, and two new ways to install it, both since 1.8.0:
+
+- **Debian and Homebrew**: Debian testing and unstable have sping
+  (`sudo apt install sping`, packaged by Debian's Rust team), and
+  homebrew-core has it with bottles for macOS on Apple silicon and Linux
+  (`brew install sping`, the README's way from now on instead of the tap;
+  thanks to Chris Finazzo, [#3](https://github.com/LambdaBytes/sping/pull/3)).
+- **Live views and the terminal**: resizing the terminal no longer leaves
+  copies of the frame's first rows above it; a view taller than the terminal
+  is cut to its rows instead of scrolling it, and the table says how many
+  targets do not fit (`… 14 more (terminal too short)`); the extended view
+  no longer shows its `Path` row twice in a long outage.
+- **`Status` follows the outage**: when a target that had answered stops,
+  the compact and extended views say `Unreachable` from the third loss in a
+  row, as Events already did, instead of `Reachable` all through it.
+- **Linux**: `-I` takes every interface the system has (`-I lo`, one with
+  only IPv6 addresses); the interface and the prefix of the context are
+  those of the interface that holds the source address; a default route with
+  no gateway (a point-to-point link, a VPN) is `gw —`, not `gw 0.0.0.0`.
+- **The gateway in the diagnosis**: a default gateway this host gets while
+  sping runs is probed from then on, and an outage is no longer blamed on
+  the network beyond a gateway this host no longer has.
+- **Exit codes**: with several targets or `--batch`, a name that does not
+  resolve makes the exit code `1` (no name resolving at all is still an
+  error, `2`); an ICMP probe that cannot be prepared (`-S` with an address
+  that is not this host's), a stdout that cannot be written (a full disk)
+  and a task of sping that stops in a panic are errors, `2`.
+- **`--batch`**: a target on the command line, a view batch does not have
+  and a file with control characters in a target are refused; a UTF-8 byte
+  order mark at the start of the file is skipped.
+- **IPv6**: `--wan-probe` with an IPv6 address is probed with ICMPv6, and an
+  IPv4-mapped address (`::ffff:192.0.2.1`) as the target, `-S` or
+  `--wan-probe` is the IPv4 address it stands for.
+- **macOS and Windows**: on macOS, a source address on a point-to-point
+  interface (a VPN's `utun`) has its prefix and its interface in the
+  context; on Windows, a persistent default route is not taken for the
+  gateway when no default route is active.
+- **Debian's architectures**: sping builds on 32-bit Linux with a 64-bit
+  `time_t` (armhf), where 1.8.0 did not compile, and its tests pass on
+  big-endian Linux (s390x).
 
 Every change, version by version: [CHANGELOG.md](CHANGELOG.md).
 
@@ -81,21 +103,26 @@ prints only each target's summary at the end (`-c N` stops it). Batch mode
 
 | Method | Command | Platforms | Man page and completions |
 |--------|---------|-----------|--------------------------|
-| Homebrew | `brew install LambdaBytes/tap/sping` | macOS | yes |
+| Homebrew | `brew install sping` | macOS, Linux | yes |
 | Scoop | `scoop install lambdabytes/sping`, once the bucket is added (see below) | Windows x86_64 | no |
 | crates.io | `cargo install sping` | Linux, macOS, Windows, with Rust 1.88+ | no |
 | Pre-built binary | from the [Releases page](https://github.com/LambdaBytes/sping/releases) | Linux, macOS, Windows | no |
+| Debian archive | `sudo apt install sping` | Debian testing (forky) and unstable | yes |
 | Debian / Ubuntu package | `.deb` from the [Releases page](https://github.com/LambdaBytes/sping/releases) | Debian 12, Ubuntu 22.04, Raspberry Pi OS (Bookworm) or later | yes |
 | From source | `cargo build --release` | Linux, macOS, Windows, with Rust 1.88+ | no |
 
 ### Homebrew
 
-From v1.6.0 on. Builds from source and installs the binary, the man page and
-the shell completions:
+Homebrew has sping since 1.8.0, in homebrew-core, with bottles (pre-built)
+for macOS on Apple silicon and for Linux. It installs the binary, the man
+page and the shell completions:
 
 ```bash
-brew install LambdaBytes/tap/sping
+brew install sping
 ```
+
+Homebrew's version can be behind the latest release; its versions and bottles
+are on [formulae.brew.sh](https://formulae.brew.sh/formula/sping).
 
 ### Scoop
 
@@ -146,10 +173,24 @@ commit and the workflow run that produced it:
 gh attestation verify sping-vX.Y.Z-linux-x86_64 --repo LambdaBytes/sping
 ```
 
+### Debian (apt)
+
+Debian testing (forky) and unstable have sping since 1.8.0, packaged by
+Debian's Rust team (source package `rust-sping`). It installs the binary, the
+man page and the shell completions:
+
+```bash
+sudo apt install sping
+```
+
+Debian's version can be behind the latest release; its versions and
+architectures are on [tracker.debian.org](https://tracker.debian.org/pkg/rust-sping).
+Debian 12 and 13 do not have it: use the `.deb` below.
+
 ### Debian / Ubuntu (.deb)
 
 ```bash
-sudo dpkg -i sping_1.8.0-1_amd64.deb     # or _arm64.deb on aarch64
+sudo dpkg -i sping_1.9.0-1_amd64.deb     # or _arm64.deb on aarch64
 ```
 
 The package installs:
@@ -241,6 +282,9 @@ sping --debug 8.8.8.8
 ```
 
 Exit codes are ping-compatible: `0` replies received, `1` no replies, `2` error.
+With several targets or `--batch`, `0` needs replies from every target: one
+that does not answer, or a name that does not resolve, makes it `1` (no name
+resolving at all is an error, `2`).
 
 ### Batch mode
 
@@ -278,6 +322,9 @@ Output (summary):
 ```
 
 All targets are probed in parallel. Full diagnostics (quality, trend, spikes) included.
+The targets are the file's: one on the command line next to `--batch` is
+refused, as is a view batch does not have (`extended`, `classic`, `table`).
+A target with control characters is an error, with the number of its line.
 
 ### Views
 
@@ -434,8 +481,10 @@ If DGRAM ICMP is restricted, widen the allowed group range:
 sudo sysctl -w net.ipv4.ping_group_range='0 2147483647'
 ```
 
-Two features require `CAP_NET_RAW` (the RAW fallback and interface binding with
-`-I`/`--interface`). Grant it to the binary without running as root:
+The RAW fallback requires `CAP_NET_RAW`, and so does interface binding with
+`-I`/`--interface` on kernels older than Linux 5.7, or when the socket is
+already bound to a device, as under `ip vrf exec`. Grant it to the binary
+without running as root:
 
 ```bash
 sudo setcap cap_net_raw+ep /usr/bin/sping
@@ -466,7 +515,8 @@ sudo setcap cap_net_raw+ep /usr/bin/sping
   default gateway and target class (same LAN, routed internal, public,
   default gateway, link-local, loopback)
 - **GW/WAN auxiliary probes** with hysteresis (3 fails → offline, 2 ok →
-  online); the WAN reference is `1.1.1.1` or `--wan-probe IP`
+  online); the WAN reference is `1.1.1.1` or `--wan-probe IP` (IPv4 or
+  IPv6, without a zone)
 - **Diagnostic correlation**: "target unreachable · internet still OK",
   "gateway unreachable · local network issue likely"; in JSON as stable codes
   with their evidence
@@ -521,10 +571,10 @@ sudo setcap cap_net_raw+ep /usr/bin/sping
 | IPv6 | ICMPv6 DGRAM | ICMPv6 DGRAM | Icmp6SendEcho2 |
 | TTL / hop limit | recvmsg | IP header (IPv4), recvmsg (IPv6) | API (IPv4 only) |
 | Gateway detection | /proc/net/route | `/sbin/route` | `route print` |
-| Interface detection | /proc/net/route, if_inet6 | `/sbin/ifconfig` | GetAdaptersAddresses |
+| Interface detection | getifaddrs, if_inet6, /proc/net/route | `/sbin/ifconfig` | GetAdaptersAddresses |
 | Host addresses (`--ip`) | getifaddrs, if_inet6 | `/sbin/ifconfig` | GetAdaptersAddresses |
 | Destination unreachable | ICMP errors (`IP_RECVERR`) | DGRAM socket, IPv4 only | reply status |
-| `-I` interface | SO_BINDTODEVICE | accepted, no effect | warning, unbound |
+| `-I` interface | SO_BINDTODEVICE | warning, unbound | warning, unbound |
 | `-S` source | bind() | bind() | OS routes (TCP: bind()) |
 | TCP connect | socket2 | socket2 | socket2 (Winsock) |
 | Traceroute (`--diagnose`) | ICMP errors (`IP_RECVERR`) | DGRAM socket, IPv4 only | IcmpSendEcho with TTL |
@@ -556,16 +606,18 @@ x86_64/aarch64 (glibc, and static with musl), macOS arm64 and Windows x86_64.
 
 ## Known limitations
 
-- `-I`/`--interface` binds only on Linux: macOS accepts the flag but it has
-  no effect, Windows prints a warning and probes unbound. `-S`/`--source` is
-  ignored by ICMP on Windows, where the OS picks the route; `--tcp` binds it.
+- `-I`/`--interface` binds only on Linux: macOS and Windows print a warning
+  and probe unbound. They take any interface the system has (macOS) or any
+  adapter with an address (Windows), the loopback included. `-S`/`--source`
+  is ignored by ICMP on Windows, where the OS picks the route; `--tcp` binds
+  it.
 - Each probe waits for its answer, up to `-W`, before the next one goes out,
   as Windows `ping` does (Linux and macOS `ping` keep sending every `-i`):
   with `-W` longer than `-i`, a target that does not answer is probed every
   `-W` (2 s by default), and `-c N` can take up to N × `-W`.
-- The raw-socket fallback and `-I` need `CAP_NET_RAW` (see
-  [SECURITY.md](SECURITY.md)); the unprivileged DGRAM path covers the common
-  case.
+- The raw-socket fallback needs `CAP_NET_RAW`, and so does `-I` on kernels
+  older than Linux 5.7 or under `ip vrf exec` (see [SECURITY.md](SECURITY.md));
+  the unprivileged DGRAM path covers the common case.
 - Names go through the system resolver (5 s timeout) and are resolved again
   every 60 s while monitoring; sping does no reverse DNS and keeps no DNS
   cache of its own.
@@ -595,18 +647,20 @@ x86_64/aarch64 (glibc, and static with musl), macOS arm64 and Windows x86_64.
   1.8) keeps today's probe, for scripts that rely on it; `-4`, `-6` and
   `--tcp` stay as they are.
 - Distribution packaging, in progress: the AUR and Fedora/COPR (recipes
-  under [`packaging/`](packaging/)), and Debian, through its Rust team.
-- WinGet (`LambdaBytes.Sping`) and nixpkgs: the packages are under review.
+  under [`packaging/`](packaging/)). Debian has it (`rust-sping`, through
+  its Rust team) in unstable since 2026-10-26 and in testing since
+  2026-10-31: `sudo apt install sping`.
+- WinGet (`LambdaBytes.Sping`): the package is under review.
 
 ## Performance
 
 | Metric | Value |
 |--------|-------|
-| Binary | 1.9 MiB (stripped + LTO) |
-| RAM | ~4 MB resident |
+| Binary | 1.7–2.2 MiB (stripped + LTO; 2.0 MiB on Linux x86_64) |
+| RAM | ~3.5 MiB resident on macOS, ~5 MiB on Linux and Windows (private); under 6 MiB with 20 targets |
 | CPU | < 1% at two probes per second |
-| Code | ~23,400 lines Rust |
-| Tests | 375 (330 unit + 45 E2E) |
+| Code | ~25,100 lines Rust |
+| Tests | 423 (367 unit + 56 E2E) |
 
 ## Around the web
 
@@ -615,7 +669,14 @@ Where sping has been reviewed, listed or written about:
 - [LinuxLinks — sping: ping utility with advanced network diagnostics](https://www.linuxlinks.com/sping-ping-utility-advanced-network-diagnostics/)
 - [Terminal Trove — sping](https://terminaltrove.com/sping/)
 - [Awesome Rust — System tools](https://github.com/rust-unofficial/awesome-rust#system-tools)
+- [The Terminal Index — sping](https://cli.masoko.net/tools/sping/)
 - [DEV Community — Your ping works. Your connection doesn't. Meet sping.](https://dev.to/antonio_cotos_0e227a64226/sping-advanced-ping-cli-522c) *(by the author)*
+
+## Contributing
+
+Bug reports and feature ideas are welcome as issues. Before opening a pull
+request, please read [CONTRIBUTING.md](CONTRIBUTING.md): it says what to
+discuss first and how an accepted change reaches a release.
 
 ## License
 

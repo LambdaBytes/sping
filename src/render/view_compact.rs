@@ -9,20 +9,22 @@ use crossterm::style::{Color, ResetColor, SetForegroundColor};
 use crossterm::{cursor, queue, terminal};
 
 use crate::diagnostics::correlator::{self, DiagInput};
+use crate::diagnostics::health::Reachability;
 use crate::probe::auxiliary::AuxiliaryState;
 use crate::probe::diagnose::DiagnoseState;
 use crate::probe::pulse::PulseScaler;
 use crate::probe::quality::Trend;
 use crate::probe::types::ProbeSnapshot;
 use crate::render::format::{
-    events, fmt_elapsed, fmt_loss, fmt_rtt, fmt_rtt_opt, fmt_source, tcp_outcome, unreachable_event,
+    Placement, events, fmt_elapsed, fmt_loss, fmt_rtt, fmt_rtt_opt, fmt_source, tcp_outcome,
+    unreachable_event,
 };
 use crate::render::icons;
 
 const VAL: Color = Color::DarkYellow;
 
-/// Draw one frame, first moving the cursor up over the `lines_before` lines
-/// from the previous frame. Returns the line count to pass back next call.
+/// Draw one frame where `place` says: first moving the cursor up over the
+/// lines of the previous frame. Returns the line count to pass back next call.
 pub fn draw_inline(
     out: &mut impl Write,
     snap: &ProbeSnapshot,
@@ -30,7 +32,7 @@ pub fn draw_inline(
     wan: Option<&AuxiliaryState>,
     diagnose: Option<&DiagnoseState>,
     spinner_idx: usize,
-    lines_before: u16,
+    place: Placement,
 ) -> io::Result<u16> {
     let use_color = icons::use_color();
     let sep = icons::sep();
@@ -103,7 +105,12 @@ pub fn draw_inline(
     lines += 1;
 
     write!(w, "Status     ")?;
-    let status = if snap.received > 0 {
+    // It has answered and no longer does: the health tracker's `Offline`,
+    // from three losses in a row until two replies in a row, as the "target
+    // unreachable" of Events.
+    let status = if snap.received > 0 && snap.reachability == Reachability::Offline {
+        "Unreachable"
+    } else if snap.received > 0 {
         "Reachable"
     } else if snap.sent > 0 {
         "No replies"
@@ -210,12 +217,13 @@ pub fn draw_inline(
 
     // Keep every line on one row, fix newlines for raw mode (\n → \r\n) and
     // prepend cursor repositioning
-    let buf = crate::render::format::stage_frame(&buf, crate::render::format::term_width())?;
+    let (buf, lines) = crate::render::format::fit_rows(&buf, lines, place);
+    let buf = crate::render::format::stage_frame(buf, place.width)?;
     let mut final_buf = Vec::with_capacity(buf.len() + 16);
-    if lines_before > 0 {
+    if place.lines_before > 0 {
         queue!(
             final_buf,
-            cursor::MoveUp(lines_before),
+            cursor::MoveUp(place.lines_before),
             cursor::MoveToColumn(0)
         )?;
     }
@@ -302,7 +310,7 @@ mod tests {
         snap.last_error = Some("send failed: No route to host (os error 65)".into());
 
         let mut out = Vec::new();
-        draw_inline(&mut out, &snap, None, None, None, 0, 0).unwrap();
+        draw_inline(&mut out, &snap, None, None, None, 0, Placement::default()).unwrap();
         let frame = String::from_utf8(out).unwrap();
         assert!(
             frame.contains("Events     send failed: No route to host (os error 65)"),
@@ -312,7 +320,7 @@ mod tests {
         // Without an error the line carries diagnostics only.
         snap.last_error = None;
         let mut out = Vec::new();
-        draw_inline(&mut out, &snap, None, None, None, 0, 0).unwrap();
+        draw_inline(&mut out, &snap, None, None, None, 0, Placement::default()).unwrap();
         assert!(!String::from_utf8(out).unwrap().contains("send failed"));
     }
 }

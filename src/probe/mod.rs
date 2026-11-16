@@ -4,7 +4,6 @@
 pub mod auxiliary;
 pub mod batch;
 pub mod diagnose;
-pub mod events;
 pub mod pulse;
 pub mod quality;
 pub mod scheduler;

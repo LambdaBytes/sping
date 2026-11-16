@@ -52,7 +52,7 @@ impl OutageTracker {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn in_outage(&self) -> bool {
         self.outage_start.is_some()
     }

@@ -152,6 +152,101 @@ fn test_list_interfaces() {
     }
 }
 
+/// A stdout that takes nothing: every write to `/dev/full` fails with "No
+/// space left on device". `None` where the device cannot be opened, or is
+/// not that device.
+#[cfg(target_os = "linux")]
+fn full_device() -> Option<std::fs::File> {
+    use std::io::Write;
+    let full = std::fs::OpenOptions::new().write(true).open("/dev/full");
+    let full = full.ok().filter(|mut device| {
+        device
+            .write(b"\n")
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::StorageFull)
+    });
+    if full.is_none() {
+        eprintln!("no /dev/full here: the failed write not checked");
+    }
+    full
+}
+
+/// `sping --list-interfaces | head -1`: a reader that went away is not an
+/// error, and a stdout that cannot be written is one, exit 2. Both were a
+/// panic ("failed printing to stdout", exit 101). The pipe's read end is
+/// closed before sping starts, so its write fails.
+#[cfg(unix)]
+#[test]
+fn test_list_interfaces_when_stdout_cannot_be_written() {
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    let output = sping_cmd()
+        .arg("--list-interfaces")
+        .stdout(writer)
+        .output()
+        .expect("failed to run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert_eq!(stderr, "");
+
+    #[cfg(target_os = "linux")]
+    if let Some(full) = full_device() {
+        let output = sping_cmd()
+            .arg("--list-interfaces")
+            .stdout(full)
+            .output()
+            .expect("failed to run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        assert!(
+            stderr.starts_with("error: cannot write the interfaces: "),
+            "{stderr}"
+        );
+    }
+}
+
+/// The classic and JSON views on a stdout that cannot be written: an error,
+/// exit 2. sping said so and ended with the exit code of the replies, 0 here,
+/// and classic with `-q`, which writes only the summary, said nothing. A
+/// reader that went away (`sping host | head -1`) is not an error: the exit
+/// code stays that of the replies.
+#[cfg(unix)]
+#[test]
+fn test_views_when_stdout_cannot_be_written() {
+    let (_listener, port) = tcp_listener();
+    let run = |view: &str, quiet: bool, stdout: Stdio| {
+        let mut cmd = sping_cmd();
+        cmd.args(["127.0.0.1", "--tcp", &port, "-c", "2", "-i", "50"]);
+        cmd.args(["--view", view]);
+        if quiet {
+            cmd.arg("-q");
+        }
+        let output = cmd.stdout(stdout).output().expect("failed to run");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        (output.status.code(), stderr)
+    };
+
+    for (view, quiet) in [("json", false), ("classic", false), ("classic", true)] {
+        let (reader, writer) = std::io::pipe().expect("pipe");
+        drop(reader);
+        let (code, stderr) = run(view, quiet, writer.into());
+        assert_eq!(code, Some(0), "{view} quiet={quiet}: {stderr}");
+        assert!(
+            !stderr.contains("cannot write"),
+            "{view} quiet={quiet}: {stderr}"
+        );
+
+        #[cfg(target_os = "linux")]
+        if let Some(full) = full_device() {
+            let (code, stderr) = run(view, quiet, full.into());
+            assert_eq!(code, Some(2), "{view} quiet={quiet}: {stderr}");
+            assert!(
+                stderr.contains("error: cannot write to stdout: "),
+                "{view} quiet={quiet}: {stderr}"
+            );
+        }
+    }
+}
+
 /// `--ip`: every address, the loopback's among them (whatever the system
 /// calls that interface), then the sources and the gateway.
 #[test]
@@ -592,6 +687,35 @@ fn test_exit_code_two_on_usage_error() {
     assert_eq!(output.status.code(), Some(2));
 }
 
+/// homebrew-core's formula (`Formula/s/sping.rb`, `test do`) runs, besides
+/// `--version`, these two commands on every bump and wants exit code 2 with
+/// these words in what they print (stdout and stderr together): a message
+/// reworded here fails Homebrew's bump of that version, which its autobump
+/// opens from the tag.
+#[test]
+fn test_the_errors_homebrew_core_tests() {
+    let no_targets = batch_file("homebrew-core-targets", "# No targets configured\n");
+    let runs = [
+        (
+            sping_timed(30).args(["--batch", &no_targets]),
+            "contains no targets",
+        ),
+        (
+            sping_timed(30).args(["127.0.0.1", "--source", "invalid"]),
+            "invalid source IP address: 'invalid'",
+        ),
+    ];
+    for (run, wanted) in runs {
+        let output = run.output().expect("failed to run");
+        let mut printed = String::from_utf8_lossy(&output.stdout).into_owned();
+        printed.push_str(&String::from_utf8_lossy(&output.stderr));
+        // A command that went on to probe never ends by itself.
+        assert!(!output.timed_out, "{wanted}: {printed}");
+        assert_eq!(output.status.code(), Some(2), "{wanted}: {printed}");
+        assert!(printed.contains(wanted), "{wanted}: {printed}");
+    }
+}
+
 #[test]
 fn test_quiet_suppresses_probe_lines() {
     let output = sping_timed(15)
@@ -698,6 +822,42 @@ fn test_several_targets_piped_print_only_their_summaries() {
     );
 }
 
+/// Several targets with stdout not a terminal write only their summaries:
+/// when they cannot be written it is an error, exit 2. Nothing was said and
+/// the exit code was that of the replies, 0 here (a refused connect is an
+/// answer). A reader that went away is not an error. Linux: every address of
+/// 127.0.0.0/8 is this host.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_several_targets_when_stdout_cannot_be_written() {
+    let (_listener, port) = tcp_listener();
+    let run = |stdout: Stdio| {
+        let output = sping_cmd()
+            .args(["127.0.0.1", "127.0.0.2", "--tcp", &port])
+            .args(["-c", "1", "-i", "50"])
+            .stdout(stdout)
+            .output()
+            .expect("failed to run");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        (output.status.code(), stderr)
+    };
+
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+    let (code, stderr) = run(writer.into());
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(!stderr.contains("cannot write"), "{stderr}");
+
+    if let Some(full) = full_device() {
+        let (code, stderr) = run(full.into());
+        assert_eq!(code, Some(2), "{stderr}");
+        assert!(
+            stderr.contains("error: cannot write to stdout: "),
+            "{stderr}"
+        );
+    }
+}
+
 // === Keys and terminals (a pseudo-terminal: Unix) ===
 
 /// A pseudo-terminal: sping on the slave side sees a terminal, as in a
@@ -739,11 +899,19 @@ fn open_pty() -> (std::fs::File, std::fs::File) {
         .custom_flags(libc::O_NOCTTY)
         .open(name)
         .unwrap();
-    // 80 x 24, room for every view. Set on the slave, as openpty(3) does:
-    // macOS refuses it on the master (-1, seen in CI).
+    // 80 x 24, room for every view.
+    set_pty_size(&slave, 80, 24);
+    (master, slave)
+}
+
+/// Set the pty's window size, on the slave, as openpty(3) does: macOS
+/// refuses it on the master (-1, seen in CI).
+#[cfg(unix)]
+fn set_pty_size(slave: &std::fs::File, cols: u16, rows: u16) {
+    use std::os::fd::AsRawFd;
     let size = libc::winsize {
-        ws_row: 24,
-        ws_col: 80,
+        ws_row: rows,
+        ws_col: cols,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
@@ -755,8 +923,7 @@ fn open_pty() -> (std::fs::File, std::fs::File) {
             &size as *const libc::winsize,
         )
     };
-    assert_eq!(set, 0, "TIOCSWINSZ: {}", os_error());
-    (master, slave)
+    assert_eq!(set, 0, "TIOCSWINSZ: {}", std::io::Error::last_os_error());
 }
 
 /// sping with stdout (and stdin, if `keys`) on the pty's `slave`, in a
@@ -876,6 +1043,63 @@ fn test_keys_quit_the_live_views() {
     }
 }
 
+/// Narrowing or widening the terminal while a live view runs: the next frame
+/// is drawn at the top of a cleared screen, not over the previous one, which
+/// a reflowing terminal (tmux, iTerm2, Windows Terminal, conhost) no longer
+/// shows one row per line: moving up over it left copies of its first rows
+/// above. Before the change, no frame clears the screen.
+#[cfg(unix)]
+#[test]
+fn test_a_width_change_redraws_the_live_views_on_a_cleared_screen() {
+    const CLEARED: &[u8] = b"\x1b[2J\x1b[1;1H";
+    let cleared_at = |seen: &[u8], from: usize| {
+        seen[from..]
+            .windows(CLEARED.len())
+            .position(|w| w == CLEARED)
+            .map(|at| from + at)
+    };
+    if icmp_denied() {
+        return;
+    }
+    let views: [&[&str]; 3] = [
+        &["127.0.0.1"],
+        &["127.0.0.1", "--view", "extended"],
+        &["127.0.0.1", "127.0.0.2"],
+    ];
+    for view in views {
+        let (master, slave) = open_pty();
+        let mut child = sping_on_pty(&slave, false, &[view, &["-i", "200"][..]].concat());
+        let seen = screen(&master);
+        let drawn = wait_until(Duration::from_secs(10), || !seen.lock().unwrap().is_empty());
+        // Several frames at the same width (10 per second).
+        std::thread::sleep(Duration::from_millis(500));
+        let clean = cleared_at(&seen.lock().unwrap(), 0).is_none();
+        // Narrower, then wider.
+        let mut redrawn = Vec::new();
+        for cols in [50, 70] {
+            let before = seen.lock().unwrap().len();
+            set_pty_size(&slave, cols, 24);
+            let cleared = wait_until(Duration::from_secs(5), || {
+                cleared_at(&seen.lock().unwrap(), before).is_some()
+            });
+            redrawn.push((cols, cleared));
+        }
+        terminate(&mut child).unwrap();
+        child.wait().unwrap();
+        assert!(drawn, "{view:?}: nothing drawn");
+        assert!(
+            clean,
+            "{view:?}: a frame cleared the screen before any resize"
+        );
+        for (cols, cleared) in redrawn {
+            assert!(
+                cleared,
+                "{view:?}: no cleared frame after the width became {cols}"
+            );
+        }
+    }
+}
+
 /// A live view with no terminal to read keys from (stdin is not one and
 /// there is no controlling terminal: cron, systemd, nohup) costs no CPU. The
 /// key listener's polls failed at once, and it spun a core.
@@ -938,19 +1162,38 @@ fn batch_file(name: &str, hosts: &str) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// A target that never answers on `port`: 127.0.0.2 (local on Linux) with a
-/// listener whose queue is full, so the kernel drops every new SYN. Keep
-/// both values alive while probing.
+/// A local listener (`tcp_listener`) and, on its port, a target that never
+/// answers: 127.0.0.2 (local on Linux) with a listener whose queue is full,
+/// so the kernel drops every new SYN. Keep the values alive while probing.
+///
+/// The port the kernel gives the first listener is free on 127.0.0.1, not
+/// on 127.0.0.2: the unit test of `-S 127.0.0.2` leaves its connection in
+/// TIME_WAIT there for a minute, and both run in one network namespace
+/// where the package is built. A port in use there is left for another.
 #[cfg(target_os = "linux")]
-fn tcp_silent_target(port: &str) -> (socket2::Socket, std::net::TcpStream) {
+fn tcp_listener_and_silent_target() -> (
+    std::net::TcpListener,
+    (socket2::Socket, std::net::TcpStream),
+    String,
+) {
     use socket2::{Domain, SockAddr, Socket, Type};
-    let addr: std::net::SocketAddr = format!("127.0.0.2:{port}").parse().unwrap();
-    let listener = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
-    listener.bind(&SockAddr::from(addr)).unwrap();
-    listener.listen(0).unwrap();
-    // A backlog of 0 holds one pending connection: this one.
-    let queued = std::net::TcpStream::connect(addr).unwrap();
-    (listener, queued)
+    // Each attempt is a port drawn anew from thousands: one in use on
+    // 127.0.0.2 is rare, eight in a row are not a coincidence.
+    for _ in 0..8 {
+        let (listener, port) = tcp_listener();
+        let addr: std::net::SocketAddr = format!("127.0.0.2:{port}").parse().unwrap();
+        let silent = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        match silent.bind(&SockAddr::from(addr)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(e) => panic!("bind {addr}: {e}"),
+        }
+        silent.listen(0).unwrap();
+        // A backlog of 0 holds one pending connection: this one.
+        let queued = std::net::TcpStream::connect(addr).unwrap();
+        return (listener, (silent, queued), port);
+    }
+    panic!("no port free on both 127.0.0.1 and 127.0.0.2 in 8 attempts");
 }
 
 #[test]
@@ -1170,6 +1413,89 @@ fn test_icmp_is_the_default_probe() {
     );
 }
 
+/// `--wan-probe` with an IPv6 address is probed through an ICMPv6 socket.
+/// Its echoes went to the IPv4 one, which cannot send them: the reference
+/// never answered (`rtt_last` null, `offline` three probes later) although
+/// the same address answers as a target.
+#[test]
+fn test_an_ipv6_wan_reference_answers() {
+    use std::io::BufRead;
+
+    // Only where both loopback addresses answer the main probe: several
+    // targets end with 0 when every one of them answered.
+    let gate = sping_timed(20)
+        .args(["127.0.0.1", "::1", "-c", "1", "-W", "1"])
+        .output()
+        .expect("failed to run");
+    assert!(!gate.timed_out, "did not stop after -c 1");
+    if gate.status.code() != Some(0) {
+        eprintln!("127.0.0.1 and ::1 do not both answer here: not run");
+        return;
+    }
+
+    // No `-c`: the run lasts until a line has the reference's answer, however
+    // late its first probe is published (a loaded or emulated builder), or
+    // 30 s.
+    let mut child = sping_cmd()
+        .args(["127.0.0.1", "--wan-probe", "::1", "-i", "200"])
+        .args(["--view", "json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to run");
+    let stdout = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+    let (line_tx, line_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in stdout.lines().map_while(Result::ok) {
+            if line_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last = String::new();
+    // The answer, or what the test fails with once sping is stopped.
+    let answered = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let Ok(line) = line_rx.recv_timeout(left) else {
+            break Err(format!("no answer from the reference; last line: {last}"));
+        };
+        let wan = match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(mut json) => json["wan"].take(),
+            Err(e) => break Err(format!("invalid JSON '{line}': {e}")),
+        };
+        if wan["target"] == "::1" && wan["rtt_last"].is_number() {
+            break Ok(());
+        }
+        last = line;
+    };
+
+    // Stopped and reaped before anything fails the test: within 10 s of
+    // SIGTERM, or killed. The reader ends with the child's stdout.
+    let signalled = terminate(&mut child);
+    let limit = Instant::now() + Duration::from_secs(10);
+    let stopped = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break true,
+            Ok(None) if signalled.is_ok() && Instant::now() < limit => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+    drop(line_rx);
+    reader.join().expect("stdout reader panicked");
+    if let Err(why) = answered {
+        panic!("{why}");
+    }
+    assert!(stopped, "sping still running 10 s after SIGTERM");
+}
+
 #[test]
 fn test_tcp_unusable_source_is_an_error() {
     let (_listener, port) = tcp_listener();
@@ -1182,11 +1508,43 @@ fn test_tcp_unusable_source_is_an_error() {
     assert!(stderr.contains("cannot prepare the TCP probe"), "{stderr}");
 }
 
+/// The ICMP probe too: a source address that cannot be bound is a local
+/// error before probing, with one target, several and a batch (it was exit 1
+/// with the ICMP permission hint). Windows ignores `-S`.
+#[cfg(unix)]
+#[test]
+fn test_icmp_unusable_source_is_an_error() {
+    if icmp_denied() {
+        return;
+    }
+    let hosts = batch_file("icmp-unusable-source.txt", "127.0.0.1\n");
+    let outputs = [
+        sping_timed(15)
+            .args(["127.0.0.1", "-S", "192.0.2.7", "-c", "1"])
+            .output(),
+        sping_timed(15)
+            .args(["127.0.0.1", "127.0.0.2", "-S", "192.0.2.7", "-c", "1"])
+            .output(),
+        sping_timed(15)
+            .args(["--batch", &hosts, "-S", "192.0.2.7", "-c", "1"])
+            .output(),
+    ];
+    for output in outputs {
+        let output = output.expect("failed to run");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        assert!(
+            stderr.contains("cannot prepare the ICMP probe of 127.0.0.1"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("ping_group_range"), "{stderr}");
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn test_tcp_multi_target_needs_every_answer() {
-    let (_listener, port) = tcp_listener();
-    let _silent = tcp_silent_target(&port);
+    let (_listener, _silent, port) = tcp_listener_and_silent_target();
     let output = sping_timed(30)
         .args([
             "127.0.0.1",
@@ -1284,8 +1642,7 @@ fn test_tcp_batch_exit_codes() {
 #[cfg(target_os = "linux")]
 #[test]
 fn test_tcp_batch_needs_every_answer() {
-    let (_listener, port) = tcp_listener();
-    let _silent = tcp_silent_target(&port);
+    let (_listener, _silent, port) = tcp_listener_and_silent_target();
     let mixed = batch_file("tcp-batch-mixed.txt", "127.0.0.1\n127.0.0.2\n");
     let output = sping_timed(30)
         .args([
@@ -1305,6 +1662,146 @@ fn test_tcp_batch_needs_every_answer() {
     assert_eq!(lines[1]["tcp_state"], "timeout");
     assert_eq!(lines[1]["received"], 0);
     assert!(lines.iter().all(|l| l["probe"] == "tcp"), "{stdout}");
+}
+
+/// A name that does not resolve is a target with no replies: with several
+/// targets, or in a batch, the exit code is 1, as when one of them does not
+/// answer. It was skipped with a warning and the others decided: 0 here.
+#[test]
+fn test_an_unresolved_target_is_one_with_no_replies() {
+    let (_listener, port) = tcp_listener();
+    let name = "this-host-definitely-does-not-exist.invalid";
+
+    let multi = sping_timed(30)
+        .args(["127.0.0.1", name, "--tcp", &port, "-c", "1", "-i", "200"])
+        .output()
+        .expect("failed to run");
+    let stdout = String::from_utf8_lossy(&multi.stdout);
+    let stderr = String::from_utf8_lossy(&multi.stderr);
+    assert!(!multi.timed_out, "did not stop after -c 1");
+    assert!(
+        stderr.contains(&format!("warning: skipping {name}")),
+        "{stderr}"
+    );
+    assert!(
+        stdout.contains("1 connects, 1 answered (0 refused), 0% loss"),
+        "{stdout}"
+    );
+    assert_eq!(multi.status.code(), Some(1), "{stderr}");
+
+    let hosts = batch_file("unresolved-batch.txt", &format!("127.0.0.1\n{name}\n"));
+    let batch = sping_timed(30)
+        .args(["--batch", &hosts, "--tcp", &port, "-c", "1", "-i", "200"])
+        .output()
+        .expect("failed to run");
+    let stdout = String::from_utf8_lossy(&batch.stdout);
+    let stderr = String::from_utf8_lossy(&batch.stderr);
+    assert!(
+        stderr.contains(&format!("warning: skipping {name}")),
+        "{stderr}"
+    );
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert!(stdout.contains("1/1  0%"), "{stdout}");
+    assert_eq!(batch.status.code(), Some(1), "{stderr}");
+}
+
+/// An IPv4-mapped IPv6 target is the IPv4 address it stands for: probed
+/// and shown as that one, and refused by `-6`. As IPv6 the ICMP probe could
+/// not be sent to it.
+#[test]
+fn test_ipv4_mapped_target_is_its_ipv4_address() {
+    let port = tcp_closed_port();
+    let mapped = "::ffff:127.0.0.1";
+    let common = ["--tcp", &port, "-c", "1", "-i", "200", "--view", "json"];
+    for ipv4_only in [false, true] {
+        let timed = sping_timed(30).args([mapped]).args(common);
+        let timed = if ipv4_only { timed.args(["-4"]) } else { timed };
+        let output = timed.output().expect("failed to run");
+        assert!(!output.timed_out, "did not stop after -c 1");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line: serde_json::Value =
+            serde_json::from_str(stdout.lines().last().unwrap_or_default()).expect("a JSON line");
+        assert_eq!(line["target_host"], mapped, "{stdout}");
+        assert_eq!(line["target_ip"], "127.0.0.1", "{stdout}");
+        assert_eq!(line["received"], 1, "{stdout}");
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    let output = sping_timed(30)
+        .args([mapped, "-6"])
+        .args(common)
+        .output()
+        .expect("failed to run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("does not match the requested address family"),
+        "{stderr}"
+    );
+    assert_eq!(output.status.code(), Some(2));
+}
+
+/// A target of a `--batch` file is written to stderr as it is ("Resolving
+/// …", "skipping …"): one with control characters, an escape sequence among
+/// them, is refused when the file is read, by its line number and without
+/// writing it. Line endings and the blanks around a target are not part of
+/// it.
+#[test]
+fn test_batch_refuses_control_characters() {
+    let port = tcp_closed_port();
+    let run = |name: &str, hosts: &str| {
+        let hosts = batch_file(name, hosts);
+        sping_timed(30)
+            .args(["--batch", &hosts, "--tcp", &port, "-c", "1", "-i", "200"])
+            .output()
+            .expect("failed to run")
+    };
+
+    let plain = run("plain-batch.txt", "# hosts\r\n\t127.0.0.1 \r\n");
+    let stdout = String::from_utf8_lossy(&plain.stdout);
+    assert!(stdout.contains("1/1  0%"), "{stdout}");
+    assert_eq!(plain.status.code(), Some(0));
+
+    let escaped = run(
+        "control-batch.txt",
+        "# hosts\n127.0.0.1\n\nbad\x1b[2Jhost.invalid\n",
+    );
+    let stderr = String::from_utf8_lossy(&escaped.stderr);
+    assert!(
+        stderr.contains("line 4: a target with control characters"),
+        "{stderr:?}"
+    );
+    assert!(!stderr.contains('\x1b'), "{stderr:?}");
+    assert!(escaped.stdout.is_empty());
+    assert_eq!(escaped.status.code(), Some(2), "{stderr:?}");
+}
+
+/// A `--batch` file that starts with a UTF-8 byte order mark: the mark is
+/// not part of the first line, which is the comment or the host it would be
+/// without it. It was a target of its own (`<BOM># hosts`, a name that does
+/// not resolve: exit code 1), or the host's name with the mark in front.
+#[test]
+fn test_batch_file_with_a_byte_order_mark() {
+    let port = tcp_closed_port();
+    let run = |name: &str, hosts: &str| {
+        let hosts = batch_file(name, hosts);
+        sping_timed(30)
+            .args(["--batch", &hosts, "--tcp", &port, "-c", "1", "-i", "200"])
+            .output()
+            .expect("failed to run")
+    };
+
+    for (name, hosts) in [
+        ("bom-comment-batch.txt", "\u{feff}# hosts\r\n127.0.0.1\r\n"),
+        ("bom-host-batch.txt", "\u{feff}127.0.0.1\n"),
+    ] {
+        let output = run(name, hosts);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("Batch: 1 targets"), "{name}: {stderr:?}");
+        assert!(!stderr.contains('\u{feff}'), "{name}: {stderr:?}");
+        assert!(stdout.contains("1/1  0%"), "{name}: {stdout}");
+        assert_eq!(output.status.code(), Some(0), "{name}: {stderr:?}");
+    }
 }
 
 // === --diagnose ===

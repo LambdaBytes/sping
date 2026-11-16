@@ -60,7 +60,7 @@ These fields are guaranteed present in every JSON line:
 | `interface` | string | Network interface name |
 | `local_ip` | string | Local IP address |
 | `prefix_len` | number | Network prefix length |
-| `gateway` | string \| null | Gateway IP or null |
+| `gateway` | string | Only when there is a default gateway: its IP. With none the key is absent; it has never been `null` |
 | `target_class` | string | "SameLan", "RoutedInternal", "PublicNetwork", "DefaultGateway", "LinkLocal" (a loopback target, `127.0.0.0/8` or `::1`, is "RoutedInternal") |
 
 ## gateway and wan Objects (added in 1.6.0)
@@ -79,6 +79,12 @@ An absent object means no evidence: no default gateway was found (`wan` can
 be present without `gateway`), the probe has no result yet or could not start
 (no ICMP permission), or the line comes from batch mode, which runs no
 auxiliary probe. `"unknown"` means a result that has not decided a state yet.
+
+When the default gateway goes while sping runs, the probe keeps the last one
+until it is given a different one. `net_ctx` is re-detected every 15 s: once
+it has lost the gateway, `target` is not `net_ctx.gateway` (there is none;
+or, around a change of gateway, the other of the two until both the probe
+and `net_ctx` have moved).
 
 ## icmp_unreachable Object (added in 1.8.0)
 
@@ -105,6 +111,16 @@ only ever added, never renamed or removed: a consumer ignores a code it does
 not know. Batch lines diagnose the target alone (no `gateway`/`wan`). A
 finding may repeat on later lines (`context_changed`, with its age).
 
+The localization also reads `net_ctx.gateway` (since 1.9.0). A gateway that
+answers counts as "gateway up" only while its `target` is the line's
+`net_ctx.gateway`: replies from a former gateway say nothing about the way
+out, so `upstream_outage` and `wan_degraded` are not concluded from them and
+`wan_unreachable` may come with a `gateway` whose `state` is `"online"`.
+`net_ctx` is re-detected every 15 s: while the two differ (a default gateway
+that came back after `net_ctx` lost it, or a new one that only one of them
+has yet), the gateway does not count as up. A gateway whose `state` is
+`"offline"` counts for `gateway_unreachable` whatever `net_ctx` says.
+
 | `code` | Evidence | Meaning |
 |--------|----------|---------|
 | `tcp_refused` | `port` | The last connect was refused: the host, or a firewall on the way, answered for the port |
@@ -113,7 +129,7 @@ finding may repeat on later lines (`context_changed`, with its age).
 | `outage` | `duration` (ms) | The target has not answered for `duration` |
 | `gateway_unreachable` | — | Target and gateway down: local network |
 | `upstream_outage` | — | Target and WAN reference down, gateway up |
-| `wan_unreachable` | — | Target and WAN reference down, gateway state unknown: no cause claimed |
+| `wan_unreachable` | — | Target and WAN reference down, gateway state unknown (no verdict, or replies from a gateway that is not `net_ctx.gateway`): no cause claimed |
 | `target_unreachable` | — | Target down; gateway and WAN reference not down (see `wan`) |
 | `latency_spike` | `rtt` (ms) | A latency spike, with the spike guard on |
 | `high_jitter` | — | No recent loss, but the last 20 probes' replies deviate from their mean by more than half of it (the quality grade's window and measure, not the lifetime `jitter` field) |
@@ -189,7 +205,7 @@ its own fields; none of the above applies to it.
 | `…addresses[].kind` | string | `"loopback"`, `"link_local"`, `"private"` (RFC 1918, `fc00::/7`), `"shared"` (`100.64.0.0/10`), `"global"` |
 | `…addresses[].temporary`, `deprecated`, `tentative`, `duplicate` | boolean \| null | IPv6 addresses only: their state; `null` when the system does not report it (`temporary` on Windows) |
 | `source.ipv4`, `source.ipv6` | object | The source the system picks towards `to`, a global reference address: `ip` and `interface` (`null` when no single interface holds it); `ip` `null`: no source of that family; `{"to", "unknown"}`: it could not be told, with the reason |
-| `gateway.ipv4` | object \| null | The IPv4 default gateway, `{"ip", "interface"}` (`interface` `null` when unknown); `null`: no default route; `{"unknown": reason}`: the routes could not be read |
+| `gateway.ipv4` | object \| null | The IPv4 default gateway, `{"ip", "interface"}` (`interface` `null` when unknown); `null`: no default route, or one with no gateway address; `{"unknown": reason}`: the routes could not be read |
 
 With `--external`, the object has one more member, `external`; without it,
 the object is as above, byte for byte:

@@ -13,6 +13,7 @@ use crate::config::ViewMode;
 use crate::probe::auxiliary::AuxiliaryState;
 use crate::probe::diagnose::DiagnoseState;
 use crate::probe::types::ProbeSnapshot;
+use crate::render::format::Placement;
 use crate::render::view_classic::ClassicView;
 use crate::render::view_compact;
 use crate::render::view_extended;
@@ -57,6 +58,83 @@ impl DiagnoseView {
     }
 }
 
+/// Where a live view's next frame starts. Frames are redrawn in place, over
+/// the previous one, by moving up one row per line. A terminal whose width
+/// changes may reflow what it shows (tmux, iTerm2, Windows Terminal and
+/// conhost do): the previous frame's lines take more rows, or rows come back
+/// from the scrollback, and moving up over it would leave copies of its first
+/// rows above. After a width change the frame is drawn at the top of a
+/// cleared screen instead.
+struct InlineFrame {
+    /// Lines of the previous frame; 0 before the first.
+    lines: u16,
+    /// The [`format::term_width`](crate::render::format::term_width) it was
+    /// drawn at.
+    width: Option<usize>,
+}
+
+impl InlineFrame {
+    fn new() -> Self {
+        Self {
+            lines: 0,
+            width: None,
+        }
+    }
+
+    /// Whether the next frame, at `width`, starts on a cleared screen: there
+    /// is a previous frame and the width changed since. A terminal that
+    /// reports no width (`Some(0)`) never tells a change.
+    fn clears(&self, width: Option<usize>) -> bool {
+        self.lines > 0 && width != self.width && width != Some(0) && self.width != Some(0)
+    }
+
+    /// Draw one frame with `draw`, which takes where to draw it and returns
+    /// the frame's line count, and write it to `out` at once, with the
+    /// clearing first if any. A frame that fails, to stage or to write, counts
+    /// as no lines, as it did before.
+    fn draw(
+        &mut self,
+        out: &mut impl Write,
+        draw: impl FnOnce(&mut Vec<u8>, Placement) -> std::io::Result<u16>,
+    ) {
+        use crate::render::format::{term_rows, term_width};
+        self.draw_at(out, term_width(), term_rows(), draw);
+    }
+
+    /// [`draw`](Self::draw) on a terminal of a given `width` and `rows`.
+    fn draw_at(
+        &mut self,
+        out: &mut impl Write,
+        width: Option<usize>,
+        rows: usize,
+        draw: impl FnOnce(&mut Vec<u8>, Placement) -> std::io::Result<u16>,
+    ) {
+        let mut frame = Vec::new();
+        let lines_before = if self.clears(width) {
+            let _ = crossterm::queue!(
+                frame,
+                terminal::Clear(terminal::ClearType::All),
+                crossterm::cursor::MoveTo(0, 0)
+            );
+            0
+        } else {
+            self.lines
+        };
+        let place = Placement {
+            lines_before,
+            width,
+            rows,
+        };
+        let written = draw(&mut frame, place).and_then(|lines| {
+            out.write_all(&frame)?;
+            out.flush()?;
+            Ok(lines)
+        });
+        self.lines = written.unwrap_or(0);
+        self.width = width;
+    }
+}
+
 /// Listen for Ctrl+C / `q` via crossterm events; send `true` on shutdown.
 fn spawn_key_listener(shutdown_tx: watch::Sender<bool>) {
     tokio::task::spawn_blocking(move || {
@@ -97,33 +175,52 @@ fn spawn_key_listener(shutdown_tx: watch::Sender<bool>) {
 
 /// Single-target renderer dispatching on `view`. `quiet` suppresses
 /// per-probe lines in classic mode (the summary still prints).
+///
+/// # Errors
+///
+/// The classic and JSON views could not write to stdout.
 pub async fn run(
     view: ViewMode,
     probe_rx: watch::Receiver<Option<ProbeSnapshot>>,
     aux: AuxChannels,
     shutdown: watch::Receiver<bool>,
     quiet: bool,
-) {
+) -> std::io::Result<()> {
     let mut out = stdout();
 
-    match view {
+    let written = match view {
         ViewMode::Classic => run_classic(&mut out, probe_rx, aux.diagnose, shutdown, quiet).await,
         ViewMode::Json => run_json(&mut out, probe_rx, aux, shutdown).await,
         _ => {
             let extended = matches!(view, ViewMode::Extended);
             run_tui(&mut out, probe_rx, aux, shutdown, extended).await;
+            Ok(())
         }
+    };
+    unless_reader_gone(written)
+}
+
+/// A closed pipe is the reader going away (`sping host | head -1`), not a
+/// stdout that cannot be written.
+fn unless_reader_gone(written: std::io::Result<()>) -> std::io::Result<()> {
+    match written {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        written => written,
     }
 }
 
 /// Multi-target table renderer: raw-mode TUI loop, then per-target
 /// summaries on shutdown. Not `live` (stdout not a terminal): nothing but
 /// the summaries.
+///
+/// # Errors
+///
+/// Not `live`: the summaries could not be written to stdout.
 pub async fn run_table(
     probe_rxs: Vec<watch::Receiver<Option<ProbeSnapshot>>>,
     shutdown: watch::Receiver<bool>,
     live: bool,
-) {
+) -> std::io::Result<()> {
     let mut out = stdout();
 
     // Raw mode: blocks Enter, mouse scroll, captures Ctrl+C via event reader
@@ -133,7 +230,7 @@ pub async fn run_table(
 
     let mut clock = FrameClock::default();
     let mut spinner: usize = 0;
-    let mut lines_drawn: u16 = 0;
+    let mut inline = InlineFrame::new();
     let mut shutdown = shutdown;
 
     loop {
@@ -144,7 +241,9 @@ pub async fn run_table(
                     .iter()
                     .map(|rx| rx.borrow().clone())
                     .collect();
-                lines_drawn = view_table::draw_table(&mut out, &snapshots, spinner, lines_drawn).unwrap_or(0);
+                inline.draw(&mut out, |frame, place| {
+                    view_table::draw_table(frame, &snapshots, spinner, place)
+                });
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() { break; }
@@ -156,12 +255,19 @@ pub async fn run_table(
         let _ = terminal::disable_raw_mode();
         let _ = writeln!(out);
     }
+    let mut written = Ok(());
     for rx in &probe_rxs {
         if let Some(snap) = rx.borrow().as_ref() {
-            print_final_summary(snap);
+            written = written.and(print_final_summary(&mut out, snap));
         }
     }
-    let _ = out.flush();
+    written = written.and(out.flush());
+    // After the table on a terminal, as after the single-target views:
+    // nothing to report.
+    if live {
+        return Ok(());
+    }
+    unless_reader_gone(written)
 }
 
 async fn run_tui(
@@ -177,7 +283,7 @@ async fn run_tui(
 
     let mut clock = FrameClock::default();
     let mut spinner: usize = 0;
-    let mut lines_drawn: u16 = 0;
+    let mut inline = InlineFrame::new();
     let mut shutdown = shutdown;
 
     loop {
@@ -189,11 +295,11 @@ async fn run_tui(
                     let wan = aux.wan_rx.borrow().clone();
                     let diagnose = aux.diagnose.as_ref().map(|d| d.state_about(snap.target_ip));
 
-                    if extended {
-                        lines_drawn = view_extended::draw_inline(out, snap, gw.as_ref(), wan.as_ref(), diagnose.as_ref(), spinner, lines_drawn).unwrap_or(0);
+                    inline.draw(out, |frame, place| if extended {
+                        view_extended::draw_inline(frame, snap, gw.as_ref(), wan.as_ref(), diagnose.as_ref(), spinner, place)
                     } else {
-                        lines_drawn = view_compact::draw_inline(out, snap, gw.as_ref(), wan.as_ref(), diagnose.as_ref(), spinner, lines_drawn).unwrap_or(0);
-                    }
+                        view_compact::draw_inline(frame, snap, gw.as_ref(), wan.as_ref(), diagnose.as_ref(), spinner, place)
+                    });
                 }
             }
             _ = shutdown.changed() => {
@@ -206,7 +312,7 @@ async fn run_tui(
 
     if let Some(snap) = probe_rx.borrow().as_ref() {
         let _ = writeln!(out);
-        print_final_summary(snap);
+        let _ = print_final_summary(out, snap);
         if let Some(line) = aux.diagnose.as_ref().and_then(|d| {
             crate::render::format::diagnosis_summary(
                 &d.state_about(snap.target_ip),
@@ -219,13 +325,14 @@ async fn run_tui(
     let _ = out.flush();
 }
 
+/// The first write that fails ends it, a closed pipe included.
 async fn run_classic(
-    out: &mut Stdout,
+    out: &mut impl Write,
     probe_rx: watch::Receiver<Option<ProbeSnapshot>>,
     diagnose: Option<DiagnoseView>,
     shutdown: watch::Receiver<bool>,
     quiet: bool,
-) {
+) -> std::io::Result<()> {
     // Scrolling output: no raw mode.
     let mut view = ClassicView::new();
     let mut last_snap: Option<ProbeSnapshot> = None;
@@ -242,27 +349,15 @@ async fn run_classic(
                 }
             } => {
                 let state = diagnose_rx.as_mut().map(|rx| rx.borrow_and_update().clone());
-                if !quiet
-                    && let Some(state) = state
-                    && let Err(e) = view.diagnosis(out, &state)
-                {
-                    if e.kind() != std::io::ErrorKind::BrokenPipe {
-                        eprintln!("error: cannot write to stdout: {e}");
-                    }
-                    return;
+                if !quiet && let Some(state) = state {
+                    view.diagnosis(out, &state)?;
                 }
             }
             result = probe_rx.changed() => {
                 if result.is_err() { break; }
                 if let Some(snap) = probe_rx.borrow_and_update().as_ref() {
-                    if !quiet && let Err(e) = view.draw(out, snap) {
-                        if e.kind() == std::io::ErrorKind::BrokenPipe {
-                            // Downstream consumer went away (e.g. `sping x | head`).
-                            return;
-                        }
-                        // Any other persistent stdout failure: report and stop.
-                        eprintln!("error: cannot write to stdout: {e}");
-                        return;
+                    if !quiet {
+                        view.draw(out, snap)?;
                     }
                     last_snap = Some(snap.clone());
                 }
@@ -279,34 +374,36 @@ async fn run_classic(
         && let Some(snap) = probe_rx.borrow_and_update().as_ref()
     {
         if !quiet {
-            let _ = view.draw(out, snap);
+            view.draw(out, snap)?;
         }
         last_snap = Some(snap.clone());
     }
 
     // A last state published just before the shutdown.
     if !quiet && let Some(d) = diagnose.as_ref() {
-        let _ = view.diagnosis(out, &d.state());
+        view.diagnosis(out, &d.state())?;
     }
     if let Some(snap) = last_snap.as_ref() {
-        let _ = view.summary(out, snap);
+        view.summary(out, snap)?;
         if let Some(line) = diagnose.as_ref().and_then(|d| {
             crate::render::format::diagnosis_summary(
                 &d.state_about(snap.target_ip),
                 crate::render::icons::sep(),
             )
         }) {
-            let _ = writeln!(out, "{line}");
+            writeln!(out, "{line}")?;
         }
     }
+    Ok(())
 }
 
+/// The first write that fails ends it, a closed pipe included.
 async fn run_json(
     out: &mut impl Write,
     probe_rx: watch::Receiver<Option<ProbeSnapshot>>,
     aux: AuxChannels,
     shutdown: watch::Receiver<bool>,
-) {
+) -> std::io::Result<()> {
     // Streaming output: no raw mode.
     let mut view = JsonView::new();
     let mut probe_rx = probe_rx;
@@ -331,12 +428,7 @@ async fn run_json(
                         held = Some(snap);
                         continue;
                     }
-                    if let Err(e) = view.draw(out, &snap, gw.as_ref(), wan.as_ref(), diagnose.as_ref().map(|d| (d, false))) {
-                        if e.kind() != std::io::ErrorKind::BrokenPipe {
-                            eprintln!("error: cannot write to stdout: {e}");
-                        }
-                        return;
-                    }
+                    view.draw(out, &snap, gw.as_ref(), wan.as_ref(), diagnose.as_ref().map(|d| (d, false)))?;
                 }
             }
             _ = shutdown.changed() => {
@@ -357,63 +449,62 @@ async fn run_json(
         if last_seq == Some(snap.seq) {
             held = Some(snap);
         } else {
-            let _ = view.draw(
+            view.draw(
                 out,
                 &snap,
                 gw.as_ref(),
                 wan.as_ref(),
                 diagnose.as_ref().map(|d| (d, false)),
-            );
+            )?;
         }
     }
     if let Some(snap) = held {
-        let _ = view.draw(
+        view.draw(
             out,
             &snap,
             gw.as_ref(),
             wan.as_ref(),
             diagnose.as_ref().map(|d| (d, true)),
-        );
+        )?;
     }
+    Ok(())
 }
 
-fn print_final_summary(snap: &ProbeSnapshot) {
+fn print_final_summary(out: &mut impl Write, snap: &ProbeSnapshot) -> std::io::Result<()> {
     use crate::render::format::{fmt_loss, fmt_rtt_opt};
 
-    // EPIPE-safe: never panic if stdout is gone.
-    let mut out = stdout();
     if let Some(port) = snap.port {
         // TCP counts connects and their answers, as the classic summary.
-        let _ = writeln!(
+        writeln!(
             out,
             "--- {host} ({ip}) tcp/{port} statistics ---",
             host = snap.target_host,
             ip = snap.target_ip,
-        );
-        let _ = writeln!(
+        )?;
+        writeln!(
             out,
             "{sent} connects, {recv} answered ({refused} refused), {loss} loss",
             sent = snap.sent,
             recv = snap.received,
             refused = snap.refused.unwrap_or(0),
             loss = fmt_loss(snap.loss_pct),
-        );
+        )?;
     } else {
-        let _ = writeln!(
+        writeln!(
             out,
             "--- {host} ({ip}) sping statistics ---",
             host = snap.target_host,
             ip = snap.target_ip,
-        );
-        let _ = writeln!(
+        )?;
+        writeln!(
             out,
             "{sent} sent, {recv} received, {loss} loss",
             sent = snap.sent,
             recv = snap.received,
             loss = fmt_loss(snap.loss_pct),
-        );
+        )?;
     }
-    let _ = writeln!(
+    writeln!(
         out,
         "rtt min/avg/max/mdev = {}/{}/{}/{}{sep}jitter {}",
         fmt_rtt_opt(snap.rtt_min),
@@ -422,7 +513,7 @@ fn print_final_summary(snap: &ProbeSnapshot) {
         fmt_rtt_opt(snap.mdev),
         fmt_rtt_opt(snap.jitter),
         sep = crate::render::icons::sep(),
-    );
+    )
 }
 
 /// Start the TUI keyboard listener; called from `app.rs` before the renderer.
@@ -496,7 +587,9 @@ mod tests {
             let _ = shutdown_tx.send(true);
             text
         };
-        let ((), text) = tokio::join!(run_json(&mut out, probe_rx, channels, shutdown_rx), driver);
+        let (written, text) =
+            tokio::join!(run_json(&mut out, probe_rx, channels, shutdown_rx), driver);
+        written.unwrap();
 
         let text = String::from_utf8(text).unwrap();
         let lines: Vec<&str> = text.lines().collect();
@@ -527,7 +620,9 @@ mod tests {
                 wan_rx,
                 diagnose: None,
             };
-            run_json(&mut out, probe_rx, aux, shutdown_rx).await;
+            run_json(&mut out, probe_rx, aux, shutdown_rx)
+                .await
+                .unwrap();
 
             let text = String::from_utf8(out).unwrap();
             let lines: Vec<&str> = text.lines().collect();
@@ -630,8 +725,9 @@ mod tests {
                 let _ = shutdown_tx.send(true);
                 text
             };
-            let ((), mut text) =
+            let (written, mut text) =
                 tokio::join!(run_json(&mut out, probe_rx, channels, shutdown_rx), driver);
+            written.unwrap();
             while let Ok(chunk) = tap_rx.try_recv() {
                 text.extend(chunk);
             }
@@ -648,5 +744,207 @@ mod tests {
             let state = if concluded { "done" } else { "incomplete" };
             assert_eq!(lines[1]["active_diagnosis"]["state"], state, "{text}");
         }
+    }
+
+    /// A stdout that cannot be written, as a file on a full disk.
+    struct Full;
+
+    impl Write for Full {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::StorageFull.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A write that fails ends the classic and JSON renderers with its
+    /// error, in the loop and, when the shutdown comes first, in what is
+    /// written after it: the last snapshot and the summary, which is all
+    /// that classic writes with `-q`. Those last writes were not looked at.
+    /// A closed pipe is not an error for the caller.
+    #[tokio::test]
+    async fn a_write_that_fails_is_the_renderers_error() {
+        use std::io::ErrorKind::{BrokenPipe, StorageFull};
+
+        // A snapshot and the shutdown, both there before the renderer
+        // starts: which of the two it sees first is not decided.
+        let (probe_tx, probe_rx) = watch::channel(None);
+        let (_gateway_tx, gateway_rx) = watch::channel(None);
+        let (_wan_tx, wan_rx) = watch::channel(None);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let _ = probe_tx.send(Some(replying()));
+        let _ = shutdown_tx.send(true);
+
+        for _ in 0..32 {
+            for quiet in [false, true] {
+                let written = run_classic(
+                    &mut Full,
+                    probe_rx.clone(),
+                    None,
+                    shutdown_rx.clone(),
+                    quiet,
+                )
+                .await;
+                assert_eq!(written.map_err(|e| e.kind()), Err(StorageFull), "{quiet}");
+            }
+            let aux = AuxChannels {
+                gateway_rx: gateway_rx.clone(),
+                wan_rx: wan_rx.clone(),
+                diagnose: None,
+            };
+            let written = run_json(&mut Full, probe_rx.clone(), aux, shutdown_rx.clone()).await;
+            assert_eq!(written.map_err(|e| e.kind()), Err(StorageFull));
+        }
+
+        let passed = |kind: std::io::ErrorKind| unless_reader_gone(Err(kind.into()));
+        assert!(passed(BrokenPipe).is_ok());
+        assert_eq!(passed(StorageFull).map_err(|e| e.kind()), Err(StorageFull));
+        assert!(unless_reader_gone(Ok(())).is_ok());
+    }
+
+    /// The summary of each of several targets, all that is written when
+    /// stdout is not a terminal, tells of the write that fails: it was not
+    /// looked at.
+    #[test]
+    fn a_summary_that_cannot_be_written_is_an_error() {
+        for snap in [replying(), crate::render::golden_tcp::open()] {
+            let written = print_final_summary(&mut Full, &snap);
+            assert_eq!(
+                written.map_err(|e| e.kind()),
+                Err(std::io::ErrorKind::StorageFull)
+            );
+        }
+    }
+
+    /// Clear-screen and cursor-home, as `InlineFrame` writes them.
+    const CLEARED: &str = "\x1b[2J\x1b[1;1H";
+
+    /// A two-line frame that records the lines it was asked to move up over.
+    fn frame(
+        asked: &mut Vec<u16>,
+    ) -> impl FnOnce(&mut Vec<u8>, Placement) -> std::io::Result<u16> + '_ {
+        |out, place| {
+            asked.push(place.lines_before);
+            out.extend_from_slice(b"one\r\ntwo\r\n");
+            Ok(2)
+        }
+    }
+
+    /// A frame moves up over the previous one while the width stays; after a
+    /// change, narrower or wider, it starts at the top of a cleared screen,
+    /// in the same write. The first frame, and a terminal that reports no
+    /// width, never clear.
+    #[test]
+    fn a_width_change_redraws_the_frame_on_a_cleared_screen() {
+        let mut inline = InlineFrame::new();
+        let mut asked = Vec::new();
+        let mut writes = Vec::new();
+        for width in [80, 80, 50, 50, 120, 120] {
+            let mut out = Vec::new();
+            inline.draw_at(&mut out, Some(width), 0, frame(&mut asked));
+            writes.push(String::from_utf8(out).unwrap());
+        }
+        assert_eq!(asked, [0, 2, 0, 2, 0, 2]);
+        let cleared: Vec<bool> = writes.iter().map(|w| w.starts_with(CLEARED)).collect();
+        assert_eq!(cleared, [false, false, true, false, true, false]);
+        assert_eq!(writes[2], format!("{CLEARED}one\r\ntwo\r\n"));
+
+        let mut inline = InlineFrame::new();
+        let mut asked = Vec::new();
+        for width in [Some(0), Some(0), Some(80), Some(0)] {
+            let mut out = Vec::new();
+            inline.draw_at(&mut out, width, 0, frame(&mut asked));
+            assert!(
+                !String::from_utf8(out).unwrap().contains(CLEARED),
+                "{width:?}"
+            );
+        }
+        assert_eq!(asked, [0, 2, 2, 2]);
+    }
+
+    /// A frame shorter than the one before it erases the rows that one left
+    /// below: the extended view loses its `RTT dist` line once the pulse
+    /// holds fewer than three replies, and the old last row stayed on screen.
+    #[test]
+    fn a_shorter_frame_erases_what_the_longer_one_left_below() {
+        let replying = crate::render::golden_icmp::replying();
+        let mut down = replying.clone();
+        down.pulse = vec![crate::probe::types::PulseEntry::Loss; 40];
+
+        let mut inline = InlineFrame::new();
+        let mut lines = Vec::new();
+        let mut writes = Vec::new();
+        for snap in [&replying, &down] {
+            let mut out = Vec::new();
+            inline.draw_at(&mut out, Some(120), 0, |frame, place| {
+                view_extended::draw_inline(frame, snap, None, None, None, 0, place)
+            });
+            lines.push(inline.lines);
+            writes.push(String::from_utf8(out).unwrap());
+        }
+        assert_eq!(lines, [10, 9]);
+        // Up over the ten lines, nine drawn, and from the tenth down erased.
+        assert!(writes[1].starts_with("\x1b[10A"), "{:?}", writes[1]);
+        assert!(writes[1].ends_with("\r\n\x1b[J\x1b[?7h"), "{:?}", writes[1]);
+    }
+
+    /// A frame is cut to the lines the terminal has rows for, leaving one for
+    /// the cursor, and the next one moves up over the lines really drawn: a
+    /// frame of more lines scrolled the screen on every redraw. Shorter and
+    /// taller again between frames, as when the window is resized.
+    #[test]
+    fn a_frame_taller_than_the_terminal_is_cut_to_its_rows() {
+        let snap = crate::render::golden_icmp::replying();
+        let mut inline = InlineFrame::new();
+        let mut drawn = Vec::new();
+        // The compact view has 8 lines; 0 rows is a height not reported.
+        for rows in [30, 9, 8, 4, 1, 4, 30, 0] {
+            let mut out = Vec::new();
+            inline.draw_at(&mut out, Some(120), rows, |frame, place| {
+                view_compact::draw_inline(frame, &snap, None, None, None, 0, place)
+            });
+            let newlines = out.iter().filter(|&&b| b == b'\n').count();
+            assert_eq!(newlines, usize::from(inline.lines), "{rows} rows");
+            let text = String::from_utf8(out).unwrap();
+            let up = text
+                .strip_prefix("\x1b[")
+                .and_then(|rest| rest.split_once('A'))
+                .and_then(|(n, _)| n.parse::<u16>().ok());
+            drawn.push((inline.lines, up));
+        }
+        assert_eq!(
+            drawn,
+            [
+                (8, None),
+                (8, Some(8)),
+                (7, Some(8)),
+                (3, Some(7)),
+                (0, Some(3)),
+                (3, None),
+                (8, Some(3)),
+                (8, Some(8)),
+            ]
+        );
+    }
+
+    /// A frame that fails to write counts as no lines: the next one does not
+    /// move up over it.
+    #[test]
+    fn a_frame_that_fails_to_write_counts_as_no_lines() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut inline = InlineFrame::new();
+        let mut asked = Vec::new();
+        inline.draw_at(&mut Broken, Some(80), 0, frame(&mut asked));
+        inline.draw_at(&mut Vec::new(), Some(80), 0, frame(&mut asked));
+        assert_eq!(asked, [0, 0]);
     }
 }

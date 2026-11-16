@@ -14,7 +14,6 @@ pub struct SpikeDetector {
     window: VecDeque<f64>, // recent RTTs in ms
     last_spike_time: Option<Instant>,
     last_spike_rtt: Option<Duration>,
-    spike_count: u64,
 }
 
 impl SpikeDetector {
@@ -23,7 +22,6 @@ impl SpikeDetector {
             window: VecDeque::with_capacity(WINDOW),
             last_spike_time: None,
             last_spike_rtt: None,
-            spike_count: 0,
         }
     }
 
@@ -43,7 +41,6 @@ impl SpikeDetector {
         if is_spike {
             self.last_spike_time = Some(Instant::now());
             self.last_spike_rtt = Some(rtt);
-            self.spike_count += 1;
         }
 
         is_spike
@@ -90,11 +87,6 @@ impl SpikeDetector {
     /// Whether the spike guard (cooldown) is active.
     pub fn in_cooldown(&self) -> bool {
         self.last_spike_time.is_some_and(|t| t.elapsed() < COOLDOWN)
-    }
-
-    #[allow(dead_code)] // useful for future extended diagnostics
-    pub fn spike_count(&self) -> u64 {
-        self.spike_count
     }
 }
 

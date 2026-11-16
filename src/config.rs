@@ -81,12 +81,40 @@ impl Config {
 
         let is_batch = args.batch.is_some();
 
+        // Batch takes its targets from the file: one on the command line is
+        // refused rather than ignored. Not as a conflict in clap, which
+        // would then let `-o` pass without the `--batch` it requires.
+        if let (true, Some(target)) = (is_batch, args.targets.first()) {
+            return Err(format!(
+                "--batch takes its targets from the file: '{target}' does not go with it"
+            ));
+        }
+
+        // Batch prints each target's summary, or JSON: a view it is not is
+        // refused rather than ignored. Compact is the default, which cannot
+        // be told from no `--view` at all.
+        if is_batch
+            && matches!(
+                view,
+                ViewMode::Extended | ViewMode::Classic | ViewMode::Table
+            )
+        {
+            return Err(format!(
+                "--view {} does not go with --batch, which prints a summary, \
+                 or JSON with --view json",
+                args.view
+            ));
+        }
+
         let source = match &args.source {
             Some(s) => {
                 let ip: IpAddr = s
                     .parse()
                     .map_err(|_| format!("invalid source IP address: '{s}'"))?;
-                Some(ip)
+                // An IPv4-mapped address is the IPv4 address it stands
+                // for, as a target written that way is (`ResolvedAddr`):
+                // the socket the two meet at is of one family.
+                Some(ip.to_canonical())
             }
             None => None,
         };
@@ -98,9 +126,12 @@ impl Config {
             ));
         }
 
-        if !(args.timeout > 0.0 && args.timeout <= 3600.0) {
+        // A millisecond is the unit of the coarsest timeout a probe hands
+        // the system (Windows' `IcmpSendEcho`); below a microsecond a
+        // socket's receive timeout is zero, which is none at all.
+        if !(0.001..=3600.0).contains(&args.timeout) {
             return Err(format!(
-                "timeout must be in (0, 3600] seconds (got {})",
+                "timeout must be in [0.001, 3600] seconds (got {})",
                 args.timeout
             ));
         }
@@ -124,6 +155,11 @@ impl Config {
             .wan_probe
             .parse()
             .map_err(|_| format!("invalid --wan-probe address: '{}'", args.wan_probe))?;
+        // An IPv4-mapped address is the IPv4 address it stands for, as a
+        // target or a source written that way is: left as IPv6 it was not
+        // probed as that address, and the WAN was reported offline while
+        // it answered.
+        let wan_probe = wan_probe.to_canonical();
 
         let family = match (args.ipv4, args.ipv6) {
             (true, _) => Some(Family::V4),
@@ -135,10 +171,23 @@ impl Config {
         if let Some(ref batch_path) = args.batch {
             let content = std::fs::read_to_string(batch_path)
                 .map_err(|e| format!("cannot read batch file '{batch_path}': {e}"))?;
-            for line in content.lines() {
+            // A UTF-8 byte order mark at the start of the file is not part
+            // of its first line: `trim` leaves it (it is not white space),
+            // and the line, a comment or a host, was taken for a target.
+            let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
+            for (index, line) in content.lines().enumerate() {
                 let trimmed = line.trim();
                 if trimmed.is_empty() || trimmed.starts_with('#') {
                     continue;
+                }
+                // A target is written to stderr as it is ("Resolving …"):
+                // one with a control character, an escape sequence among
+                // them, is refused by its line, without writing it.
+                if trimmed.contains(char::is_control) {
+                    return Err(format!(
+                        "batch file '{batch_path}', line {}: a target with control characters",
+                        index + 1
+                    ));
                 }
                 targets.push(trimmed.to_string());
             }
@@ -259,7 +308,18 @@ impl Config {
         if let Some(ref iface) = self.interface {
             let ifaces = crate::context::iface::list_interfaces();
             let names: Vec<&str> = ifaces.iter().map(|i| i.name.as_str()).collect();
-            if !names.contains(&iface.as_str()) {
+            // Linux and macOS ask the kernel for the name, Windows its
+            // adapters that have an address: that list comes from the IPv4
+            // routes (Linux) or keeps IPv4 and no loopback (macOS, Windows),
+            // which leaves out the loopback interface and one with only a /32
+            // or only IPv6 addresses.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let found = crate::context::iface::interface_index(iface) != 0;
+            #[cfg(target_os = "windows")]
+            let found = crate::context::iface::has_adapter(iface);
+            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+            let found = names.contains(&iface.as_str());
+            if !found {
                 return Err(format!(
                     "interface '{}' not found. Available: {}",
                     iface,
@@ -303,6 +363,73 @@ mod tests {
         );
     }
 
+    /// `-I` takes any interface the system has. The loopback one is in no
+    /// IPv4 route of `/proc/net/route`, where the list of interfaces comes
+    /// from, and every network namespace has it. A name the system does not
+    /// have is refused, as is the label of an address (`lo:0`), which the
+    /// kernel would take for its interface and no socket binds to.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_interface_is_one_the_system_has() {
+        let lo = config(&["127.0.0.1", "-I", "lo"]).expect("valid arguments");
+        assert_eq!(lo.validate(), Ok(()));
+        let none = config(&["127.0.0.1", "-I", "nonexistent99"]).expect("valid arguments");
+        let refused = none.validate().expect_err("no such interface");
+        assert!(
+            refused.starts_with("interface 'nonexistent99' not found. Available: "),
+            "{refused}"
+        );
+        let label = config(&["127.0.0.1", "-I", "lo:0"]).expect("valid arguments");
+        let refused = label.validate().expect_err("a label, not an interface");
+        assert!(
+            refused.starts_with("interface 'lo:0' not found. Available: "),
+            "{refused}"
+        );
+    }
+
+    /// macOS, as Linux: `-I` takes the loopback interface, which the list of
+    /// interfaces (IPv4, no loopback) leaves out; v1.9.0-rc1 said
+    /// `interface 'lo0' not found. Available: en0, en1`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_interface_is_one_the_system_has() {
+        let lo = config(&["127.0.0.1", "-I", "lo0"]).expect("valid arguments");
+        assert_eq!(lo.validate(), Ok(()));
+        let none = config(&["127.0.0.1", "-I", "nonexistent99"]).expect("valid arguments");
+        let refused = none.validate().expect_err("no such interface");
+        assert!(
+            refused.starts_with("interface 'nonexistent99' not found. Available: "),
+            "{refused}"
+        );
+        let label = config(&["127.0.0.1", "-I", "lo0:0"]).expect("valid arguments");
+        let refused = label.validate().expect_err("a label, not an interface");
+        assert!(
+            refused.starts_with("interface 'lo0:0' not found. Available: "),
+            "{refused}"
+        );
+    }
+
+    /// Windows: `-I` takes any adapter that has an address, the loopback one
+    /// included (the one `Init:` names for 127.0.0.1); v1.9.0-rc1 said
+    /// `interface 'Loopback Pseudo-Interface 1' not found. Available:
+    /// Ethernet`. Its name comes from the system: it may be translated.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn an_interface_is_one_the_system_has() {
+        let loopback =
+            crate::context::iface::interface_for_ip(std::net::IpAddr::from([127, 0, 0, 1]), 0)
+                .expect("an adapter holds 127.0.0.1")
+                .name;
+        let lo = config(&["127.0.0.1", "-I", &loopback]).expect("valid arguments");
+        assert_eq!(lo.validate(), Ok(()), "{loopback}");
+        let none = config(&["127.0.0.1", "-I", "nonexistent99"]).expect("valid arguments");
+        let refused = none.validate().expect_err("no such interface");
+        assert!(
+            refused.starts_with("interface 'nonexistent99' not found. Available: "),
+            "{refused}"
+        );
+    }
+
     /// `--icmp` is the probe sping runs without it: the same probe options
     /// for each target, one or several (batch takes the same options), with
     /// any other option alongside.
@@ -336,6 +463,128 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
         let text = err.to_string();
         assert!(text.contains("--icmp") && text.contains("--tcp"), "{text}");
+    }
+
+    /// `-W` is at least a millisecond, the unit of the coarsest timeout a
+    /// probe hands the system (Windows' `IcmpSendEcho`). A value below a
+    /// microsecond was a receive timeout of zero, which is none: every
+    /// probe was a timeout.
+    #[test]
+    fn timeout_is_at_least_a_millisecond() {
+        for refused in ["0.0000005", "0.0009", "0", "nan", "3600.1"] {
+            let err = config(&["192.0.2.1", "-W", refused])
+                .err()
+                .expect("refused");
+            assert_eq!(
+                err,
+                format!(
+                    "timeout must be in [0.001, 3600] seconds (got {})",
+                    refused.parse::<f64>().unwrap()
+                )
+            );
+        }
+        for (accepted, timeout) in [
+            ("0.001", Duration::from_millis(1)),
+            ("2", Duration::from_secs(2)),
+            ("3600", Duration::from_secs(3600)),
+        ] {
+            let cfg = config(&["192.0.2.1", "-W", accepted]).expect("valid arguments");
+            assert_eq!(cfg.timeout, timeout, "{accepted}");
+        }
+    }
+
+    /// `--batch` takes its targets from the file and prints each one's
+    /// summary, or JSON: a target on the command line and a view it is not
+    /// are refused (both were ignored). The default view cannot be told
+    /// from `--view compact`, so that one is taken.
+    #[test]
+    fn batch_refuses_what_it_would_ignore() {
+        let batch = ["--batch", "no-such-batch-file"];
+        let err = config(&[&batch[..], &["192.0.2.1"]].concat())
+            .err()
+            .expect("refused");
+        assert_eq!(
+            err,
+            "--batch takes its targets from the file: '192.0.2.1' does not go with it"
+        );
+        for view in ["extended", "classic", "table"] {
+            let err = config(&[&batch[..], &["--view", view]].concat())
+                .err()
+                .expect("refused");
+            assert!(
+                err.starts_with(&format!("--view {view} does not go with --batch")),
+                "{err}"
+            );
+        }
+        // The views batch has get as far as reading the file.
+        for view in [&[][..], &["--view", "compact"], &["--view", "json"]] {
+            let err = config(&[&batch[..], view].concat())
+                .err()
+                .expect("no such file");
+            assert!(
+                err.starts_with("cannot read batch file 'no-such-batch-file': "),
+                "{err}"
+            );
+        }
+    }
+
+    /// A `--batch` file loses the UTF-8 byte order mark it starts with, and
+    /// that one alone: a second one, or one further down, is part of the
+    /// line it is in, as any other character.
+    #[test]
+    fn a_batch_file_loses_only_the_byte_order_mark_it_starts_with() {
+        let targets = |name: &str, hosts: &str| {
+            let path =
+                std::env::temp_dir().join(format!("sping-{}-{name}.txt", std::process::id()));
+            std::fs::write(&path, hosts).expect("a temporary directory to write in");
+            let cfg = config(&["--batch", &path.to_string_lossy()]);
+            let _ = std::fs::remove_file(&path);
+            cfg.expect("valid arguments").targets
+        };
+        assert_eq!(
+            targets("bom-comment", "\u{feff}# hosts\r\n192.0.2.1\r\n"),
+            ["192.0.2.1"]
+        );
+        assert_eq!(targets("bom-host", "\u{feff}192.0.2.1\n"), ["192.0.2.1"]);
+        assert_eq!(
+            targets("bom-twice", "\u{feff}\u{feff}192.0.2.1\n"),
+            ["\u{feff}192.0.2.1"]
+        );
+        assert_eq!(
+            targets("bom-inside", "192.0.2.1\n\u{feff}192.0.2.2\n"),
+            ["192.0.2.1", "\u{feff}192.0.2.2"]
+        );
+    }
+
+    /// `-S` with an IPv4-mapped IPv6 address is the IPv4 address it stands
+    /// for, as a target written that way is: the two meet at one socket,
+    /// of one family.
+    #[test]
+    fn a_mapped_source_is_its_ipv4_address() {
+        let ipv4 = "192.0.2.7".parse::<IpAddr>().ok();
+        for source in ["192.0.2.7", "::ffff:192.0.2.7", "::ffff:c000:207"] {
+            let cfg = config(&["192.0.2.1", "-S", source]).expect("valid arguments");
+            assert_eq!(cfg.source, ipv4, "{source}");
+        }
+        let cfg = config(&["192.0.2.1", "-S", "::1"]).expect("valid arguments");
+        assert_eq!(cfg.source, "::1".parse::<IpAddr>().ok());
+    }
+
+    /// `--wan-probe` with an IPv4-mapped IPv6 address is the IPv4 address
+    /// it stands for, as `-S` and a target written that way are; any other
+    /// IPv6 address stays as written.
+    #[test]
+    fn a_mapped_wan_probe_is_its_ipv4_address() {
+        let ipv4: IpAddr = "192.0.2.7".parse().expect("an address");
+        for wan in ["192.0.2.7", "::ffff:192.0.2.7", "::ffff:c000:207"] {
+            let cfg = config(&["192.0.2.1", "--wan-probe", wan]).expect("valid arguments");
+            assert_eq!(cfg.wan_probe, ipv4, "{wan}");
+        }
+        for wan in ["2001:db8::7", "::1", "::192.0.2.7"] {
+            let ipv6: IpAddr = wan.parse().expect("an address");
+            let cfg = config(&["192.0.2.1", "--wan-probe", wan]).expect("valid arguments");
+            assert_eq!(cfg.wan_probe, ipv6, "{wan}");
+        }
     }
 
     /// Several targets are always the table: a view it is not is refused

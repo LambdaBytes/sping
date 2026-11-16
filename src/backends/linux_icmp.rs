@@ -183,10 +183,10 @@ pub(super) fn v6_source_ok(
 /// scheduling latency.
 #[cfg(target_os = "linux")]
 fn realtime_nanos() -> Option<i128> {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
+    // Not a struct literal: with a 64-bit `time_t` on 32-bit glibc (Debian's
+    // armhf) `libc::timespec` has a private padding field.
+    // SAFETY: all-zero bytes are a valid `timespec`.
+    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
     // SAFETY: `ts` is a valid, writable `timespec` and `CLOCK_REALTIME` is a
     // valid clock id; `clock_gettime` writes the struct and returns 0 or -1.
     let r = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
@@ -204,7 +204,8 @@ fn realtime_nanos() -> Option<i128> {
 
 /// Prefer the kernel-stamped RTT (rx kernel time - tx wall time) when it is
 /// plausible; fall back to the userspace measurement otherwise (missing
-/// stamps, or a wall-clock step between send and receive).
+/// stamps, or a wall-clock step between send and receive). A step back
+/// shorter than the RTT is not seen: that one probe reads shorter by the step.
 fn refine_rtt(
     tx_ns: Option<i128>,
     rx_ns: Option<i128>,
@@ -337,10 +338,13 @@ fn identifier_for(pid: u16, n: u16) -> u16 {
 /// hands it out again.
 static TRACE_IDENTIFIER: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
 
-/// Identifier for a new backend, unique among the backends of this process:
-/// a socket that also receives the replies of the others (RAW; macOS DGRAM)
-/// recognizes its own by it. Their sequence numbers advance in lockstep, so
-/// the sequence number alone cannot. The traces' identifier is skipped, also
+/// Identifier for a new backend: a socket that also receives the replies of
+/// the others (RAW; macOS DGRAM) recognizes its own by it. Their sequence
+/// numbers advance in lockstep, so the sequence number alone cannot. The
+/// counter is 16 bits: any 65535 consecutive backends of this process get
+/// distinct identifiers (65536 before the traces' identifier is drawn), so a
+/// backend still open after that many more were created may share its
+/// identifier with a newer one. The traces' identifier is skipped, also
 /// after the counter wraps, so no probe ever shares it.
 fn next_identifier() -> u16 {
     static CREATED: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);

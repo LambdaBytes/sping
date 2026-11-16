@@ -337,7 +337,7 @@ fn linux_states(flags: u32) -> States {
 /// Every IPv4 and IPv6 address `getifaddrs` gives, with its interface and
 /// the prefix length of its netmask (`None` without one).
 #[cfg(target_os = "linux")]
-fn getifaddrs_list() -> Result<Vec<(String, IpAddr, Option<u8>)>, String> {
+pub(super) fn getifaddrs_list() -> Result<Vec<(String, IpAddr, Option<u8>)>, String> {
     use std::ffi::CStr;
 
     /// Frees the list on every way out.

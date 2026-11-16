@@ -171,7 +171,17 @@ pub fn path_glyphs() -> (char, char, char, char) {
 /// Whether to emit ANSI colors: stdout is a TTY that interprets escape
 /// sequences and NO_COLOR is unset.
 pub fn use_color() -> bool {
-    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() && ansi_enabled()
+    color_on(&std::io::stdout())
+}
+
+/// The same for what is printed on stderr (the `Init:` line): `2>file` gets
+/// no escape sequences, wherever stdout goes.
+pub fn use_color_stderr() -> bool {
+    color_on(&std::io::stderr())
+}
+
+fn color_on(stream: &impl IsTerminal) -> bool {
+    stream.is_terminal() && std::env::var_os("NO_COLOR").is_none() && ansi_enabled()
 }
 
 /// A Windows console only interprets escape sequences once virtual-terminal
@@ -179,12 +189,12 @@ pub fn use_color() -> bool {
 /// first command. Asking here switches it on before anything is printed, so
 /// an early line (the `Init:` line) does not show its sequences as text.
 #[cfg(windows)]
-fn ansi_enabled() -> bool {
+pub fn ansi_enabled() -> bool {
     crossterm::ansi_support::supports_ansi()
 }
 
 #[cfg(not(windows))]
-fn ansi_enabled() -> bool {
+pub fn ansi_enabled() -> bool {
     true
 }
 
@@ -205,6 +215,14 @@ mod tests {
         assert!(choose_ascii(false, Some(OsStr::new("1")), true));
         assert!(!choose_ascii(false, Some(OsStr::new("0")), false));
         assert!(choose_ascii(false, Some(OsStr::new("")), false));
+    }
+
+    /// A stream that is not a terminal gets no escape sequences: stderr sent
+    /// to a file is asked as this file is.
+    #[test]
+    fn no_color_on_a_stream_that_is_not_a_terminal() {
+        let file = std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+        assert!(!color_on(&file));
     }
 
     #[test]

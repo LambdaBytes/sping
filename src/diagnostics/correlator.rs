@@ -3,6 +3,7 @@
 //! snapshot; the views turn findings into text (`render::format::describe`)
 //! and the JSON line carries them as they are.
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -11,7 +12,6 @@ use crate::context::ContextChange;
 use crate::context::dns::Family;
 use crate::diagnostics::health::Reachability;
 use crate::probe::auxiliary::AuxiliaryState;
-use crate::probe::quality::QualityGrade;
 use crate::probe::types::{NameState, ProbeSnapshot, RecentChange, TcpState};
 
 /// Diagnostic input for the correlator.
@@ -22,11 +22,13 @@ pub struct DiagInput<'a> {
     pub target_total_loss: bool,
     /// Percentage (0–100).
     pub loss_pct: f64,
-    /// Reserved for future rules.
-    #[allow(dead_code)]
-    pub quality: Option<QualityGrade>,
     /// `None` when no gateway probe runs.
     pub gateway: Option<&'a AuxiliaryState>,
+    /// The gateway state is about the default gateway this snapshot's
+    /// context has: the probe keeps the last one after the default route
+    /// goes, and its replies then say nothing about the way out. `true` as
+    /// well without a context or without a state: nothing to compare.
+    pub gateway_current: bool,
     /// `None` when no WAN probe runs.
     pub wan: Option<&'a AuxiliaryState>,
     pub outage_duration: Option<Duration>,
@@ -60,8 +62,16 @@ impl<'a> DiagInput<'a> {
             target_reachable: snap.reachability == Reachability::Online,
             target_total_loss: snap.reachability == Reachability::Offline,
             loss_pct: snap.recent_loss_pct,
-            quality: snap.quality,
             gateway,
+            // The address as the hot re-detection parses it for the probe.
+            gateway_current: snap.net_ctx.as_ref().is_none_or(|ctx| {
+                gateway.is_none_or(|g| {
+                    ctx.gateway
+                        .as_deref()
+                        .and_then(|s| s.parse::<IpAddr>().ok())
+                        == Some(g.target)
+                })
+            }),
             wan,
             outage_duration: snap.outage_duration,
             recovery_duration: snap.recovery_duration,
@@ -84,8 +94,9 @@ impl<'a> DiagInput<'a> {
 
 /// One conclusion of the correlator. `code` (snake_case) is stable: codes
 /// are only ever added. The gateway and WAN states that decide some of them
-/// travel next to the diagnosis (the JSON line's `gateway` and `wan`), not
-/// inside each finding.
+/// travel next to the diagnosis (the JSON line's `gateway` and `wan`, and
+/// `net_ctx.gateway` for whether that gateway is the current one), not inside
+/// each finding.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum Finding {
@@ -159,9 +170,12 @@ pub fn diagnose(input: &DiagInput) -> Vec<Finding> {
     let wan_online = input
         .wan
         .is_some_and(|w| w.reachability == Reachability::Online);
-    let gw_online = input
-        .gateway
-        .is_some_and(|g| g.reachability == Reachability::Online);
+    // Replies say "gateway up" only when they are the current gateway's; a
+    // gateway that is `Offline` counts whichever it is.
+    let gw_online = input.gateway_current
+        && input
+            .gateway
+            .is_some_and(|g| g.reachability == Reachability::Online);
 
     // A refusal is an answer, whatever the target's hysteresis state says.
     if let Some(port) = input.tcp_refused_port {
@@ -190,8 +204,9 @@ pub fn diagnose(input: &DiagInput) -> Vec<Finding> {
             findings.push(Finding::UpstreamOutage);
         } else if wan_offline {
             // The WAN probe is down too, but nothing is known about the
-            // gateway (no probe, or no verdict yet): the outage may be local
-            // or upstream, so neither is claimed.
+            // gateway (no probe, no verdict yet, or replies from one the
+            // context no longer has): the outage may be local or upstream,
+            // so neither is claimed.
             findings.push(Finding::WanUnreachable);
         } else {
             findings.push(Finding::TargetUnreachable { wan_online });
@@ -250,8 +265,8 @@ mod tests {
             target_reachable: true,
             target_total_loss: false,
             loss_pct: 0.0,
-            quality: None,
             gateway: None,
+            gateway_current: true,
             wan: None,
             outage_duration: None,
             recovery_duration: None,
@@ -323,6 +338,84 @@ mod tests {
             input.wan = wan;
             assert_eq!(diagnose(&input), [expected]);
         }
+    }
+
+    /// A gateway that answers and is not the one the context has (the
+    /// default route went, or changed): not "gateway up", so no cause beyond
+    /// it is claimed. One that does not answer still is the local network.
+    #[test]
+    fn a_former_gateways_replies_are_not_gateway_up() {
+        let (gw_on, gw_off) = (
+            aux("GW", Reachability::Online),
+            aux("GW", Reachability::Offline),
+        );
+        let wan_off = aux("WAN", Reachability::Offline);
+        for (current, target_down, expected) in [
+            (true, true, vec![Finding::UpstreamOutage]),
+            (false, true, vec![Finding::WanUnreachable]),
+            (true, false, vec![Finding::WanDegraded]),
+            (false, false, vec![]),
+        ] {
+            let mut input = if target_down { down() } else { base_input() };
+            input.gateway = Some(&gw_on);
+            input.gateway_current = current;
+            input.wan = Some(&wan_off);
+            assert_eq!(diagnose(&input), expected, "{current} {target_down}");
+        }
+
+        let mut input = down();
+        input.gateway = Some(&gw_off);
+        input.gateway_current = false;
+        input.wan = Some(&wan_off);
+        assert_eq!(diagnose(&input), [Finding::GatewayUnreachable]);
+    }
+
+    /// The gateway state is current while the snapshot's context has that
+    /// address as its gateway; with no context, or no state, nothing says
+    /// otherwise.
+    #[test]
+    fn the_gateway_state_is_current_while_the_context_has_it() {
+        use crate::context::NetworkContext;
+        use crate::context::classify::TargetClass;
+        let snapshot = |gateway: Option<&str>| {
+            let ctx = NetworkContext {
+                interface: "eth0".into(),
+                local_ip: "192.0.2.100".parse().unwrap(),
+                prefix_len: 24,
+                gateway: gateway.map(String::from),
+                target_class: TargetClass::PublicNetwork,
+            };
+            let mut snap = ProbeSnapshot::empty(
+                "target.example".into(),
+                "198.51.100.7".parse().unwrap(),
+                None,
+                Some(ctx),
+            );
+            snap.reachability = Reachability::Online;
+            snap
+        };
+        let gw = aux("GW", Reachability::Online);
+        let wan = aux("WAN", Reachability::Offline);
+        for (context_gateway, current) in [
+            (Some("192.0.2.1"), true),
+            // The default route went.
+            (None, false),
+            // Another gateway, the probe not yet on it.
+            (Some("192.0.2.254"), false),
+        ] {
+            let snap = snapshot(context_gateway);
+            let input = DiagInput::from_snapshot(&snap, Some(&gw), Some(&wan));
+            assert_eq!(input.gateway_current, current, "{context_gateway:?}");
+            // As the views and the JSON line get it.
+            let degraded = diagnose(&input).contains(&Finding::WanDegraded);
+            assert_eq!(degraded, current, "{context_gateway:?}");
+        }
+
+        let snap = snapshot(None);
+        assert!(DiagInput::from_snapshot(&snap, None, Some(&wan)).gateway_current);
+        let mut snap = snapshot(None);
+        snap.net_ctx = None;
+        assert!(DiagInput::from_snapshot(&snap, Some(&gw), Some(&wan)).gateway_current);
     }
 
     /// Every finding a state can produce, in priority order.

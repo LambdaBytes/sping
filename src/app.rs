@@ -74,6 +74,31 @@ pub async fn show_host_addresses(json: bool, external: Option<&str>) -> i32 {
     }
 }
 
+/// `sping --list-interfaces`: each interface's IPv4 address, one per line.
+/// Exit 0, also when the reader went away; 2 when stdout cannot be written.
+pub fn show_interfaces() -> i32 {
+    let ifaces = context::iface::list_interfaces();
+    let mut out = String::new();
+    if ifaces.is_empty() {
+        out.push_str("No interfaces detected.\n");
+    }
+    for iface in &ifaces {
+        out.push_str(&format!(
+            "{:<16} {}/{}\n",
+            iface.name, iface.ip, iface.prefix_len
+        ));
+    }
+    match std::io::stdout().lock().write_all(out.as_bytes()) {
+        // A closed pipe (`sping --list-interfaces | head -1`) is not an error.
+        Ok(()) => EXIT_OK,
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => EXIT_OK,
+        Err(e) => {
+            eprintln!("error: cannot write the interfaces: {e}");
+            EXIT_ERROR
+        }
+    }
+}
+
 /// Listen for Ctrl+C (and SIGTERM on Unix) and trigger shutdown.
 /// In raw-mode TUI views Ctrl+C arrives via the key listener instead,
 /// but SIGTERM (systemd, kill) still lands here.
@@ -109,19 +134,24 @@ fn eprint_socket_error(e: &std::io::Error) {
     eprintln!("hint: try running as Administrator");
 }
 
-/// Before probing: the ICMP socket opens or, with `--tcp`, every target's
-/// TCP socket can be prepared (source address, TTL). A failure is a local
-/// error, reported once: the caller exits with `EXIT_ERROR`. With `--tcp` and
-/// no targets yet (batch, before resolving) there is nothing to check.
+/// Before probing: an ICMP socket opens (else the permission hint) and every
+/// target's probe can be prepared as the scheduler will (ICMP or, with
+/// `--tcp`, TCP: source address, TTL). A failure is a local error, reported
+/// once: the caller exits with `EXIT_ERROR`. With no targets yet (batch,
+/// before resolving) only the ICMP socket is checked, without `--tcp`.
 fn precheck(cfg: &Config, targets: &[dns::ResolvedAddr]) -> bool {
     if cfg.tcp_port.is_none() {
-        return match crate::backends::IcmpBackend::new() {
-            Ok(_) => true,
-            Err(e) => {
-                eprint_socket_error(&e);
-                false
+        if let Err(e) = crate::backends::IcmpBackend::new() {
+            eprint_socket_error(&e);
+            return false;
+        }
+        for &target in targets {
+            if let Err(e) = scheduler::create_backend(&cfg.probe_options(target)) {
+                eprintln!("error: cannot prepare the ICMP probe of {}: {e}", target.ip);
+                return false;
             }
-        };
+        }
+        return true;
     }
     for &target in targets {
         if let Err(e) = crate::backends::tcp::TcpProber::new(&cfg.probe_options(target)) {
@@ -136,13 +166,34 @@ fn exit_code_for(received: u64) -> i32 {
     if received > 0 { EXIT_OK } else { EXIT_NO_REPLY }
 }
 
+/// What a spawned task returned; `None` when it panicked, which is said on
+/// stderr and is for the caller an error, not the exit code of the replies.
+fn joined<T>(task: &str, result: Result<T, tokio::task::JoinError>) -> Option<T> {
+    result
+        .inspect_err(|e| eprintln!("error: the {task} stopped: {e}"))
+        .ok()
+}
+
+/// Several targets, by the replies each received: `EXIT_OK` only if every
+/// one of them answered. `unresolved`: a name among those asked for did not
+/// resolve, which is a target with no replies.
+fn exit_code_for_all(received: impl IntoIterator<Item = u64>, unresolved: bool) -> i32 {
+    let mut received = received.into_iter().peekable();
+    let all_replied = received.peek().is_some() && received.all(|r| r > 0);
+    if all_replied && !unresolved {
+        EXIT_OK
+    } else {
+        EXIT_NO_REPLY
+    }
+}
+
 /// Single-target mode: one scheduler plus GW/WAN auxiliary probes feeding
 /// the selected view. Returns the process exit code.
 ///
 /// # Errors
 ///
-/// Fails only on DNS resolution failure; socket failures yield
-/// `Ok(EXIT_ERROR)` instead.
+/// Fails on DNS resolution failure and when the classic or JSON view
+/// cannot write to stdout; socket failures yield `Ok(EXIT_ERROR)` instead.
 pub async fn run(cfg: Config) -> anyhow::Result<i32> {
     eprintln!();
 
@@ -160,7 +211,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<i32> {
     let sep = icons::sep();
     let dash = icons::dash();
     let net_ctx = context::detect(target_addr);
-    let bold = if icons::use_color() {
+    let bold = if icons::use_color_stderr() {
         ("\x1b[1m", "\x1b[0m")
     } else {
         ("", "")
@@ -211,14 +262,17 @@ pub async fn run(cfg: Config) -> anyhow::Result<i32> {
         target_rx: target_tx.subscribe(),
         ctx_rx: ctx_tx.subscribe(),
     });
-    let gw_channel = net_ctx
-        .gateway
-        .as_deref()
-        .and_then(|s| s.parse::<IpAddr>().ok())
-        .map(watch::channel);
+    // The GW probe's target: none until this host has a default gateway. One
+    // that appears later starts the probe, another retargets it; when the
+    // gateway goes, the probe keeps the last one.
+    let (gw_target_tx, gw_target_rx) = watch::channel(
+        net_ctx
+            .gateway
+            .as_deref()
+            .and_then(|s| s.parse::<IpAddr>().ok()),
+    );
 
     {
-        let gw_target_tx = gw_channel.as_ref().map(|(tx, _)| tx.clone());
         let mut shutdown_rx = bus.subscribe_shutdown();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(CTX_REDETECT_INTERVAL);
@@ -251,14 +305,12 @@ pub async fn run(cfg: Config) -> anyhow::Result<i32> {
                     && *ctx_tx.borrow() != new
                 {
                     let new_ctx = &new.context;
-                    if let (Some(gw_tx), Some(gw_ip)) = (
-                        &gw_target_tx,
-                        new_ctx
-                            .gateway
-                            .as_deref()
-                            .and_then(|s| s.parse::<IpAddr>().ok()),
-                    ) {
-                        let _ = gw_tx.send(gw_ip);
+                    if let Some(gw_ip) = new_ctx
+                        .gateway
+                        .as_deref()
+                        .and_then(|s| s.parse::<IpAddr>().ok())
+                    {
+                        let _ = gw_target_tx.send(Some(gw_ip));
                     }
                     let _ = ctx_tx.send(new);
                 }
@@ -327,11 +379,11 @@ pub async fn run(cfg: Config) -> anyhow::Result<i32> {
         });
     }
 
-    // GW probe, retargetable via the context watcher.
-    if let Some((_, gw_target_rx)) = &gw_channel {
+    // GW probe, started and retargeted via the context watcher: it waits
+    // while there is no gateway.
+    {
         let tx = bus.gateway_sender();
         let shutdown_rx = bus.subscribe_shutdown();
-        let gw_target_rx = gw_target_rx.clone();
         tokio::spawn(async move {
             auxiliary::run(
                 "GW".into(),
@@ -350,7 +402,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<i32> {
         let shutdown_rx = bus.subscribe_shutdown();
         // The sender is dropped on purpose: the WAN target never changes, and
         // watch receivers keep serving the last value after the sender drops.
-        let (_wan_tx, wan_rx) = watch::channel(cfg.wan_probe);
+        let (_wan_tx, wan_rx) = watch::channel(Some(cfg.wan_probe));
         tokio::spawn(async move {
             auxiliary::run("WAN".into(), wan_rx, AUX_PROBE_INTERVAL, tx, shutdown_rx).await;
         });
@@ -371,11 +423,14 @@ pub async fn run(cfg: Config) -> anyhow::Result<i32> {
 
     if is_tui {
         let renderer = tokio::spawn(async move {
-            terminal::run(view, probe_rx, aux, shutdown_rx, quiet).await;
+            // Frames on a terminal: nothing to report.
+            let _ = terminal::run(view, probe_rx, aux, shutdown_rx, quiet).await;
         });
-        let _ = renderer.await;
-    } else {
-        terminal::run(view, probe_rx, aux, shutdown_rx, quiet).await;
+        if joined("renderer", renderer.await).is_none() {
+            return Ok(EXIT_ERROR);
+        }
+    } else if let Err(e) = terminal::run(view, probe_rx, aux, shutdown_rx, quiet).await {
+        anyhow::bail!("cannot write to stdout: {e}");
     }
 
     let received = bus
@@ -388,16 +443,19 @@ pub async fn run(cfg: Config) -> anyhow::Result<i32> {
 }
 
 /// Multi-target dashboard mode: one scheduler per target rendered as a
-/// table. Returns `EXIT_OK` only if every target received replies.
+/// table. Returns `EXIT_OK` only if every target received replies; a name
+/// that does not resolve is one that received none.
 ///
 /// # Errors
 ///
-/// Fails only when no target resolves; individual failures and duplicate
+/// Fails when no target resolves and when the summaries cannot be written
+/// to a stdout that is not a terminal; individual failures and duplicate
 /// IPs are skipped.
 pub async fn run_multi(cfg: Config) -> anyhow::Result<i32> {
     eprintln!();
 
     let mut resolved = Vec::new();
+    let mut unresolved = false;
     // Address and zone together: the same link-local address in two zones
     // is two different hosts.
     let mut seen_addrs = std::collections::HashSet::new();
@@ -421,6 +479,7 @@ pub async fn run_multi(cfg: Config) -> anyhow::Result<i32> {
             }
             Err(e) => {
                 eprintln!("warning: skipping {target}: {e}");
+                unresolved = true;
             }
         }
     }
@@ -450,7 +509,10 @@ pub async fn run_multi(cfg: Config) -> anyhow::Result<i32> {
             .unwrap_or_default(),
     );
 
-    let (shutdown_tx, _) = watch::channel(false);
+    // The renderer's receiver, kept from here on: a shutdown sent with no
+    // receiver left is lost, and every scheduler may end (`-c N`) before the
+    // renderer starts.
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     // The live table, or with stdout not a terminal (`Config::from_args`)
     // only each target's summary at the end: no raw mode, no keys to read.
@@ -508,21 +570,24 @@ pub async fn run_multi(cfg: Config) -> anyhow::Result<i32> {
     // Keep receivers to compute the exit code after the renderer is done.
     let final_rxs = probe_rxs.clone();
 
-    let shutdown_rx = shutdown_tx.subscribe();
-    let renderer = tokio::spawn(async move {
-        terminal::run_table(probe_rxs, shutdown_rx, live).await;
-    });
+    let renderer =
+        tokio::spawn(async move { terminal::run_table(probe_rxs, shutdown_rx, live).await });
 
-    let _ = renderer.await;
+    match joined("renderer", renderer.await) {
+        None => return Ok(EXIT_ERROR),
+        Some(Err(e)) => anyhow::bail!("cannot write to stdout: {e}"),
+        Some(Ok(())) => {}
+    }
 
-    let all_replied = final_rxs
+    let received = final_rxs
         .iter()
-        .all(|rx| rx.borrow().as_ref().is_some_and(|s| s.received > 0));
-    Ok(if all_replied { EXIT_OK } else { EXIT_NO_REPLY })
+        .map(|rx| rx.borrow().as_ref().map_or(0, |s| s.received));
+    Ok(exit_code_for_all(received, unresolved))
 }
 
 /// Batch mode: read targets from file, probe each N times, output results.
-/// Returns `EXIT_OK` only if every probed target received replies.
+/// Returns `EXIT_OK` only if every target received replies; a name that
+/// does not resolve is one that received none.
 ///
 /// # Errors
 ///
@@ -541,12 +606,13 @@ pub async fn run_batch(cfg: Config) -> anyhow::Result<i32> {
         cfg.interval.as_millis()
     );
 
-    // Pre-check the socket before probing (TCP: per target, below).
+    // Pre-check the socket before probing (per target, below).
     if !precheck(&cfg, &[]) {
         return Ok(EXIT_ERROR);
     }
 
     let mut resolved = Vec::new();
+    let mut unresolved = false;
     for target in &cfg.targets {
         if !dns::is_literal(target) {
             eprint!("  Resolving {target}...");
@@ -560,6 +626,7 @@ pub async fn run_batch(cfg: Config) -> anyhow::Result<i32> {
             }
             Err(e) => {
                 eprintln!("  warning: skipping {target}: {e}");
+                unresolved = true;
             }
         }
     }
@@ -569,8 +636,8 @@ pub async fn run_batch(cfg: Config) -> anyhow::Result<i32> {
     }
 
     let addrs: Vec<_> = resolved.iter().map(|(_, addr, _)| *addr).collect();
-    // TCP: every target's socket, now that the addresses are known.
-    if cfg.tcp_port.is_some() && !precheck(&cfg, &addrs) {
+    // Every target's probe, now that the addresses are known.
+    if !precheck(&cfg, &addrs) {
         return Ok(EXIT_ERROR);
     }
 
@@ -587,16 +654,21 @@ pub async fn run_batch(cfg: Config) -> anyhow::Result<i32> {
         let interval = cfg.interval;
         let opts = cfg.probe_options(target_addr);
 
+        let host = target_host.clone();
         let handle = tokio::spawn(async move {
             batch::probe_target(target_host, target_ip, dns_time, ctx, interval, opts, count).await
         });
-        handles.push(handle);
+        handles.push((host, handle));
     }
 
+    // A target whose task stopped has no result: the others are written,
+    // and the exit code is that of an error.
     let mut results: Vec<ProbeSnapshot> = Vec::new();
-    for handle in handles {
-        if let Ok(snapshot) = handle.await {
-            results.push(snapshot);
+    let mut stopped = false;
+    for (host, handle) in handles {
+        match joined(&format!("probe of {host}"), handle.await) {
+            Some(snapshot) => results.push(snapshot),
+            None => stopped = true,
         }
     }
 
@@ -638,8 +710,13 @@ pub async fn run_batch(cfg: Config) -> anyhow::Result<i32> {
         }
     }
 
-    let all_replied = !results.is_empty() && results.iter().all(|s| s.received > 0);
-    Ok(if all_replied { EXIT_OK } else { EXIT_NO_REPLY })
+    if stopped {
+        return Ok(EXIT_ERROR);
+    }
+    Ok(exit_code_for_all(
+        results.iter().map(|s| s.received),
+        unresolved,
+    ))
 }
 
 /// One-line summary of a batch target (the text batch output, one per host).
@@ -704,11 +781,33 @@ fn batch_line(snap: &ProbeSnapshot) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::batch_line;
+    use super::{EXIT_NO_REPLY, EXIT_OK, batch_line, exit_code_for_all, joined};
     use crate::render::golden_icmp::{lost, no_hop_limit, replying};
     use crate::render::golden_tcp::{open, refused, timed_out};
 
-    // The exact text batch line for ICMP, as before the TCP probe existed.
+    // A task that ended hands over what it returned; one that panicked,
+    // nothing: its result was dropped without a word, and the exit code was
+    // that of the replies.
+    #[tokio::test]
+    async fn a_task_that_panicked_returned_nothing() {
+        let ended = tokio::spawn(async { 7 });
+        assert_eq!(joined("task", ended.await), Some(7));
+        let panicked: tokio::task::JoinHandle<i32> = tokio::spawn(async { panic!("boom") });
+        assert_eq!(joined("task", panicked.await), None);
+    }
+
+    // Several targets: 0 needs replies from every one, and a name that did
+    // not resolve is one with none (the others decided: 0 with all of them
+    // answering). No target probed at all is no reply.
+    #[test]
+    fn several_targets_exit_ok_only_if_every_one_answered() {
+        assert_eq!(exit_code_for_all([3, 1], false), EXIT_OK);
+        assert_eq!(exit_code_for_all([3, 0], false), EXIT_NO_REPLY);
+        assert_eq!(exit_code_for_all([3, 1], true), EXIT_NO_REPLY);
+        assert_eq!(exit_code_for_all([0], true), EXIT_NO_REPLY);
+        assert_eq!(exit_code_for_all([], false), EXIT_NO_REPLY);
+    }
+
     #[test]
     fn batch_line_icmp_golden() {
         assert_eq!(

@@ -402,8 +402,10 @@ impl NameTracker {
 
 /// Create the probe for `opts`: a TCP connect with `--tcp`, otherwise an ICMP
 /// backend matching the target's address family, with the socket options
-/// applied. An interface-bind failure only warns and continues unbound
-/// (binding is unsupported on Windows and may require privileges elsewhere).
+/// applied. An interface-bind failure only warns, once per process (each
+/// target's backend is built twice: precheck and scheduler), and continues
+/// unbound (binding is unsupported on macOS and Windows and may require
+/// privileges on Linux).
 ///
 /// # Errors
 ///
@@ -420,7 +422,8 @@ pub(crate) fn create_backend(opts: &ProbeOptions) -> std::io::Result<ProbeBacken
     if let Some(ref iface) = opts.interface
         && let Err(e) = backend.bind_interface(iface)
     {
-        eprintln!("warning: could not bind to interface {iface}: {e}");
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| eprintln!("warning: could not bind to interface {iface}: {e}"));
     }
 
     if let Some(src) = opts.source {

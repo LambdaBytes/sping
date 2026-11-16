@@ -3,4 +3,3 @@
 
 pub mod bus;
 pub mod frame_clock;
-pub mod shutdown;

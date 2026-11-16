@@ -26,7 +26,7 @@ pub struct Args {
     #[arg(short = 'i', long, default_value = "1000")]
     pub interval_ms: u64,
 
-    /// Per-probe timeout in seconds
+    /// Per-probe timeout in seconds (0.001 to 3600)
     #[arg(short = 'W', long, default_value = "2")]
     pub timeout: f64,
 
@@ -70,7 +70,7 @@ pub struct Args {
     #[arg(short, long, default_value = "compact", value_parser = ["compact", "extended", "classic", "json", "table"])]
     pub view: String,
 
-    /// Batch mode: read targets from file (one per line)
+    /// Batch mode: read targets from file (one per line); prints a summary, or JSON with --view json
     #[arg(short, long)]
     pub batch: Option<String>,
 

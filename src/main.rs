@@ -33,15 +33,7 @@ async fn real_main() -> i32 {
     render::icons::init(args.ascii);
 
     if args.list_interfaces {
-        let ifaces = context::iface::list_interfaces();
-        if ifaces.is_empty() {
-            println!("No interfaces detected.");
-        } else {
-            for iface in &ifaces {
-                println!("{:<16} {}/{}", iface.name, iface.ip, iface.prefix_len);
-            }
-        }
-        return app::EXIT_OK;
+        return app::show_interfaces();
     }
 
     if args.ip {

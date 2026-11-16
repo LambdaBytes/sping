@@ -121,7 +121,12 @@ impl ProbeStats {
         if self.received == 0 {
             None
         } else {
-            Some(self.rtt_sum / self.received as u32)
+            // In nanoseconds: `Duration` divides by a u32 only, and the
+            // count is a u64. A mean of RTTs fits in a u64 of them.
+            let nanos = self.rtt_sum.as_nanos() / u128::from(self.received);
+            Some(Duration::from_nanos(
+                u64::try_from(nanos).unwrap_or(u64::MAX),
+            ))
         }
     }
 
@@ -195,5 +200,23 @@ mod tests {
         let mut s = ProbeStats::new();
         s.record_timeout();
         assert!(s.mdev().is_none());
+    }
+
+    /// The mean divides by the whole count of replies: cut to 32 bits, 2^32
+    /// of them divided by zero and one more by one.
+    #[test]
+    fn the_mean_rtt_divides_by_the_whole_count() {
+        let mut s = ProbeStats::new();
+        for rtt in [10, 10, 11] {
+            s.record_reply(Duration::from_millis(rtt));
+        }
+        // Whole nanoseconds, as `Duration` divides.
+        assert_eq!(s.rtt_avg(), Some(Duration::from_nanos(10_333_333)));
+
+        for received in [1u64 << 32, (1 << 32) + 1] {
+            s.received = received;
+            s.rtt_sum = Duration::from_millis(20 * received);
+            assert_eq!(s.rtt_avg(), Some(Duration::from_millis(20)), "{received}");
+        }
     }
 }

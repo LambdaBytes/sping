@@ -10,7 +10,7 @@ use crossterm::{cursor, queue, terminal};
 
 use crate::context::dns::is_literal;
 use crate::probe::types::ProbeSnapshot;
-use crate::render::format::{fmt_loss, fmt_rtt_opt};
+use crate::render::format::{Placement, fmt_loss, fmt_rtt_opt};
 use crate::render::icons;
 use crate::render::view_compact::{estimate_hops, guess_os};
 
@@ -26,14 +26,14 @@ fn truncate_name(name: &str, max: usize) -> String {
     out
 }
 
-/// Draw one frame, first moving the cursor up over the `lines_before` lines
-/// from the previous frame. `None` entries render as `waiting...` rows.
+/// Draw one frame where `place` says: first moving the cursor up over the
+/// lines of the previous frame. `None` entries render as `waiting...` rows.
 /// Returns the line count to pass back next call.
 pub fn draw_table(
     out: &mut impl Write,
     snapshots: &[Option<ProbeSnapshot>],
     spinner_idx: usize,
-    lines_before: u16,
+    place: Placement,
 ) -> io::Result<u16> {
     let spinner = icons::spinner();
     let spin = spinner[spinner_idx % spinner.len()];
@@ -86,7 +86,19 @@ pub fn draw_table(
     writeln!(w)?;
     lines += 1;
 
-    for snap_opt in snapshots {
+    // In a terminal too short for every target, the rows left under the
+    // lines above go to the first ones, and the last row says how many are
+    // not shown: a frame cut blindly would hide them without a word. Under
+    // six rows the lines above do not fit either, and the count is cut with
+    // them (`fit_rows`).
+    let shown = match place.max_lines() {
+        Some(max) if usize::from(lines) + snapshots.len() > max => {
+            max.saturating_sub(usize::from(lines) + 1)
+        }
+        _ => snapshots.len(),
+    };
+
+    for snap_opt in snapshots.iter().take(shown) {
         let Some(snap) = snap_opt else {
             write!(w, "{:<20}  waiting...", "?")?;
             queue!(w, terminal::Clear(terminal::ClearType::UntilNewLine))?;
@@ -196,12 +208,25 @@ pub fn draw_table(
         lines += 1;
     }
 
-    let buf = crate::render::format::stage_frame(&buf, crate::render::format::term_width())?;
+    if shown < snapshots.len() {
+        let hidden = snapshots.len() - shown;
+        write!(
+            w,
+            "{} {hidden} more (terminal too short)",
+            icons::ellipsis()
+        )?;
+        queue!(w, terminal::Clear(terminal::ClearType::UntilNewLine))?;
+        writeln!(w)?;
+        lines += 1;
+    }
+
+    let (buf, lines) = crate::render::format::fit_rows(&buf, lines, place);
+    let buf = crate::render::format::stage_frame(buf, place.width)?;
     let mut final_buf = Vec::with_capacity(buf.len() + 16);
-    if lines_before > 0 {
+    if place.lines_before > 0 {
         queue!(
             final_buf,
-            cursor::MoveUp(lines_before),
+            cursor::MoveUp(place.lines_before),
             cursor::MoveToColumn(0)
         )?;
     }
@@ -215,6 +240,58 @@ pub fn draw_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The table of 20 targets (24 lines) on a terminal of 100 columns and
+    /// `rows` rows: the lines it says it drew, and its text.
+    fn table_of_20(width: Option<usize>, rows: usize) -> (u16, String) {
+        let place = Placement {
+            width,
+            rows,
+            ..Placement::default()
+        };
+        let mut out = Vec::new();
+        let lines = draw_table(&mut out, &vec![None; 20], 0, place).unwrap();
+        (lines, crate::render::golden_icmp::visible(&out))
+    }
+
+    #[test]
+    fn a_table_too_tall_for_the_terminal_says_how_many_targets_it_hides() {
+        // 12 rows: the four lines above, six targets and the count of the rest.
+        let (lines, text) = table_of_20(Some(100), 12);
+        assert_eq!(lines, 11);
+        assert_eq!(text.lines().count(), 11);
+        assert_eq!(text.matches("waiting...").count(), 6);
+        assert_eq!(text.lines().last(), Some("… 14 more (terminal too short)"));
+
+        // One row short of them all.
+        let (lines, text) = table_of_20(Some(100), 24);
+        assert_eq!(lines, 23);
+        assert_eq!(text.matches("waiting...").count(), 18);
+        assert_eq!(text.lines().last(), Some("… 2 more (terminal too short)"));
+
+        // Never more lines than rows to spare, down to none.
+        for rows in 1..=6 {
+            let (lines, text) = table_of_20(Some(100), rows);
+            assert_eq!(usize::from(lines), rows - 1);
+            assert_eq!(text.lines().count(), rows - 1);
+        }
+        let (_, text) = table_of_20(Some(100), 6);
+        assert_eq!(text.lines().last(), Some("… 20 more (terminal too short)"));
+        // Under that the heading itself is cut, and the count with it.
+        let (_, text) = table_of_20(Some(100), 5);
+        assert!(!text.contains("more"), "{text}");
+    }
+
+    #[test]
+    fn a_table_that_fits_or_cannot_tell_shows_every_target() {
+        // Rows for all, a terminal of unknown height, and not a terminal.
+        for (width, rows) in [(Some(100), 25), (Some(100), 0), (None, 12)] {
+            let (lines, text) = table_of_20(width, rows);
+            assert_eq!(lines, 24, "{width:?} {rows}");
+            assert_eq!(text.matches("waiting...").count(), 20);
+            assert!(!text.contains("more"), "{text}");
+        }
+    }
 
     #[test]
     fn test_truncate_short_name_untouched() {

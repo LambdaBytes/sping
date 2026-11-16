@@ -117,6 +117,9 @@ setup() {
         ip -n "$ns" route add default via 10.0.5.1
         ip -n "$ns" addr add 2001:db8:5::2/64 dev v0 nodad
         ip -n "$ns" -6 route add default via 2001:db8:5::1
+        # A source with a /32, which no route covers.
+        ip -n "$ns" addr add 10.77.7.7/32 dev v0
+        ip -n "$ns" route add 198.51.100.64/26 via 10.0.5.1 src 10.77.7.7
         ;;
     routes)
         ip -n "$ns" route add unreachable 198.51.100.0/26

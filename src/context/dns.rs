@@ -54,15 +54,19 @@ impl ResolvedAddr {
     }
 }
 
+/// Every address resolved comes through here, written as a literal or
+/// answered by a lookup. An IPv4-mapped IPv6 address (`::ffff:192.0.2.1`)
+/// is the IPv4 address it stands for, with no zone: as IPv6 the ICMP probe
+/// cannot be sent, and `-4`/`-6`, the context and the comparison of two
+/// targets all look at the family.
 impl From<SocketAddr> for ResolvedAddr {
     fn from(addr: SocketAddr) -> Self {
-        let scope_id = match addr {
-            SocketAddr::V6(v6) => v6.scope_id(),
-            SocketAddr::V4(_) => 0,
-        };
-        Self {
-            ip: addr.ip(),
-            scope_id,
+        match (addr.ip().to_canonical(), addr) {
+            (ip @ IpAddr::V6(_), SocketAddr::V6(v6)) => Self {
+                ip,
+                scope_id: v6.scope_id(),
+            },
+            (ip, _) => Self::unscoped(ip),
         }
     }
 }
@@ -105,12 +109,13 @@ pub async fn resolve(
     family: Option<Family>,
 ) -> Result<(ResolvedAddr, Option<Duration>)> {
     if let Ok(ip) = target.parse::<IpAddr>() {
+        let addr = ResolvedAddr::from(SocketAddr::new(ip, 0));
         if let Some(f) = family
-            && !f.matches(ip)
+            && !f.matches(addr.ip)
         {
             bail!("'{target}' does not match the requested address family");
         }
-        return Ok((ResolvedAddr::unscoped(ip), None));
+        return Ok((addr, None));
     }
 
     let start = Instant::now();
@@ -181,7 +186,7 @@ pub struct Families {
 /// zone, or no address at all. One family missing is not an error.
 pub async fn resolve_both(target: &str) -> Result<Families> {
     if let Ok(ip) = target.parse::<IpAddr>() {
-        let (v4, v6) = first_of_each(&[ResolvedAddr::unscoped(ip)]);
+        let (v4, v6) = first_of_each(&[ResolvedAddr::from(SocketAddr::new(ip, 0))]);
         return Ok(Families { v4, v6, time: None });
     }
 
@@ -345,6 +350,37 @@ mod tests {
 
     fn addr(s: &str) -> ResolvedAddr {
         ResolvedAddr::unscoped(s.parse().unwrap())
+    }
+
+    /// An IPv4-mapped IPv6 address (`::ffff:192.0.2.1`) is that IPv4
+    /// address, which is how it is probed: as IPv6 no ICMP probe could be
+    /// sent to it. It is one before `-4`/`-6` look at it, written as the
+    /// target or in the answer of a lookup, and it has no zone.
+    #[tokio::test]
+    async fn an_ipv4_mapped_address_is_its_ipv4_address() {
+        let v4 = addr("192.0.2.1");
+        for mapped in ["::ffff:192.0.2.1", "::ffff:c000:201"] {
+            assert_eq!(resolve(mapped, None).await.unwrap(), (v4, None));
+            let as_v4 = resolve(mapped, Some(Family::V4)).await.unwrap();
+            assert_eq!(as_v4, (v4, None));
+            assert!(resolve(mapped, Some(Family::V6)).await.is_err());
+            let both = resolve_both(mapped).await.unwrap();
+            assert_eq!((both.v4, both.v6, both.time), (Some(v4), None, None));
+        }
+
+        let answer: SocketAddr = "[::ffff:192.0.2.1%7]:0".parse().unwrap();
+        assert_eq!(ResolvedAddr::from(answer), v4);
+        assert_eq!(
+            resolution(&[ResolvedAddr::from(answer)], v4),
+            Resolution::Unchanged
+        );
+
+        // Only the mapped form: these stay the IPv6 addresses they are.
+        for v6 in ["::1", "::192.0.2.1", "64:ff9b::c000:201", "2001:db8::1"] {
+            assert_eq!(resolve(v6, None).await.unwrap(), (addr(v6), None));
+            let as_v6 = resolve(v6, Some(Family::V6)).await.unwrap();
+            assert_eq!(as_v6, (addr(v6), None));
+        }
     }
 
     #[test]

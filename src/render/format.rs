@@ -339,6 +339,35 @@ pub fn fix_raw_newlines(buf: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Where a live view draws a frame. The view is handed it, and never asks the
+/// terminal itself: a test's frame must not depend on the terminal the tests
+/// run in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Placement {
+    /// Lines of the previous frame to move up over; 0 before the first.
+    pub lines_before: u16,
+    /// The [`term_width`] the frame is drawn at; `None` (the default) is
+    /// output that is not a terminal.
+    pub width: Option<usize>,
+    /// The [`term_rows`] of that terminal; 0 (the default) when unknown.
+    pub rows: usize,
+}
+
+impl Placement {
+    /// The most lines a frame may have here, `None` when nothing limits them
+    /// (not a terminal, or one of unknown height). Every line ends in a
+    /// newline, so a frame takes one row more than it has lines: the one the
+    /// cursor is left on. A frame of more lines than this scrolls the screen
+    /// when it is drawn, and the next one, moving up, stops at the top row,
+    /// short of the frame's first line, and scrolls it again.
+    pub fn max_lines(self) -> Option<usize> {
+        match (self.width, self.rows) {
+            (None, _) | (_, 0) => None,
+            (Some(_), rows) => Some(rows - 1),
+        }
+    }
+}
+
 /// Width in columns of the terminal a frame is written to: `None` when stdout
 /// is not a terminal (the size query would then answer for the controlling
 /// terminal, and redirected output must stay untouched), `Some(0)` for a
@@ -350,10 +379,40 @@ pub fn term_width() -> Option<usize> {
     Some(crossterm::terminal::size().map_or(0, |(cols, _)| cols as usize))
 }
 
+/// Height in rows of the terminal a frame is written to, 0 when it does not
+/// report one. It means something only where [`term_width`] is `Some`.
+pub fn term_rows() -> usize {
+    crossterm::terminal::size().map_or(0, |(_, rows)| usize::from(rows))
+}
+
+/// Cut a staged frame of `lines` lines to the lines that fit where it is
+/// drawn ([`Placement::max_lines`]): the first ones are kept, and the count
+/// returned is the one to move up over before the next frame. A frame that
+/// fits, or with nothing to fit in, comes back as it is.
+pub fn fit_rows(buf: &[u8], lines: u16, place: Placement) -> (&[u8], u16) {
+    let Some(max) = place.max_lines() else {
+        return (buf, lines);
+    };
+    let max = u16::try_from(max).unwrap_or(u16::MAX);
+    if lines <= max {
+        return (buf, lines);
+    }
+    let Some(last) = usize::from(max).checked_sub(1) else {
+        return (&buf[..0], 0);
+    };
+    let newlines = buf.iter().enumerate().filter(|&(_, &b)| b == b'\n');
+    match newlines.map(|(at, _)| at).nth(last) {
+        Some(at) => (&buf[..=at], max),
+        None => (buf, lines),
+    }
+}
+
 /// Turn a staged frame into the bytes written to a raw-mode terminal of the
 /// given [`term_width`]: every line cut to fit ([`fit_lines`]), newlines
-/// rewritten ([`fix_raw_newlines`]), and the frame drawn with the terminal's
-/// automatic line wrap switched off.
+/// rewritten ([`fix_raw_newlines`]), the frame drawn with the terminal's
+/// automatic line wrap switched off, and the screen erased from the row after
+/// its last line: a frame with fewer lines than the one it is drawn over
+/// would leave that one's last rows below it.
 ///
 /// The views redraw in place by moving the cursor up one row per line, so a
 /// line must never take two rows. `fit_lines` sees to that for every
@@ -374,6 +433,15 @@ pub fn stage_frame(buf: &[u8], width: Option<usize>) -> std::io::Result<Vec<u8>>
     let mut out = Vec::with_capacity(body.len() + 16);
     crossterm::queue!(out, crossterm::terminal::DisableLineWrap)?;
     out.extend_from_slice(&body);
+    // A console without escape sequences (the legacy Windows one) runs a
+    // queued command at once, through its API: the erase would run here,
+    // before the frame is written, and over all the buffer below the cursor.
+    if crate::render::icons::ansi_enabled() {
+        crossterm::queue!(
+            out,
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
+        )?;
+    }
     crossterm::queue!(out, crossterm::terminal::EnableLineWrap)?;
     Ok(out)
 }
@@ -477,14 +545,20 @@ fn char_width(c: char) -> usize {
 
 /// Byte length of the escape sequence at the start of `s`, or 0 if there is
 /// none. The views emit CSI sequences (`ESC [ parameters final`); any other
-/// escape is taken in its two-byte form.
+/// escape is taken in its two-byte form, whose second byte is ASCII: an ESC
+/// before anything else stands alone, so the length never ends inside a
+/// character.
 fn escape_len(s: &str) -> usize {
     let bytes = s.as_bytes();
     if bytes.first() != Some(&0x1b) {
         return 0;
     }
     if bytes.get(1) != Some(&b'[') {
-        return bytes.len().min(2);
+        return if bytes.get(1).is_some_and(u8::is_ascii) {
+            2
+        } else {
+            1
+        };
     }
     match bytes[2..].iter().position(|b| (0x40..=0x7e).contains(b)) {
         Some(end) => end + 3,
@@ -650,6 +724,21 @@ mod tests {
     }
 
     #[test]
+    fn an_escape_before_a_multibyte_character_leaves_it_whole() {
+        // Not a sequence the views write, but a name may carry anything. The
+        // two bytes once taken ended inside the character, and cutting the
+        // line there panicked.
+        assert_eq!(fit("\x1bé123456789", 10), "\x1bé1234567…");
+        assert_eq!(fit("12345678\x1b日90", 10), "12345678\x1b…");
+        assert_eq!(visible_width("\x1bé12345"), 6);
+        assert_eq!(escape_len("\x1bé"), 1);
+        // The two-byte form and an escape that ends the line, as before.
+        assert_eq!(escape_len("\x1b7rest"), 2);
+        assert_eq!(escape_len("\x1b"), 1);
+        assert_eq!(fit("1234567890\x1b", 10), "12345678…\x1b");
+    }
+
+    #[test]
     fn fit_lines_counts_wide_characters_as_two_columns() {
         // Six CJK characters take 12 columns, not 6.
         assert_eq!(visible_width("日本語テスト"), 12);
@@ -663,10 +752,11 @@ mod tests {
 
     #[test]
     fn stage_frame_draws_with_line_wrap_off() {
-        // Wrap off, the fitted body with raw-mode newlines, wrap back on.
+        // Wrap off, the fitted body with raw-mode newlines, the rows below
+        // erased, wrap back on.
         assert_eq!(
             stage_frame(b"1234567890\nok\n", Some(10)).unwrap(),
-            "\x1b[?7l12345678…\r\nok\r\n\x1b[?7h".as_bytes()
+            "\x1b[?7l12345678…\r\nok\r\n\x1b[J\x1b[?7h".as_bytes()
         );
     }
 
@@ -677,7 +767,7 @@ mod tests {
         let long = "x".repeat(300) + "\n";
         let mut expected = b"\x1b[?7l".to_vec();
         expected.extend(fix_raw_newlines(long.as_bytes()));
-        expected.extend(b"\x1b[?7h");
+        expected.extend(b"\x1b[J\x1b[?7h");
         assert_eq!(stage_frame(long.as_bytes(), Some(0)).unwrap(), expected);
     }
 
@@ -688,6 +778,49 @@ mod tests {
         assert_eq!(
             stage_frame(long.as_bytes(), None).unwrap(),
             fix_raw_newlines(long.as_bytes())
+        );
+    }
+
+    /// A terminal of `rows` rows and, when `width` says so, 80 columns.
+    fn placed(width: Option<usize>, rows: usize) -> Placement {
+        Placement {
+            width,
+            rows,
+            ..Placement::default()
+        }
+    }
+
+    #[test]
+    fn fit_rows_keeps_the_lines_that_leave_the_cursor_a_row() {
+        let frame: &[u8] = b"one\ntwo\nthree\nfour\n";
+        // Four lines and the row the cursor ends on: five rows or more.
+        for rows in [5, 6, 100] {
+            assert_eq!(fit_rows(frame, 4, placed(Some(80), rows)), (frame, 4));
+        }
+        let cut = |rows| fit_rows(frame, 4, placed(Some(80), rows));
+        assert_eq!(cut(4), (&b"one\ntwo\nthree\n"[..], 3));
+        assert_eq!(cut(3), (&b"one\ntwo\n"[..], 2));
+        assert_eq!(cut(2), (&b"one\n"[..], 1));
+        // A single row has none to spare: any line would scroll it.
+        assert_eq!(cut(1), (&b""[..], 0));
+        // A terminal of unknown width is still a terminal with rows.
+        assert_eq!(
+            fit_rows(frame, 4, placed(Some(0), 3)),
+            (&b"one\ntwo\n"[..], 2)
+        );
+    }
+
+    #[test]
+    fn fit_rows_leaves_alone_a_frame_it_cannot_place() {
+        let frame: &[u8] = b"one\ntwo\nthree\nfour\n";
+        // A terminal that does not report its height.
+        assert_eq!(fit_rows(frame, 4, placed(Some(80), 0)), (frame, 4));
+        // Not a terminal, whatever the controlling terminal's rows are.
+        assert_eq!(fit_rows(frame, 4, placed(None, 2)), (frame, 4));
+        // A count the frame does not hold: nothing to cut by.
+        assert_eq!(
+            fit_rows(b"one\n", 4, placed(Some(80), 3)),
+            (&b"one\n"[..], 4)
         );
     }
 

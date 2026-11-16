@@ -12,6 +12,8 @@ use crate::probe::trace::UnreachableKind;
 
 /// Result of a single probe.
 #[derive(Debug, Clone)]
+// `seq`: every backend sets it and only tests read it; the scheduler and
+// the batch number the probes themselves.
 #[allow(dead_code)]
 pub enum ProbeResult {
     /// ICMP echo reply.
@@ -69,9 +71,7 @@ pub struct ProbeOptions {
     /// Outgoing TTL / hop limit; None = OS default.
     pub ttl: Option<u8>,
     /// Interface to bind the socket to (`-I`); platform-dependent support.
-    #[allow(dead_code)]
     pub interface: Option<String>,
-    #[allow(dead_code)]
     pub source: Option<IpAddr>,
     /// `Some(port)`: probe with a TCP connect to that port instead of ICMP.
     pub tcp_port: Option<u16>,
@@ -135,14 +135,11 @@ pub struct RecentChange {
 
 /// Entry in the pulse ring buffer.
 #[derive(Debug, Clone, Copy, Serialize)]
-#[allow(dead_code)]
 pub enum PulseEntry {
     /// Reply received; carries the RTT (serialized as milliseconds).
     Reply(#[serde(serialize_with = "ser_duration_ms")] Duration),
     /// Probe timed out or errored.
     Loss,
-    /// Slot with no sample yet; rendered as blank padding.
-    Empty,
 }
 
 /// Snapshot of probe stats, published via the Bus.

@@ -71,7 +71,6 @@ impl PulseScaler {
                     write!(w, "{}", icons::loss_char())?;
                     queue!(w, ResetColor)?;
                 }
-                PulseEntry::Empty => write!(w, " ")?,
             }
             chars_written += 1;
         }
@@ -117,7 +116,6 @@ impl PulseScaler {
                     out.push(icons::blocks()[level.min(7)]);
                 }
                 PulseEntry::Loss => out.push(icons::loss_char()),
-                PulseEntry::Empty => out.push(' '),
             }
         }
         while out.chars().count() < DISPLAY_WIDTH {

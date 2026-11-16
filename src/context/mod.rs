@@ -400,6 +400,11 @@ mod tests {
                     assert_eq!(ctx.local_ip, ip(local));
                     assert_eq!((ctx.interface.as_str(), ctx.prefix_len), ("v0", prefix));
                 }
+                // A source no route covers (a /32): its prefix is the one
+                // it has on the interface that holds it.
+                let ctx = detect(addr("198.51.100.65"));
+                assert_eq!(ctx.local_ip, ip("10.77.7.7"));
+                assert_eq!((ctx.interface.as_str(), ctx.prefix_len), ("v0", 32));
             }
             // `unreachable`: no route; `prohibit` and `blackhole`: unknown.
             "routes" => {
